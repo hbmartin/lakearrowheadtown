@@ -1,5 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import favicon from '../favicon.svg';
+import { matchesEtag, parseIfNoneMatch } from './conditions';
 import { hashBytes, IMAGE_CACHE, imageUpload, withImageUploadSlot } from './images';
 import { HTML_CACHE } from './publishing';
 import { renderPage } from './render';
@@ -26,10 +27,6 @@ function originFor(request: Request, env: Env): string {
   } catch { throw new HttpError(503, 'Site origin is not configured correctly'); }
 }
 
-function notModified(request: Request, etag: string): boolean {
-  return (request.headers.get('if-none-match') ?? '').split(',').some(tag => tag.trim() === '*' || tag.trim().replace(/^W\//, '') === etag.replace(/^W\//, ''));
-}
-
 // One cached fallback per serving origin; never hash static HTML on every request.
 const fallbackPages = new Map<string, Promise<{ html: string; etag: string }>>();
 function fallbackFor(origin: string): Promise<{ html: string; etag: string }> {
@@ -45,10 +42,10 @@ function fallbackFor(origin: string): Promise<{ html: string; etag: string }> {
 }
 
 async function publicObject(request: Request, env: Env, key: string, image = false): Promise<Response> {
-  const condition = request.headers.get('if-none-match');
+  const condition = parseIfNoneMatch(request.headers.get('if-none-match'));
   const object = request.method === 'HEAD'
     ? await env.SITE_BUCKET.head(key)
-    : await env.SITE_BUCKET.get(key, condition ? { onlyIf: new Headers({ 'If-None-Match': condition }) } : undefined);
+    : await env.SITE_BUCKET.get(key, condition ? { onlyIf: new Headers({ 'If-None-Match': condition.header }) } : undefined);
   const headers = new Headers({ 'Cloudflare-CDN-Cache-Control': image ? IMAGE_CACHE : 'no-store', 'X-Content-Type-Options': 'nosniff' });
   if (!object) {
     if (key !== 'pages/index.html') return json({ ok: false, error: 'Not found' }, 404);
@@ -56,7 +53,7 @@ async function publicObject(request: Request, env: Env, key: string, image = fal
     headers.set('Cache-Control', HTML_CACHE);
     headers.set('Content-Type', 'text/html; charset=utf-8');
     headers.set('ETag', etag);
-    const unchanged = notModified(request, etag);
+    const unchanged = matchesEtag(condition, etag);
     return new Response(request.method === 'HEAD' || unchanged ? null : html, { status: unchanged ? 304 : 200, headers });
   }
   object.writeHttpMetadata(headers);
@@ -65,7 +62,7 @@ async function publicObject(request: Request, env: Env, key: string, image = fal
   const etag = image ? object.httpEtag : `W/"${object.etag}"`;
   headers.set('ETag', etag);
   const body = (object as Partial<R2ObjectBody>).body;
-  if (notModified(request, etag)) {
+  if (matchesEtag(condition, etag)) {
     if (body) await body.cancel();
     return new Response(null, { status: 304, headers });
   }
@@ -76,10 +73,13 @@ async function publicObject(request: Request, env: Env, key: string, image = fal
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    let operation: 'read' | 'digest' | 'image' | 'rebuild' = 'read';
+    let publicationAttempted = false;
     try {
       const path = new URL(request.url).pathname;
       const maintenance = /^\/api\/rebuild(?:\/([a-f0-9-]{36})(\/resume)?)?$/.exec(path);
       if (maintenance) {
+        operation = 'rebuild';
         await authenticate(request, env.API_SECRET);
         const publisher = env.PUBLISHER.getByName('site');
         if (!maintenance[1] && request.method === 'POST') {
@@ -98,6 +98,7 @@ export default {
         return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: maintenance[1] && !maintenance[2] ? 'GET' : 'POST' });
       }
       if (path === '/api/digests' || path === '/api/images') {
+        operation = path === '/api/digests' ? 'digest' : 'image';
         if (request.method !== 'POST') return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: 'POST' });
         await authenticate(request, env.API_SECRET);
         const origin = originFor(request, env);
@@ -107,7 +108,10 @@ export default {
           let input: unknown;
           try { input = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)); }
           catch { throw new HttpError(400, 'Invalid JSON'); }
-          await env.PUBLISHER.getByName('site').publish(validateDigest(input), origin);
+          const digest = validateDigest(input);
+          const publisher = env.PUBLISHER.getByName('site');
+          publicationAttempted = true;
+          await publisher.publish(digest, origin);
           return json({ ok: true, url: '/' });
         }
         return await withImageUploadSlot(async () => {
@@ -125,7 +129,10 @@ export default {
     } catch (error) {
       if (error instanceof HttpError) return json({ ok: false, error: error.message }, error.status, error.headers);
       console.error('Request failed', error instanceof Error ? error.name : 'Unknown error');
-      return json({ ok: false, error: 'Unable to complete request; publication may have completed. Check the homepage before posting again' }, 500);
+      const message = publicationAttempted
+        ? 'Unable to publish digest; publication may have completed. Check the homepage before posting again'
+        : { read: 'Unable to load content', digest: 'Unable to process digest', image: 'Unable to upload image', rebuild: 'Unable to complete rebuild request' }[operation];
+      return json({ ok: false, error: message }, 500);
     }
   },
 } satisfies ExportedHandler<Env>;

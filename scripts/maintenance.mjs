@@ -19,9 +19,11 @@ export async function maintenance(operation, environment, id, options = {}) {
   const secret = options.secret ?? readCredential(environment);
   const path = `/api/rebuild${operation === 'start' ? '' : `/${id}${operation === 'resume' ? '/resume' : ''}`}`;
   const response = await (options.request ?? fetch)(origin + path, { method: operation === 'status' ? 'GET' : 'POST', headers: { Authorization: `Bearer ${secret}` }, signal: AbortSignal.timeout(30000) });
-  const result = await response.json();
-  if (!response.ok) throw new Error(`Maintenance request failed (${response.status}): ${result.error ?? 'Unknown error'}`);
-  if (!result.job?.id || !result.job.status) throw new Error('Invalid maintenance response');
+  let result;
+  try { result = await response.json(); }
+  catch { throw new Error(response.ok ? `Invalid maintenance response (${response.status}): expected JSON` : `Maintenance request failed (${response.status}): non-JSON response`); }
+  if (!response.ok) throw new Error(`Maintenance request failed (${response.status}): ${typeof result?.error === 'string' ? result.error : 'Unknown error'}`);
+  if (typeof result?.job?.id !== 'string' || !/^[a-f0-9-]{36}$/.test(result.job.id) || !['queued', 'running', 'completed', 'failed'].includes(result.job.status)) throw new Error(`Invalid maintenance response (${response.status}): expected a rebuild job`);
   return result.job;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
