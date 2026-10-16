@@ -1,128 +1,101 @@
 # Lake Arrowhead . Town
 
-A Cloudflare Worker publishes daily community digests and hosts uploaded images. The existing HTML design and four selectable themes are shared by the homepage and daily permalinks.
-
-Digest publishing works like this:
+A Cloudflare Worker publishes an append-only community news feed and hosts uploaded images. The homepage preserves the existing design and four selectable themes.
 
 ```text
-POST /api/digests → authenticate and validate → serialized publisher → R2 JSON + HTML
+POST /api/digests → authenticate and validate → serialized publisher → R2 post + manifest + index
 POST /api/images  → authenticate and validate → R2 image → public image URL
-GET  /           → read the published homepage from R2
+POST /api/rebuild → durable background job → migrate legacy sources → rebuild the same snapshot
+GET  /           → read published HTML from R2
 ```
 
-Posting a digest rebuilds the homepage immediately. Publishing content does not require a Git commit, code deployment, or CI run.
-
-[Cloudflare setup](#set-up-cloudflare) · [Local development](#development) · [Authentication](#authentication-and-secrets) · [Publish a digest](#publish-a-digest) · [Upload an image](#upload-an-image) · [Operations](#operations-and-troubleshooting)
+New posts rebuild the homepage without a Git commit, deployment, or CI run. Every submission creates a new post, including duplicate requests. Corrections are follow-up posts.
 
 ## Set up Cloudflare
 
-### 1. Install the tools and sign in
+### 1. Install and sign in
 
-You need Node.js 24 or newer, npm, a Cloudflare account with Workers and R2 enabled, and access to the domain's DNS and registrar settings. Enable R2 in the Cloudflare dashboard if you have not used it before.
-
-Run these commands from the repository root:
+Use Node.js 24 or newer, npm, and a Cloudflare account with Workers and R2 enabled. Run commands from the repository root:
 
 ```sh
 npm ci
 npx wrangler login
 npx wrangler whoami
-```
-
-Confirm that Wrangler is signed into the account that will own the Worker, R2 buckets, and domain. If you use several accounts, select one explicitly:
-
-```sh
+# If you have multiple accounts:
 export CLOUDFLARE_ACCOUNT_ID=your-cloudflare-account-id
 ```
 
-The project uses the Wrangler version installed by `npm ci`.
-
-### 2. Review the configuration
-
-[`wrangler.jsonc`](wrangler.jsonc) defines both deployments. Production uses the top-level configuration; preview uses `env.preview`.
+[`wrangler.jsonc`](wrangler.jsonc) defines production at the top level and a separate `preview` environment. There is no named `production` environment.
 
 | Setting | Production | Preview |
 | --- | --- | --- |
-| Worker name | `lakearrowheadtown` | `lakearrowheadtown-preview` |
+| Worker | `lakearrowheadtown` | `lakearrowheadtown-preview` |
 | R2 bucket | `lakearrowheadtown-content` | `lakearrowheadtown-content-preview` |
 | R2 binding | `SITE_BUCKET` | `SITE_BUCKET` |
 | Durable Object binding | `PUBLISHER` | `PUBLISHER` |
-| Durable Object class | `DigestPublisher` | `DigestPublisher` |
-| `SITE_ORIGIN` variable | `https://lakearrowhead.town` | Empty; uses the request origin |
-| Publishing secret | `API_SECRET` | Separate `API_SECRET` |
-| Custom domain | `lakearrowhead.town` | None |
+| Publisher class | `DigestPublisher` | `DigestPublisher` |
+| `SITE_ORIGIN` | `https://lakearrowhead.town` | Empty; uses the request origin |
+| Local credential | `.secrets/production.vars` | `.dev.vars.preview` |
 
-Wrangler provisions the SQLite-backed Durable Object class and separate namespaces during deployment. You do not need to create a database or publisher object manually. The secret is configured separately from the checked-in variables.
+Wrangler provisions the SQLite-backed publisher and separate namespaces. Keep R2 buckets private, with public development URLs disabled and no R2 custom domain. The Worker exposes only the specified public routes; no S3 credentials are required. See [R2 Worker bindings](https://developers.cloudflare.com/r2/api/workers/workers-api-usage/).
 
-For another domain or account, update the Worker names, bucket names, production route, and production `SITE_ORIGIN` before deploying. `SITE_ORIGIN` must contain only the scheme and hostname, with an optional port and no additional path. It determines the absolute URLs returned by uploads and the canonical URLs embedded in rendered pages.
+For another domain or account, update the Worker names, buckets, route, and `SITE_ORIGIN`, plus the URL defaults and target allowlists in [`scripts/maintenance.mjs`](scripts/maintenance.mjs). `SITE_ORIGIN` must be an HTTP(S) origin without credentials, a path, query, or fragment.
 
-Keep both R2 buckets private: leave their public development URLs disabled and do not attach an R2 custom domain. The Worker exposes the public image and HTML routes through its R2 binding. No S3 credentials are needed. See [using R2 from Workers](https://developers.cloudflare.com/r2/api/workers/workers-api-usage/).
+### 2. Create buckets
 
-### 3. Create the R2 buckets
-
-Run these commands once, skipping buckets that already exist:
+Run once, skipping resources that already exist:
 
 ```sh
 npx wrangler r2 bucket create lakearrowheadtown-content-preview
 npx wrangler r2 bucket create lakearrowheadtown-content
 ```
 
-Use separate buckets for preview and production so verification posts and uploads do not appear on the live site.
+### 3. Bootstrap preview
 
-### 4. Deploy and verify preview
+The normal deployment script expects an existing local and remote publishing credential. For the first installation, deploy the code directly, then provision the secret:
 
 ```sh
-npm run deploy:preview
+npx wrangler deploy --env preview
 npm run secret -- preview
+npm run deploy:preview
 ```
 
-The first command uploads the Worker and configures its bindings. The second generates and uploads a random publishing secret, saving a local copy in `.dev.vars.preview`. On an existing installation, reuse the existing secret unless you intend to rotate it.
-
-Wrangler prints the deployed `workers.dev` URL. This project's preview is [lakearrowheadtown-preview.harold-martin.workers.dev](https://lakearrowheadtown-preview.harold-martin.workers.dev).
-
-Run the live smoke check:
+The final command deploys the code and durably queues the first rebuild. It prints a job ID and a status command, then exits without waiting for the rebuild to finish.
 
 ```sh
-node scripts/smoke-preview.mjs https://lakearrowheadtown-preview.harold-martin.workers.dev
+npm run rebuild:status -- preview JOB_UUID
+node scripts/smoke-preview.mjs https://lakearrowheadtown-preview.harold-martin.workers.dev --verify-edge
 ```
 
-The check uploads an image, creates and replaces two clearly labeled verification digests, and checks public retrieval, authentication, and ETag revalidation. It leaves that content in the preview bucket. The script accepts this project's exact preview hostname or `http://localhost:<port>`; if you change the deployed preview hostname, update its allowlist in [`scripts/smoke-preview.mjs`](scripts/smoke-preview.mjs).
+The smoke check uploads an image, appends three labeled posts (including a duplicate and a follow-up), checks public routes and ETags, and queues a rebuild. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The script accepts only the configured preview hostname or `http://localhost:<port>`.
 
-### 5. Connect the production domain
+### 4. Connect the domain
 
-In the Cloudflare dashboard, add `lakearrowhead.town` as a domain in the same account as the Worker. Review the imported DNS records and copy any missing records, including records used for email, subdomains, and certificate-authority permissions.
+Add `lakearrowhead.town` as a Cloudflare zone in the same account as the Worker. Review imported DNS records and copy any missing email, subdomain, and certificate-authority records.
 
-For a domain currently hosted elsewhere:
+1. Follow [Cloudflare's DNSSEC migration instructions](https://developers.cloudflare.com/dns/dnssec/) if the previous provider has an active DS record.
+2. At the registrar, replace the old authoritative nameservers with Cloudflare's assigned pair.
+3. Wait for the zone to become **Active**. During propagation, visitors may still reach the previous host.
+4. Remove conflicting records at the exact hostname assigned to the Worker; preserve unrelated records.
 
-1. Check whether DNSSEC is enabled at the current provider. Follow [Cloudflare's DNSSEC migration instructions](https://developers.cloudflare.com/dns/dnssec/) before changing nameservers if an old DS record is present.
-2. At the registrar, replace the current authoritative nameservers with the exact pair Cloudflare assigns to this zone. Domain registration can remain with the existing registrar.
-3. Wait for Cloudflare's domain overview to report the zone as **Active**. During propagation, some visitors may still reach the previous host.
-4. Remove any conflicting DNS record at the exact hostname being assigned to the Worker. Preserve unrelated records.
+The production `custom_domain: true` route lets Cloudflare manage Worker DNS and HTTPS certificates. See [Worker custom domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/).
 
-The checked-in `routes` entry uses `custom_domain: true`, so deploying the Worker attaches it to `lakearrowhead.town`. Cloudflare manages the domain's Worker DNS record and HTTPS certificate. This requires an active zone in the same account; see [Worker custom domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/).
-
-### 6. Deploy production and configure its secret
+### 5. Bootstrap production
 
 ```sh
-npm run deploy
+npx wrangler deploy --env=''
 npm run secret -- production
-```
-
-Production is the top-level Wrangler environment. Do not use `--env production`; there is no named environment with that name in the configuration. The package scripts select the correct environment automatically.
-
-The production secret is saved in `.dev.vars`. Supply its `API_SECRET` value to the server or job that will post digests and images. Keep the preview and production credentials separate. Both POST endpoints return `503` until a valid secret is configured.
-
-Check the site and confirm that an unauthenticated upload is rejected:
-
-```sh
+npm run deploy
+npm run rebuild:status -- production JOB_UUID
 curl --fail-with-body -I https://lakearrowhead.town/
 curl -i -X POST https://lakearrowhead.town/api/digests
 ```
 
-Expect `200` for the homepage and `401` for the POST. Before the first digest, the homepage displays an empty state. Production also has a `workers.dev` hostname printed by Wrangler, but its image URLs and canonical links still use the configured production `SITE_ORIGIN`.
+Expect `200` for the homepage and `401` for the unauthenticated POST once the secret is configured. Before any posts, the page shows an empty state and canonical metadata. Production image URLs use the configured `SITE_ORIGIN` even when requests arrive through its `workers.dev` hostname.
 
-## Development
+## Local development and verification
 
-Local development does not require remote buckets or a deployed Worker. Install dependencies and create a local credential file if one does not already exist:
+Create a local preview credential without changing any remote secret:
 
 ```sh
 npm ci
@@ -136,63 +109,66 @@ JS
 npm run dev
 ```
 
-Open http://localhost:8787. Local development uses emulated R2 and Durable Object storage under `.wrangler/`; it does not publish to the remote preview or production buckets. Generating the file above does not upload or rotate a remote secret. `.dev.vars.example` also documents the required variable.
+Open http://localhost:8787. R2 and Durable Objects are emulated under `.wrangler/`; local posts do not modify deployed buckets.
 
 ```sh
 npm run typecheck
 npm test
 npm run build
-```
-
-Tests use the Cloudflare Workers runtime with local R2 and a real publisher Durable Object. `build` bundles a production deployment without uploading it.
-
-To exercise the local endpoints using the generated credential:
-
-```sh
+npx wrangler deploy --env preview --dry-run --outdir dist/preview
 node scripts/smoke-preview.mjs http://localhost:8787
 ```
 
-## Authentication and secrets
+Tests exercise the Workers runtime, R2, Durable Object alarms/eviction, and local tooling. Build commands above are deployment dry runs. The local smoke check intentionally appends data and queues a local rebuild. It cannot verify Cloudflare edge caching or compression.
 
-Both upload endpoints require `Authorization: Bearer <API_SECRET>`. Public HTML and image retrieval does not require authentication. No browser admin UI or browser CORS API is provided.
+## Credentials and rotation
 
-Generate a secret during initial setup or rotate one deliberately:
+All publishing and maintenance operations require `Authorization: Bearer <API_SECRET>`. Scheme names are case-insensitive; the token is exact. Public page and image retrieval require no credentials.
+
+Provision or deliberately rotate a secret:
 
 ```sh
 npm run secret -- preview
 npm run secret -- production
 ```
 
-Each command generates 32 random bytes encoded as 64 hexadecimal characters, uploads the value using Wrangler secrets, and saves it in `.dev.vars.preview` or `.dev.vars` with owner-only permissions. The files are ignored by Git. Previous local values are backed up in the ignored `.secrets/` directory. Update the posting client's environment variable after rotation; the previous token stops authenticating once the remote update takes effect. A missing secret or one shorter than 32 characters disables publishing with a `503` response.
+These commands generate 32 random bytes as 64 hexadecimal characters and upload them using Wrangler secrets. They update only `API_SECRET`, preserve unrelated variables, and back up the previous complete credential file in ignored `.secrets/`. Files have owner-only permissions. A failed upload leaves the generated value available locally for retry. Update the posting client after rotation; old tokens stop authenticating once the update takes effect.
 
-For production requests below, load the production credential without printing it:
+Production credentials live in `.secrets/production.vars`, outside Wrangler's automatic local-development files. To move an existing production credential from `.dev.vars` without rotating or uploading it:
 
 ```sh
-. ./.dev.vars
+npm run secret:migrate-production
+```
+
+Migration backs up `.dev.vars`, preserves other variables, and refuses to overwrite a different production credential.
+
+For production curl examples:
+
+```sh
+. ./.secrets/production.vars
 export API_SECRET
 export SITE_URL=https://lakearrowhead.town
 ```
 
-For the remote preview, source `.dev.vars.preview` instead and set `SITE_URL` to the preview URL. For local development, use that same local file and `SITE_URL=http://localhost:8787`. The credentials must match the target environment. In an automated posting job, set `API_SECRET` in that job's secret store and `SITE_URL` in its environment.
+For preview, source `.dev.vars.preview` and use the preview URL. For local testing, source the same file and set `SITE_URL=http://localhost:8787`. An automated publisher should get its token from its own secret store.
 
-If a secret upload fails after saving the generated value locally, retry that same saved value with Wrangler rather than generating another one:
+If a secret upload fails, upload the same saved value rather than generating another:
 
 ```sh
-# Preview: source .dev.vars.preview, then use --env preview instead.
-. ./.dev.vars
+. ./.secrets/production.vars
 printf '%s' "$API_SECRET" | npx wrangler secret put API_SECRET --env=''
+# Preview: source .dev.vars.preview and use --env preview.
 ```
 
-See [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/) for manual secret management. Do not put the token in `wrangler.jsonc` or client-side code.
+A missing secret or one shorter than 32 characters disables protected endpoints with `503`. See [Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/).
 
-## Publish a digest
+## Publish posts
 
-Prepare a JSON file using [`examples/digest.json`](examples/digest.json). Change its date, title, timestamps, and items to the content you intend to publish. The request shape is:
+Prepare [`examples/digest.json`](examples/digest.json) with actual titles, source links, summaries, and item timestamps:
 
 ```json
 {
-  "date": "2026-10-16",
-  "title": "Morning Facebook digest — Fri Oct 16",
+  "title": "Morning Facebook digest",
   "source": "facebook-groups",
   "items": [
     {
@@ -208,8 +184,6 @@ Prepare a JSON file using [`examples/digest.json`](examples/digest.json). Change
 }
 ```
 
-Publish the file with the matching environment's credential:
-
 ```sh
 curl --fail-with-body "$SITE_URL/api/digests" \
   -H "Authorization: Bearer $API_SECRET" \
@@ -217,28 +191,19 @@ curl --fail-with-body "$SITE_URL/api/digests" \
   --data-binary @examples/digest.json
 ```
 
-All shown fields are required. `title`, `source`, `group`, and `headline` must be nonempty strings; `body` and `category` may be empty strings. `items` may be an empty array.
+Successful publication returns `200 {"ok":true,"url":"/"}` after the source, manifest, and index writes complete.
 
-- `date` is a real `YYYY-MM-DD` calendar date. It identifies the digest; reposting the date replaces the complete previous digest, including its items.
-- `body` is Markdown. Raw HTML is escaped, and unsafe Markdown link protocols are blocked. Markdown images can reference URLs returned by the image endpoint.
-- `posted_at` must be an ISO timestamp including `Z` or an explicit offset. The timestamp may be outside the digest day. Items retain submitted order; displayed timestamps use `America/Los_Angeles`.
-- `category` accepts any string, including an empty string. Categories do not control rendering or validation beyond their type. `items: []` publishes an empty daily digest.
-- `group_url` and `post_url` must be absolute HTTP(S) URLs without embedded credentials.
-- The request body is limited to 1 MiB, including for streamed requests without a Content-Length header.
+- Every request appends a post. There is no upsert, editing API, deletion API, or idempotency key. A rerun can create duplicates; publish a follow-up to correct a previous post.
+- The server assigns a unique ID, receipt timestamp, and Los Angeles date inside the serialized publisher. Any top-level `date`, `id`, or `received_at` sent by the client is ignored. Item `posted_at` values retain their original meaning and display in Los Angeles time.
+- `title`, `source`, `group`, and `headline` are required nonempty strings. `body` and `category` may be empty; `items: []` creates an empty post. Categories accept arbitrary strings; items retain submitted order.
+- Item timestamps require real calendar dates and an explicit timezone (`Z` or an offset). Source links must be absolute HTTP(S) URLs without credentials.
+- Markdown is rendered with raw HTML disabled and unsafe link protocols blocked. Plain-text fields are escaped. JSON requests are limited to 1 MiB, including streamed requests.
 
-Successful creates and corrections both return:
+A publish selects every published post received today and during the preceding six Los Angeles dates, newest receipt first. The homepage labels its date range and last publication time. It stays unchanged between posts, even when its covered week is old. There is no scheduled refresh. Template rebuilds retain the exact published selection and timestamp.
 
-```json
-{"ok":true,"url":"/digests/2026-10-16"}
-```
+R2 has no transaction spanning these objects. Index replacement is the commit point, and a failure can leave private source or manifest objects. After a timeout or `500`, check the homepage before posting again: publication may have completed, and another POST can create a duplicate.
 
-The response is sent after the source JSON, daily HTML, and homepage HTML have been written. Publishing is serialized through a single internal Durable Object to prevent overlapping homepage rebuilds. R2 does not support a transaction across these objects: a failed publish can leave partial writes and returns `500`. Reposting the same date safely repairs the pages.
-
-The homepage contains today and the preceding six dates in Los Angeles, newest date first, omitting missing dates. Its window is computed when a digest is posted and remains unchanged between posts. Backdated and future digests always have daily permalinks but appear on the homepage only when their date is in that window. Daily pages and images are retained indefinitely.
-
-To correct a digest, send the entire replacement payload with the same `date`. This is an upsert, not a partial update: omitted previous items are removed. Dates are the only identity key; changing `source` or `title` does not create a second digest for that day. No listing, pagination, deletion, or standalone Markdown endpoint is implemented.
-
-## Upload an image
+## Upload images
 
 ```sh
 curl --fail-with-body "$SITE_URL/api/images" \
@@ -246,79 +211,51 @@ curl --fail-with-body "$SITE_URL/api/images" \
   -F 'file=@photo.jpg;type=image/jpeg'
 ```
 
-Supply exactly one multipart field named `file`. JPEG, PNG, WebP, and GIF files are accepted up to 10 MiB. The declared media type must match the file signature. SVG is not supported. Validation checks signatures, not full image decoding or image re-encoding.
+Use exactly one multipart `file`. JPEG (`image/jpeg`), PNG, WebP, and GIF files up to 10 MiB are supported. The canonical media type must match the signature; aliases, generic/missing types, SVG, and contradictory types receive `415`. Signatures are checked without full image decoding or re-encoding. Let curl generate the multipart boundary.
 
-```json
-{"ok":true,"url":"https://lakearrowhead.town/images/<sha256>.jpg"}
-```
+The response is `200 {"ok":true,"url":"https://lakearrowhead.town/images/<sha256>.jpg"}`. Identical bytes return the same URL. Images have one-year immutable browser and Cloudflare Workers cache policies; an edge cache miss reads R2. See [Workers Caching configuration](https://developers.cloudflare.com/workers/cache/configuration/).
 
-Identical bytes return the same URL. Images are immutable and cached for a year. Reference them in a digest body with `![Description](https://lakearrowhead.town/images/<sha256>.jpg)`.
+Upload images first, include their returned URLs as `![Description](https://lakearrowhead.town/images/<hash>.jpg)` in Markdown, then publish. Two image uploads may process concurrently per isolate; excess requests return `503` with `Retry-After: 1` before their bodies are processed.
 
-The normal workflow is to upload images first, put the returned URLs into item Markdown, then publish the digest. Let curl generate the multipart boundary; do not manually set the request's `Content-Type` header when using `-F`.
+## Rebuilds, migration, and operations
 
-## Public routes and errors
-
-| Route | Behavior |
-| --- | --- |
-| `/`, `/index.html` | Pre-rendered weekly homepage |
-| `/digests/YYYY-MM-DD` | Pre-rendered daily permalink |
-| `/images/<sha256>.<extension>` | Public uploaded image |
-| `/favicon.svg` | Site favicon |
-
-Public routes support GET and HEAD; HTML and images support ETag revalidation. HTML requires revalidation and bypasses Cloudflare CDN caching so corrections are visible immediately. Source JSON, bucket listing, and arbitrary bucket paths are private. GET requests do not render Markdown or query the publisher's database.
-
-Errors are JSON: `{"ok":false,"error":"Short explanation"}`. Statuses include `400` for invalid input, `401` for failed authentication, `404` for unknown public routes, `405` for unsupported methods, `413` for oversized requests, `415` for unsupported media types, and `500`/`503` for storage or configuration failures. Credentials and submitted content are not logged on errors.
-
-## Operations and troubleshooting
-
-### Deploy code changes
+Normal code deployments queue background rebuilds automatically:
 
 ```sh
-npm ci
-npm run typecheck
-npm test
-npm run build
 npm run deploy:preview
-node scripts/smoke-preview.mjs https://lakearrowheadtown-preview.harold-martin.workers.dev
 npm run deploy
 ```
 
-Normal code deployments reuse the existing buckets, publisher namespaces, and secrets. Run secret generation only when provisioning or rotating credentials. No cron schedule is configured.
+These commands require matching local credentials and do not rotate secrets. They report success after code deployment and durable job creation, not after rendering. A failure to enqueue is a command failure even if code deployment already succeeded. Fix the credential/connection issue and use `rebuild` to queue work without redeploying. If `SITE_URL` was set for local testing, unset it before deployment; deployment scripts reject localhost rebuild targets.
 
-Rendered pages are stored independently from the Worker bundle. After a template or styling change, the next digest publish rebuilds the homepage with the new template. Repost a retained digest's complete payload to refresh that daily permalink as well. Redeploying code alone does not regenerate existing R2 HTML.
+```sh
+npm run rebuild -- preview
+npm run rebuild:status -- preview JOB_UUID
+npm run rebuild:resume -- preview JOB_UUID
+# Use production instead of preview for the live site.
+```
 
-### Inspect resources and logs
+Status includes the job ID, phase, migration count, timestamps, and queued/running/completed/failed state. Check it manually. Application failures pause at the first error and retain the current HTML until a successful replacement. Resume after repairing the cause. Later queued jobs report `blocked_by` when a failed earlier job blocks them. There are no external alerts or automatic application retries.
 
-In the Cloudflare dashboard, use **Workers & Pages** to inspect each Worker, its bindings, variables, secrets, custom domain, and logs. Use **R2 Object Storage** to inspect the corresponding bucket. The stored keys are:
+Jobs use persistent Durable Object state and one-shot alarms, surviving object eviction. Migration and rendering share the publishing queue. The initial job imports old `digests/YYYY-MM-DD.json` files in checkpointed batches of 25, using their R2 upload times as receipt times. Stable legacy IDs and conditional writes prevent duplicate imports after interruption. Existing sources and old daily HTML remain private backups. Normal publishing merges legacy/imported identities during migration.
+
+For the initial snapshot, the old stored index's upload time supplies the publication time and date-window anchor. If there is no index, the latest legacy receipt time is used. Later rebuilds use the published manifest so they cannot advance the date window or introduce uncommitted source posts.
 
 | R2 key | Contents |
 | --- | --- |
-| `digests/YYYY-MM-DD.json` | Private source payload used for rebuilds |
-| `pages/digests/YYYY-MM-DD.html` | Rendered daily permalink |
-| `pages/index.html` | Rendered weekly homepage |
-| `images/<sha256>.<extension>` | Uploaded image |
+| `posts/YYYY-MM-DD/<id>.json` | Private server-dated source posts |
+| `publications/<uuid>.json` | Immutable private snapshot manifests |
+| `pages/index.html` | Public rendered index; metadata references its manifest |
+| `images/<sha256>.<extension>` | Immutable uploaded images |
+| `digests/*.json`, `pages/digests/*.html` | Retained private legacy backups |
 
-Live logs are also available from the CLI:
+Only `/`, `/index.html`, `/images/<hash>.<extension>`, and `/favicon.svg` are public. Old daily routes return `404`. Sources, manifests, bucket listings, and config files are never exposed. There is no archive listing or public administration UI.
+
+HTML supports HEAD and weak ETag revalidation, requires revalidation, permits compression, and bypasses edge caching. Image GETs use Workers Caching. Protected APIs always return `no-store` JSON. Error statuses include `400`, `401`, `404`, `405`, `409` for invalid job resume, `413`, `415`, and `500`/`503`. Logs omit credentials and payloads.
 
 ```sh
 npx wrangler tail --env preview
-# Or production:
 npx wrangler tail --env=''
 ```
 
-### Resolve common problems
-
-| Symptom | Check |
-| --- | --- |
-| Domain still reaches the previous host | Registrar nameservers, Cloudflare zone activation, DNS propagation, and the Worker's custom-domain assignment. |
-| `401 Unauthorized` | Use the exact `Bearer` header and the secret for the target environment. If a key was rotated, update the posting job. |
-| `503 Publishing secret is not configured` | Upload `API_SECRET` to the correct Worker; it must be at least 32 characters. Allow the secret update to propagate. |
-| `503 Site origin is not configured correctly` | Set `SITE_ORIGIN` to an HTTP(S) origin without a path, credentials, query string, or fragment. |
-| `400` on a digest | Check the JSON error message, required fields, real date, absolute source URLs, and timezone-bearing timestamps. |
-| `413` on an upload | Keep digest JSON within 1 MiB and each image within 10 MiB. |
-| `415` on an image | Use multipart `file`, a supported image format, and the matching file media type. |
-| Daily page exists but the digest is absent from the homepage | Its `date` must be today or one of the preceding six dates in Los Angeles when the latest publish occurred. The example date must be updated for current posts. |
-| Homepage still shows last week's content | The window advances only when another digest is posted. No background refresh runs. |
-| `500` after publishing | Inspect Worker logs and the `SITE_BUCKET`/`PUBLISHER` bindings, then retry the same complete payload. A retry repairs partial writes. |
-
-Keep the buckets and publisher namespace when rolling back Worker code. Code rollback does not restore previous digest contents; restore content by reposting the desired payload for its date. There is no automatic content deletion or retention cleanup.
+Use the Cloudflare dashboard to inspect Worker bindings, variables, secrets, logs, and private R2 objects. During rollout, verify preview smoke checks with `--verify-edge`, confirm the rebuild completed, and inspect all four themes before deploying production. Rolling back code does not roll back R2 content; preserve source objects and manifests. Do not run the previous upsert-based Worker against the migrated bucket.

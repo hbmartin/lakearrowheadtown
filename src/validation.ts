@@ -1,7 +1,7 @@
 import type { Digest, DigestItem } from './types';
 
 export class HttpError extends Error {
-  constructor(public status: number, message: string) { super(message); }
+  constructor(public status: number, message: string, public headers: HeadersInit = {}) { super(message); }
 }
 
 function invalid(message: string): never { throw new HttpError(400, message); }
@@ -42,8 +42,6 @@ function timestamp(value: unknown, field: string): string {
 
 export function validateDigest(value: unknown): Digest {
   const input = record(value, 'digest');
-  const date = string(input.date, 'date');
-  if (!isDate(date)) invalid('date must be a real YYYY-MM-DD calendar date');
   if (!Array.isArray(input.items)) invalid('items must be an array');
   const items = input.items.map((value, i): DigestItem => {
     const item = record(value, `items[${i}]`);
@@ -58,7 +56,8 @@ export function validateDigest(value: unknown): Digest {
       posted_at: timestamp(item.posted_at, field('posted_at')),
     };
   });
-  return { date, title: string(input.title, 'title'), source: string(input.source, 'source'), items };
+  // Client-supplied date/receipt/identity fields never control server publication.
+  return { title: string(input.title, 'title'), source: string(input.source, 'source'), items };
 }
 
 export async function readLimited(request: Request, limit: number): Promise<ArrayBuffer> {

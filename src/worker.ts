@@ -1,80 +1,102 @@
-import { DurableObject } from 'cloudflare:workers';
 import { timingSafeEqual } from 'node:crypto';
-import emptyPage from '../index.html';
 import favicon from '../favicon.svg';
-import { hashBytes, IMAGE_CACHE, imageUpload } from './images';
-import { HTML_CACHE, publishDigest } from './publishing';
-import type { Digest, Env } from './types';
-import { HttpError, isDate, readLimited, validateDigest } from './validation';
-
-export class DigestPublisher extends DurableObject<Env> {
-  private queue: Promise<void> = Promise.resolve();
-
-  async publish(digest: Digest, origin: string): Promise<void> {
-    const job = this.queue.then(() => publishDigest(this.env.SITE_BUCKET, digest, origin));
-    // A rejected job must not poison the queue for the next correction.
-    this.queue = job.then(() => {}, () => {});
-    await job;
-  }
-}
+import { hashBytes, IMAGE_CACHE, imageUpload, withImageUploadSlot } from './images';
+import { HTML_CACHE } from './publishing';
+import { renderPage } from './render';
+import type { Env } from './types';
+import { HttpError, readLimited, validateDigest } from './validation';
+export { DigestPublisher } from './publisher';
 
 function json(value: unknown, status = 200, headers: HeadersInit = {}): Response {
-  return Response.json(value, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...headers } });
+  return Response.json(value, { status, headers: { 'Cache-Control': 'no-store', 'Cloudflare-CDN-Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...headers } });
 }
 
 async function authenticate(request: Request, secret?: string): Promise<void> {
   if (!secret || secret.length < 32) throw new HttpError(503, 'Publishing secret is not configured');
-  const authorization = request.headers.get('authorization') ?? '';
-  const [provided, expected] = await Promise.all([authorization, `Bearer ${secret}`].map(async value => new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))));
+  const token = /^Bearer +([^\s]+)$/i.exec(request.headers.get('authorization') ?? '')?.[1] ?? '';
+  const [provided, expected] = await Promise.all([token, secret].map(async value => new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))));
   if (!timingSafeEqual(provided, expected)) throw new HttpError(401, 'Unauthorized');
 }
 
 function originFor(request: Request, env: Env): string {
-  const url = new URL(env.SITE_ORIGIN || new URL(request.url).origin);
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new HttpError(503, 'Site origin is not configured correctly');
-  return url.origin;
+  try {
+    const url = new URL(env.SITE_ORIGIN || new URL(request.url).origin);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Invalid origin');
+    return url.origin;
+  } catch { throw new HttpError(503, 'Site origin is not configured correctly'); }
 }
 
 function notModified(request: Request, etag: string): boolean {
   return (request.headers.get('if-none-match') ?? '').split(',').some(tag => tag.trim() === '*' || tag.trim().replace(/^W\//, '') === etag.replace(/^W\//, ''));
 }
 
+// One cached fallback per serving origin; never hash static HTML on every request.
+const fallbackPages = new Map<string, Promise<{ html: string; etag: string }>>();
+function fallbackFor(origin: string): Promise<{ html: string; etag: string }> {
+  let page = fallbackPages.get(origin);
+  if (!page) {
+    page = (async () => {
+      const html = renderPage([], { origin });
+      return { html, etag: `W/"${await hashBytes(new TextEncoder().encode(html))}"` };
+    })();
+    fallbackPages.set(origin, page);
+  }
+  return page;
+}
+
 async function publicObject(request: Request, env: Env, key: string, image = false): Promise<Response> {
-  const object = await env.SITE_BUCKET.get(key);
-  const headers = new Headers({
-    'Cache-Control': image ? IMAGE_CACHE : HTML_CACHE,
-    // Do not let an edge cache mask a newly published correction.
-    'Cloudflare-CDN-Cache-Control': image ? IMAGE_CACHE : 'no-store',
-    'X-Content-Type-Options': 'nosniff',
-  });
+  const condition = request.headers.get('if-none-match');
+  const object = request.method === 'HEAD'
+    ? await env.SITE_BUCKET.head(key)
+    : await env.SITE_BUCKET.get(key, condition ? { onlyIf: new Headers({ 'If-None-Match': condition }) } : undefined);
+  const headers = new Headers({ 'Cloudflare-CDN-Cache-Control': image ? IMAGE_CACHE : 'no-store', 'X-Content-Type-Options': 'nosniff' });
   if (!object) {
     if (key !== 'pages/index.html') return json({ ok: false, error: 'Not found' }, 404);
-    const etag = `W/"${await hashBytes(new TextEncoder().encode(emptyPage).buffer as ArrayBuffer)}"`;
+    const { html, etag } = await fallbackFor(originFor(request, env));
+    headers.set('Cache-Control', HTML_CACHE);
     headers.set('Content-Type', 'text/html; charset=utf-8');
     headers.set('ETag', etag);
-    return new Response(request.method === 'HEAD' || notModified(request, etag) ? null : emptyPage, { status: notModified(request, etag) ? 304 : 200, headers });
+    const unchanged = notModified(request, etag);
+    return new Response(request.method === 'HEAD' || unchanged ? null : html, { status: unchanged ? 304 : 200, headers });
   }
   object.writeHttpMetadata(headers);
-  // Apply serving policy after stored metadata, including older rendered pages.
+  // Serving policy overrides metadata on older stored objects too.
   headers.set('Cache-Control', image ? IMAGE_CACHE : HTML_CACHE);
-  // Weak HTML validators survive Cloudflare's automatic response compression.
   const etag = image ? object.httpEtag : `W/"${object.etag}"`;
   headers.set('ETag', etag);
+  const body = (object as Partial<R2ObjectBody>).body;
   if (notModified(request, etag)) {
-    await object.body.cancel();
+    if (body) await body.cancel();
     return new Response(null, { status: 304, headers });
   }
-  if (request.method === 'HEAD') {
-    await object.body.cancel();
-    return new Response(null, { headers });
-  }
-  return new Response(object.body, { headers });
+  if (request.method === 'HEAD') return new Response(null, { headers });
+  if (!body) throw new Error('Unexpected conditional read result');
+  return new Response(body, { headers });
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const path = new URL(request.url).pathname;
+      const maintenance = /^\/api\/rebuild(?:\/([a-f0-9-]{36})(\/resume)?)?$/.exec(path);
+      if (maintenance) {
+        await authenticate(request, env.API_SECRET);
+        const publisher = env.PUBLISHER.getByName('site');
+        if (!maintenance[1] && request.method === 'POST') {
+          const job = await publisher.enqueueRebuild(originFor(request, env));
+          return json({ ok: true, job }, 202);
+        }
+        if (maintenance[1] && !maintenance[2] && request.method === 'GET') {
+          const job = await publisher.jobStatus(maintenance[1]);
+          return job ? json({ ok: true, job }) : json({ ok: false, error: 'Job not found' }, 404);
+        }
+        if (maintenance[2] && request.method === 'POST') {
+          const job = await publisher.resumeRebuild(maintenance[1]);
+          if (!job) return json({ ok: false, error: 'Job not found' }, 404);
+          return job === 'conflict' ? json({ ok: false, error: 'Only failed jobs can resume' }, 409) : json({ ok: true, job }, 202);
+        }
+        return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: maintenance[1] && !maintenance[2] ? 'GET' : 'POST' });
+      }
       if (path === '/api/digests' || path === '/api/images') {
         if (request.method !== 'POST') return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: 'POST' });
         await authenticate(request, env.API_SECRET);
@@ -85,27 +107,25 @@ export default {
           let input: unknown;
           try { input = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)); }
           catch { throw new HttpError(400, 'Invalid JSON'); }
-          const digest = validateDigest(input);
-          await env.PUBLISHER.getByName('site').publish(digest, origin);
-          return json({ ok: true, url: `/digests/${digest.date}` });
+          await env.PUBLISHER.getByName('site').publish(validateDigest(input), origin);
+          return json({ ok: true, url: '/' });
         }
-        const image = await imageUpload(request);
-        const key = `images/${await hashBytes(image.bytes)}.${image.extension}`;
-        await env.SITE_BUCKET.put(key, image.bytes, { httpMetadata: { contentType: image.type, cacheControl: IMAGE_CACHE } });
-        return json({ ok: true, url: `${origin}/${key}` });
+        return await withImageUploadSlot(async () => {
+          const image = await imageUpload(request);
+          const key = `images/${image.hash}.${image.extension}`;
+          await env.SITE_BUCKET.put(key, image.file.stream(), { httpMetadata: { contentType: image.type, cacheControl: IMAGE_CACHE } });
+          return json({ ok: true, url: `${origin}/${key}` });
+        });
       }
       if (!['GET', 'HEAD'].includes(request.method)) return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: 'GET, HEAD' });
       if (path === '/' || path === '/index.html') return await publicObject(request, env, 'pages/index.html');
-      const date = /^\/digests\/(\d{4}-\d{2}-\d{2})$/.exec(path)?.[1];
-      if (date && isDate(date)) return await publicObject(request, env, `pages/digests/${date}.html`);
       if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return await publicObject(request, env, path.slice(1), true);
       if (path === '/favicon.svg') return new Response(request.method === 'HEAD' ? null : favicon, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400', 'X-Content-Type-Options': 'nosniff' } });
       return json({ ok: false, error: 'Not found' }, 404);
     } catch (error) {
-      if (error instanceof HttpError) return json({ ok: false, error: error.message }, error.status);
-      // Avoid logging payloads or credentials on upload failures.
+      if (error instanceof HttpError) return json({ ok: false, error: error.message }, error.status, error.headers);
       console.error('Request failed', error instanceof Error ? error.name : 'Unknown error');
-      return json({ ok: false, error: 'Unable to complete request; retry safely' }, 500);
+      return json({ ok: false, error: 'Unable to complete request; publication may have completed. Check the homepage before posting again' }, 500);
     }
   },
 } satisfies ExportedHandler<Env>;
