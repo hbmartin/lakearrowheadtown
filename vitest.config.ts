@@ -11,5 +11,5 @@ export default defineConfig({
       },
     },
   })],
-  test: { fileParallelism: false },
+  test: { fileParallelism: false, include: ['test/**/*.test.ts'] },
 });

@@ -6,6 +6,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "preview_urls": false,
+  "cache": { "enabled": true },
   "routes": [{ "pattern": "lakearrowhead.town", "custom_domain": true }],
   "vars": { "SITE_ORIGIN": "https://lakearrowhead.town" },
   "r2_buckets": [{ "binding": "SITE_BUCKET", "bucket_name": "lakearrowheadtown-content" }],

@@ -5,12 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --env preview",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:scripts",
     "typecheck": "tsc --noEmit",
     "build": "wrangler deploy --env='' --dry-run --outdir dist",
-    "deploy:preview": "wrangler deploy --env preview",
-    "deploy": "wrangler deploy --env=''",
-    "secret": "node scripts/provision-secret.mjs"
+    "deploy:preview": "node scripts/deploy.mjs preview",
+    "deploy": "node scripts/deploy.mjs production",
+    "secret": "node scripts/provision-secret.mjs",
+    "test:scripts": "node --test test/scripts.test.mjs",
+    "secret:migrate-production": "node scripts/migrate-production-secret.mjs",
+    "rebuild": "node scripts/maintenance.mjs start",
+    "rebuild:status": "node scripts/maintenance.mjs status",
+    "rebuild:resume": "node scripts/maintenance.mjs resume"
   },
   "dependencies": {
     "markdown-it": "^15.0.3"
