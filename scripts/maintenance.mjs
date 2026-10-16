@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { checkEnvironment, readCredential } from './credentials.mjs';
+import { checkEnvironment, readPublishingCredential } from './credentials.mjs';
 
 const defaults = { preview: 'https://lakearrowheadtown-preview.harold-martin.workers.dev', production: 'https://lakearrowhead.town' };
 export function maintenanceTarget(environment, value = process.env.SITE_URL || defaults[environment]) {
@@ -16,7 +16,7 @@ export async function maintenance(operation, environment, id, options = {}) {
   if (!['start', 'status', 'resume'].includes(operation)) throw new Error('Choose start, status, or resume');
   if (operation !== 'start' && !/^[a-f0-9-]{36}$/.test(id ?? '')) throw new Error('Provide the rebuild job UUID');
   const origin = maintenanceTarget(environment, options.origin);
-  const secret = options.secret ?? readCredential(environment);
+  const secret = options.secret ?? readPublishingCredential(environment);
   const path = `/api/rebuild${operation === 'start' ? '' : `/${id}${operation === 'resume' ? '/resume' : ''}`}`;
   const response = await (options.request ?? fetch)(origin + path, { method: operation === 'status' ? 'GET' : 'POST', headers: { Authorization: `Bearer ${secret}` }, signal: AbortSignal.timeout(30000) });
   let result;

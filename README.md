@@ -52,7 +52,7 @@ npx wrangler r2 bucket create lakearrowheadtown-content
 
 ### 3. Bootstrap preview
 
-The normal deployment script expects an existing local and remote publishing credential. For the first installation, deploy the code directly, then provision the secret:
+The normal deployment script expects an existing publishing credential in the build environment or a local file, matching the remote secret. For the first installation, deploy the code directly, then provision the secret:
 
 ```sh
 npx wrangler deploy --env preview
@@ -92,6 +92,25 @@ curl -i -X POST https://lakearrowhead.town/api/digests
 ```
 
 Expect `200` for the homepage and `401` for the unauthenticated POST once the secret is configured. Before any posts, the page shows an empty state and canonical metadata. Production image URLs use the configured `SITE_ORIGIN` even when requests arrive through its `workers.dev` hostname.
+
+### 6. Deploy production automatically from `main`
+
+Connect the existing `lakearrowheadtown` Worker to `hbmartin/lakearrowheadtown` in **Settings > Builds > Connect**. Use [Cloudflare Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/git-integration/github-integration/) with these settings:
+
+| Setting | Value |
+| --- | --- |
+| Production branch | `main` |
+| Root directory | `/` (repository root) |
+| Build command | `npm run typecheck && npm test && npm run build` |
+| Deploy command | `npm run deploy` |
+| Preview builds | Disabled for this production Worker |
+| Build secret | `PRODUCTION_API_SECRET`, containing the existing production `API_SECRET` value |
+
+The committed `.node-version` selects Node.js 24. Cloudflare installs dependencies before the build command. Add `PRODUCTION_API_SECRET` as an encrypted **build** secret; the Worker's runtime `API_SECRET` is configured separately and is not automatically available to builds. Use the existing token from `.secrets/production.vars`, migrating it from `.dev.vars` first if necessary. Do not run `npm run secret` just to set up Builds, because that rotates the publishing token. Update the build secret whenever the runtime token is rotated.
+
+Each push to `main`, including a merged pull request, runs validation and then deploys production. Failed validation stops deployment. The deploy command queues a durable homepage rebuild using production content and prints its job ID. Check that job as described below; a successful build means the rebuild was queued, not that it has finished. Preview remains available through `npm run deploy:preview`, with its own Worker and storage.
+
+The deployment and maintenance commands prefer the environment-specific `PRODUCTION_API_SECRET` or `PREVIEW_API_SECRET` process variable when present, then fall back to the matching local credential file. An invalid process variable fails instead of falling back. Secret provisioning and migration continue to use local files.
 
 ## Local development and verification
 
@@ -230,7 +249,7 @@ npm run deploy:preview
 npm run deploy
 ```
 
-These commands require matching local credentials and do not rotate secrets. They report success after code deployment and durable job creation, not after rendering. A failure to enqueue is a command failure even if code deployment already succeeded. Fix the credential/connection issue and use `rebuild` to queue work without redeploying. If `SITE_URL` was set for local testing, unset it before deployment; deployment scripts reject localhost rebuild targets.
+These commands require matching credentials from an environment-specific process variable or local file and do not rotate secrets. They report success after code deployment and durable job creation, not after rendering. A failure to enqueue is a command failure even if code deployment already succeeded. Fix the credential/connection issue and use `rebuild` to queue work without redeploying. If `SITE_URL` was set for local testing, unset it before deployment; deployment scripts reject localhost rebuild targets.
 
 ```sh
 npm run rebuild -- preview

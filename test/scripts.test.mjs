@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { migrateProductionCredential, readCredential, saveCredential, updateSecret } from '../scripts/credentials.mjs';
+import { migrateProductionCredential, readCredential, readPublishingCredential, saveCredential, updateSecret } from '../scripts/credentials.mjs';
 import { deploy } from '../scripts/deploy.mjs';
 import { maintenance, maintenanceTarget } from '../scripts/maintenance.mjs';
 import { provisionSecret } from '../scripts/provision-secret.mjs';
@@ -31,6 +31,34 @@ test('production credentials live outside Wrangler automatic local files', t => 
   assert.equal(file, join(root, '.secrets/production.vars'));
   assert.equal(readCredential('production', root), secret);
   assert.equal(readdirSync(root).includes('.dev.vars'), false);
+});
+test('build credentials select only the requested environment without local secret files', t => {
+  const root = directory(t);
+  const preview = 'b'.repeat(64);
+  const variables = { PRODUCTION_API_SECRET: secret, PREVIEW_API_SECRET: preview };
+  assert.equal(readPublishingCredential('production', variables, root), secret);
+  assert.equal(readPublishingCredential('preview', variables, root), preview);
+  assert.deepEqual(readdirSync(root), []);
+  assert.throws(() => readPublishingCredential('preview', { PRODUCTION_API_SECRET: secret, API_SECRET: secret }, root), /Missing/);
+  assert.throws(() => readPublishingCredential('production', { PREVIEW_API_SECRET: preview, API_SECRET: preview }, root), /Missing/);
+});
+test('publishing credentials prefer build secrets and otherwise use the environment file', t => {
+  const root = directory(t);
+  const local = 'b'.repeat(64);
+  for (const environment of ['production', 'preview']) {
+    saveCredential(environment, local, root);
+    const name = `${environment.toUpperCase()}_API_SECRET`;
+    assert.equal(readPublishingCredential(environment, {}, root), local);
+    assert.equal(readPublishingCredential(environment, { [name]: secret }, root), secret);
+    for (const value of ['', 'too-short']) {
+      assert.throws(() => readPublishingCredential(environment, { [name]: value }, root), error => {
+        assert.match(error.message, new RegExp(`${name} is missing or too short`));
+        assert(!error.message.includes(value || secret));
+        return true;
+      });
+    }
+  }
+  assert.throws(() => readPublishingCredential('invalid', { INVALID_API_SECRET: secret }, root), /Choose preview or production/);
 });
 test('explicit migration preserves the token and unrelated variables without any remote call', t => {
   const root = directory(t);

@@ -18,6 +18,14 @@ export function readCredential(environment, root = process.cwd()) {
   if (!value || value.length < 32) throw new Error(`API_SECRET is missing or too short in ${file}`);
   return value;
 }
+export function readPublishingCredential(environment, variables = process.env, root = process.cwd()) {
+  checkEnvironment(environment);
+  const name = `${environment.toUpperCase()}_API_SECRET`;
+  if (!Object.hasOwn(variables, name)) return readCredential(environment, root);
+  const value = variables[name];
+  if (typeof value !== 'string' || value.length < 32) throw new Error(`${name} is missing or too short`);
+  return value;
+}
 export function updateSecret(text, secret) {
   const before = parseEnv(text);
   const result = text.replace(/^[ \t]*(?:export[ \t]+)?API_SECRET[ \t]*=.*(?:\r?\n|$)/gm, '');
