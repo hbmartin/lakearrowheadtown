@@ -32,11 +32,12 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const run = `Preview verification ${crypto.randomUUID()}`;
   const input = {
     date: '2099-01-01', title: run, source: 'deployment-smoke-test',
-    items: [{ group: 'Preview verification', group_url: 'https://lakearrowhead.town/', headline: 'Publishing verification', body: `This is preview test content.\n\n**Markdown works.**\n\n![Uploaded image](${imageUrl})`, post_url: 'https://lakearrowhead.town/', category: 'announcement', posted_at: new Date().toISOString() }],
+    items: [{ group: 'Preview verification', group_url: 'https://lakearrowhead.town/', headline: run, body: `This is preview test content.\n\n**Markdown works.**\n\n![Uploaded image](${imageUrl})`, post_url: 'https://lakearrowhead.town/', category: 'announcement', posted_at: new Date().toISOString() }],
   };
   let previousTag;
   for (let attempt = 0; attempt < 3; attempt++) {
     input.title = `${run}${attempt === 2 ? ' follow-up correction' : ''}`;
+    input.items[0].headline = input.title;
     const response = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
     assert.equal(response.status, 200, await response.clone().text());
     assert.deepEqual(await response.json(), { ok: true, url: '/' });
@@ -45,7 +46,8 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     const html = await homepage.text();
     assert(html.includes('<strong>Markdown works.</strong>'));
     assert(html.includes('Last published'));
-    assert.equal(html.split(`<p class="digest-title">${run}`).length - 1, attempt + 1);
+    assert.equal(html.split(`<h3>${run}`).length - 1, attempt + 1);
+    assert(html.indexOf('Posts from') > html.indexOf('</main>'));
     assert(!html.includes('href="/digests/'));
     previousTag = homepage.headers.get('etag');
     assert(previousTag?.startsWith('W/'), 'HTML must expose a weak ETag');

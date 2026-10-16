@@ -148,7 +148,7 @@
 
     body {
       isolation: isolate;
-      padding-bottom: 7rem;
+      padding-bottom: 3rem;
       background: var(--page-bg);
       color: var(--text);
       font-family: var(--body-font);
@@ -169,7 +169,7 @@
       margin-inline: auto;
     }
     body > header {
-      padding-block: clamp(3rem, 9vw, 8rem) clamp(2rem, 5vw, 4rem);
+      padding-block: clamp(5rem, 9vw, 8rem) clamp(2rem, 5vw, 4rem);
       border-bottom: 1px solid var(--border);
     }
     h1, h2, h3, h4, h5, h6 {
@@ -179,20 +179,17 @@
       letter-spacing: -0.035em;
       line-height: 1.06;
     }
-    h1 { max-width: 16ch; font-size: clamp(2.75rem, 7.5vw, 6rem); }
-    :root[data-theme="village-heritage"] h1 { font-size: clamp(2rem, 10.25vw, 6rem); }
+    body > header h1 { font-size: clamp(1rem, 7vw, 6rem); white-space: nowrap; }
     main { padding-block: clamp(2rem, 5vw, 4rem); }
     a { color: var(--primary); text-underline-offset: 0.2em; }
     ::selection { background: var(--selected-bg); color: var(--text); }
 
     .site-title { color: inherit; text-decoration: none; }
     .digest { max-width: 52rem; }
-    .snapshot-meta, .received-at { color: var(--muted); font-size: 0.875rem; }
-    .snapshot-meta { max-width: 52rem; margin-bottom: 2rem; }
+    .snapshot-meta { max-width: 52rem; margin-top: 0.75rem; }
     .digest + .digest { margin-top: 4rem; padding-top: 3rem; border-top: 1px solid var(--border); }
     .digest-header { margin-bottom: 2rem; }
     .digest-header h2 { font-size: clamp(1.875rem, 4vw, 3rem); line-height: 1.15; }
-    .digest-title { margin-top: 0.75rem; color: var(--muted); font-size: 1.0625rem; }
     .digest-item { padding-block: 1.75rem; border-top: 1px solid var(--border); }
     .item-meta { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: baseline; color: var(--muted); font-size: 0.8125rem; }
     .category { padding: 0.125rem 0.5rem; border: 1px solid var(--border); border-radius: 0.375rem; }
@@ -213,38 +210,31 @@
       position: fixed;
       z-index: 10;
       right: max(1rem, env(safe-area-inset-right));
-      bottom: max(1rem, env(safe-area-inset-bottom));
+      top: max(1rem, env(safe-area-inset-top));
       max-width: calc(100vw - 2rem - env(safe-area-inset-left) - env(safe-area-inset-right));
       font-size: 0.875rem;
     }
     .theme-trigger {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      min-height: 3.5rem;
-      max-width: 100%;
+      display: grid;
+      place-items: center;
+      width: 44px;
+      height: 44px;
       margin-left: auto;
-      padding: 0.65rem 1rem;
+      padding: 0;
       border: 1px solid var(--control-border);
       border-radius: var(--radius);
       background: var(--surface);
       box-shadow: var(--shadow);
-      text-align: left;
     }
     .theme-trigger:hover, .theme-trigger[aria-expanded="true"] { background: var(--surface-hover); }
-    .theme-trigger > svg { flex: 0 0 1.25rem; color: var(--primary); }
-    .theme-trigger-copy { min-width: 0; }
-    .theme-trigger-label { display: block; color: var(--muted); font-size: 0.6875rem; }
-    .theme-current { display: block; font-weight: 600; line-height: 1.35; }
-    .theme-chevron { margin-left: 0.5rem; }
-    .theme-trigger[aria-expanded="true"] .theme-chevron { transform: rotate(180deg); }
+    .theme-trigger > svg { color: var(--primary); }
     .theme-panel {
       position: absolute;
       right: 0;
-      bottom: calc(100% + 0.75rem);
+      top: calc(100% + 0.75rem);
       width: min(22rem, calc(100vw - 2rem - env(safe-area-inset-left) - env(safe-area-inset-right)));
-      max-height: calc(100vh - 7rem);
-      max-height: calc(100svh - 7rem - env(safe-area-inset-bottom));
+      max-height: calc(100vh - 6rem);
+      max-height: calc(100svh - 6rem - env(safe-area-inset-top) - env(safe-area-inset-bottom));
       overflow-y: auto;
       overscroll-behavior: contain;
       padding: 1rem;
@@ -287,14 +277,6 @@
       border-radius: 50%;
       background: var(--swatch);
     }
-    .theme-trigger::after {
-      content: '';
-      flex: 0 0 0.375rem;
-      width: 0.375rem;
-      height: 0.375rem;
-      border-radius: 50%;
-      background: var(--accent);
-    }
     @media (prefers-reduced-motion: no-preference) {
       body, .theme-trigger, .theme-panel, .theme-option {
         transition: background-color 180ms ease, color 180ms ease, border-color 180ms ease;
@@ -308,14 +290,17 @@
 </head>
 <body>
   <header>
-    <h1><a class="site-title" href="/">News from Lake Arrowhead . Town</a></h1>
+    <h1><a class="site-title" href="/">Lake Arrowhead . Town</a></h1>
   </header>
   <main>
     <!-- digests:start -->
-    <p class="empty-state">No digests published in the past week. Check back for news from around the mountain.</p>
+    <p class="empty-state">No posts from the past week. Check back for news from around the mountain.</p>
     <!-- digests:end -->
   </main>
-  <footer>Community news from around the mountain.</footer>
+  <footer>
+    <p>Community news from around the mountain.</p>
+    <!-- snapshot-meta -->
+  </footer>
   <div class="theme-picker" hidden>
     <div class="theme-panel" id="theme-panel" hidden>
       <fieldset>
@@ -364,16 +349,11 @@
         </div>
       </fieldset>
     </div>
-    <button class="theme-trigger" type="button" aria-expanded="false" aria-controls="theme-panel">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+    <button class="theme-trigger" type="button" aria-label="Choose theme (current: Deep Lake &amp; Lodge)" aria-expanded="false" aria-controls="theme-panel">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
         <path d="M12 3a9 9 0 1 0 0 18h1.2a2.3 2.3 0 0 0 1.5-4c-.7-.6-.3-1.8.6-1.8H17a4 4 0 0 0 4-4C21 6.6 17 3 12 3Z"/>
         <circle cx="7.5" cy="10" r=".8"/><circle cx="11" cy="7" r=".8"/><circle cx="15.5" cy="8" r=".8"/>
       </svg>
-      <span class="theme-trigger-copy">
-        <span class="theme-trigger-label">Theme</span>
-        <span class="theme-current">Deep Lake &amp; Lodge</span>
-      </span>
-      <svg class="theme-chevron" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m4 10 4-4 4 4"/></svg>
     </button>
   </div>
   <script>
@@ -381,7 +361,6 @@
       const picker = document.querySelector('.theme-picker');
       const trigger = picker.querySelector('.theme-trigger');
       const panel = document.getElementById('theme-panel');
-      const currentName = picker.querySelector('.theme-current');
       const radios = [...picker.querySelectorAll('input[name="theme"]')];
       const themeColor = document.querySelector('meta[name="theme-color"]');
 
@@ -389,7 +368,9 @@
         const selected = radios.find(radio => radio.value === value) || radios[0];
         document.documentElement.dataset.theme = selected.value;
         selected.checked = true;
-        currentName.textContent = selected.closest('label').querySelector('.theme-name').textContent;
+        const name = selected.closest('label').querySelector('.theme-name').textContent;
+        trigger.setAttribute('aria-label', `Choose theme (current: ${name})`);
+        trigger.title = `Choose theme (current: ${name})`;
         themeColor.content = getComputedStyle(document.documentElement).getPropertyValue('--page-bg').trim();
         if (persist) {
           try {

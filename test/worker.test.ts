@@ -6,7 +6,7 @@ import { currentPublication, initialMigration, migrateBatch, postKey, publishDig
 import { recentDates, renderPage } from '../src/render';
 import { readLimited, validateDigest } from '../src/validation';
 import { IMAGE_LIMIT, withImageUploadSlot } from '../src/images';
-import type { ContentBucket, Digest, Env, RebuildJob, StoredPost } from '../src/types';
+import type { ContentBucket, Digest, DigestItem, Env, RebuildJob, StoredPost } from '../src/types';
 
 const bindings = env as unknown as Env;
 const secret = 'test-secret-at-least-thirty-two-characters-long';
@@ -14,11 +14,11 @@ const base = 'https://lakearrowhead.town';
 const auth = { Authorization: `Bearer ${secret}` };
 const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='), char => char.charCodeAt(0));
 const publisher = () => bindings.PUBLISHER.getByName('site');
-function digest(title = 'Morning mountain digest'): Digest {
-  return { title, source: 'facebook-groups', items: [{
+function digest(headline = 'Wind update', posted_at = new Date().toISOString()): Digest {
+  return { title: 'Morning Facebook digest — Thu Oct 15', source: 'facebook-groups', items: [{
     group: 'Lake Arrowhead 360 Group', group_url: 'https://facebook.com/groups/2241141482782874/',
-    headline: 'Wind update', body: '**Strong winds** are expected.\n\n- Secure outdoor furniture.\n- Check for updates.',
-    post_url: 'https://facebook.com/groups/2241141482782874/permalink/4816273571936306/', category: 'alert', posted_at: '2026-10-16T07:12:00-07:00',
+    headline, body: '**Strong winds** are expected.\n\n- Secure outdoor furniture.\n- Check for updates.',
+    post_url: 'https://facebook.com/groups/2241141482782874/permalink/4816273571936306/', category: 'alert', posted_at,
   }] };
 }
 function fetch(path: string, init: RequestInit = {}, overrides: Partial<Env> = {}, origin = base) {
@@ -56,7 +56,7 @@ describe('append-only publication', () => {
     const response = await fetch('/');
     const tag = response.headers.get('etag')!;
     const html = await response.text();
-    expect(html).toContain('No digests published');
+    expect(html).toContain('No posts from the past week.');
     expect(html).toContain('<link rel="canonical" href="https://lakearrowhead.town/">');
     expect((await fetch('/', { headers: { 'If-None-Match': tag } })).status).toBe(304);
     expect((await fetch('/', { method: 'HEAD' })).status).toBe(200);
@@ -76,28 +76,33 @@ describe('append-only publication', () => {
     expect((await bindings.SITE_BUCKET.list()).objects).toHaveLength(0);
   });
   it('appends duplicate requests and follow-up corrections instead of replacing', async () => {
-    for (const input of [digest(), digest(), { ...digest('Correction'), items: [] }]) {
+    const duplicate = digest();
+    for (const input of [duplicate, duplicate, digest('Correction'), { ...digest('Empty batch'), items: [] }]) {
       const response = await post(input);
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({ ok: true, url: '/' });
     }
     const html = await (await fetch('/')).text();
-    expect(html.match(/<section class="digest"/g)).toHaveLength(3);
-    expect(html).toContain('Morning mountain digest');
+    expect(html.match(/<section class="digest"/g)).toHaveLength(1);
+    expect(html.match(/<article class="digest-item"/g)).toHaveLength(3);
+    expect(html.match(/<h3>Wind update<\/h3>/g)).toHaveLength(2);
+    expect(html).not.toContain(duplicate.title);
     expect(html).toContain('Correction');
-    expect(html).toContain('No updates in this digest.');
+    expect(html).not.toContain('Empty batch');
     expect(html).toContain('Last published');
-    expect((await bindings.SITE_BUCKET.list({ prefix: 'posts/' })).objects).toHaveLength(3);
+    expect((await bindings.SITE_BUCKET.list({ prefix: 'posts/' })).objects).toHaveLength(4);
   });
   it('ignores all client identity/date fields and preserves source timestamps', async () => {
-    await post({ ...digest(), date: 'not a date', id: 'spoof', received_at: '1900-01-01' });
+    const input = digest();
+    await post({ ...input, date: 'not a date', id: 'spoof', received_at: '1900-01-01' });
     const publication = await currentPublication(bindings.SITE_BUCKET);
     const source = await bindings.SITE_BUCKET.get(publication.posts[0].key);
     const stored = await source!.json<StoredPost>();
     expect(stored.id).not.toBe('spoof');
     expect(stored.date).toBe(recentDates(new Date())[0]);
     expect(Math.abs(Date.now() - Date.parse(stored.received_at))).toBeLessThan(10000);
-    expect(stored.items[0].posted_at).toBe(digest().items[0].posted_at);
+    expect(stored.title).toBe(input.title);
+    expect(stored.items[0].posted_at).toBe(input.items[0].posted_at);
   });
   it.each([
     { title: '' }, { source: 3 }, { items: {} }, { items: [null] },
@@ -121,7 +126,7 @@ describe('append-only publication', () => {
     const stream = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(6)); controller.enqueue(new Uint8Array(6)); controller.close(); } });
     await expect(readLimited(new Request(base, { method: 'POST', body: stream }), 10)).rejects.toMatchObject({ status: 413 });
   });
-  it('keeps arbitrary categories and submitted item order', async () => {
+  it('keeps arbitrary categories and submitted item order for equal timestamps', async () => {
     const input = digest(); input.items[0].category = 'road & weather';
     input.items.push({ ...input.items[0], headline: 'Second item', category: '' });
     await post(input);
@@ -134,7 +139,7 @@ describe('append-only publication', () => {
     expect(responses.map(value => value.status)).toEqual([200, 200, 200]);
     const html = await (await fetch('/')).text();
     for (const title of ['One', 'Two', 'Three']) expect(html).toContain(title);
-    expect(html.match(/<section class="digest"/g)).toHaveLength(3);
+    expect(html.match(/<article class="digest-item"/g)).toHaveLength(3);
   });
   it('keeps the previous index/manifest on failed publication and does not include orphan sources on rebuild', async () => {
     await publishDigest(bindings.SITE_BUCKET, digest('Good post'), base);
@@ -158,15 +163,15 @@ describe('append-only publication', () => {
 describe('damaged source omission and recovery', () => {
   it.each(['missing', 'invalid_json', 'invalid_digest'] as const)('omits %s sources, freezes rebuilds, and recovers on new publication', async reason => {
     const now = new Date('2026-10-16T20:00:00Z');
-    const damaged = await publishDigest(bindings.SITE_BUCKET, digest('Damaged historical post'), base, now, true);
-    await publishDigest(bindings.SITE_BUCKET, digest('Healthy historical post'), base, now, true);
+    const damaged = await publishDigest(bindings.SITE_BUCKET, digest('Damaged historical post', now.toISOString()), base, now, true);
+    await publishDigest(bindings.SITE_BUCKET, digest('Healthy historical post', now.toISOString()), base, now, true);
     const key = postKey(damaged);
     const original = await (await bindings.SITE_BUCKET.get(key))!.text();
     const ref = (await currentPublication(bindings.SITE_BUCKET)).posts.find(post => post.id === damaged.id)!;
     if (reason === 'missing') await bindings.SITE_BUCKET.delete(key);
     else await bindings.SITE_BUCKET.put(key, reason === 'invalid_json' ? 'broken private payload' : JSON.stringify({ title: 'private invalid digest' }));
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await publishDigest(bindings.SITE_BUCKET, digest('New post'), base, now, true);
+    await publishDigest(bindings.SITE_BUCKET, digest('New post', now.toISOString()), base, now, true);
     const snapshot = await currentPublication(bindings.SITE_BUCKET);
     expect(snapshot.omitted_posts).toEqual([ref]);
     expect(snapshot.posts).toHaveLength(2);
@@ -185,21 +190,21 @@ describe('damaged source omission and recovery', () => {
     await rebuildHomepage(bindings.SITE_BUCKET, base);
     expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
     expect(await (await fetch('/')).text()).toBe(html);
-    await publishDigest(bindings.SITE_BUCKET, digest('Publication after repair'), base, now, true);
+    await publishDigest(bindings.SITE_BUCKET, digest('Publication after repair', now.toISOString()), base, now, true);
     const recovered = await currentPublication(bindings.SITE_BUCKET);
     expect(recovered.posts).toHaveLength(4); expect(recovered.omitted_posts).toBeUndefined();
     expect(await (await fetch('/')).text()).toContain('Damaged historical post');
   });
   it('expires omitted references by their original receipt date even after source repair', async () => {
-    const damaged = await publishDigest(bindings.SITE_BUCKET, digest('Expired omitted post'), base, new Date('2026-10-09T20:00:00Z'), true);
+    const damaged = await publishDigest(bindings.SITE_BUCKET, digest('Expired omitted post', '2026-10-09T20:00:00Z'), base, new Date('2026-10-09T20:00:00Z'), true);
     const key = postKey(damaged);
     const original = await (await bindings.SITE_BUCKET.get(key))!.text();
     await bindings.SITE_BUCKET.delete(key);
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await publishDigest(bindings.SITE_BUCKET, digest('Day 10'), base, new Date('2026-10-10T20:00:00Z'), true);
+    await publishDigest(bindings.SITE_BUCKET, digest('Day 10', '2026-10-10T20:00:00Z'), base, new Date('2026-10-10T20:00:00Z'), true);
     expect((await currentPublication(bindings.SITE_BUCKET)).omitted_posts).toHaveLength(1);
     await bindings.SITE_BUCKET.put(key, original);
-    await publishDigest(bindings.SITE_BUCKET, digest('Day 16'), base, new Date('2026-10-16T20:00:00Z'), true);
+    await publishDigest(bindings.SITE_BUCKET, digest('Day 16', '2026-10-16T20:00:00Z'), base, new Date('2026-10-16T20:00:00Z'), true);
     const snapshot = await currentPublication(bindings.SITE_BUCKET);
     expect(snapshot.omitted_posts).toBeUndefined(); expect(snapshot.posts).toHaveLength(2);
     expect(await (await fetch('/')).text()).not.toContain('Expired omitted post');
@@ -314,6 +319,10 @@ describe('conditional header parsing', () => {
 });
 
 describe('server dates, snapshots and rendering', () => {
+  const source = (id: string, items: DigestItem[]): StoredPost => ({ ...digest(), id, date: '2026-10-16', received_at: '2026-10-16T20:00:00Z', items });
+  const snapshotPage = (posts: StoredPost[], date = '2026-10-16') => renderPage(posts, { origin: base, publication: {
+    version: 1, posts: [], snapshot_date: date, published_at: `${date}T21:57:00Z`,
+  } });
   it.each([
     ['2026-10-16T06:59:59Z', '2026-10-15', '2026-10-09'], ['2026-10-16T07:00:00Z', '2026-10-16', '2026-10-10'],
     ['2026-03-09T07:00:00Z', '2026-03-09', '2026-03-03'], ['2026-11-02T08:00:00Z', '2026-11-02', '2026-10-27'],
@@ -325,28 +334,108 @@ describe('server dates, snapshots and rendering', () => {
     expect(post.date).toBe(first);
   });
   it('keeps seven calendar dates, expires old posts only on publish, and rebuilds the exact snapshot', async () => {
-    for (const day of ['09', '10', '16']) await publishDigest(bindings.SITE_BUCKET, digest(`Day ${day}`), base, new Date(`2026-10-${day}T20:00:00Z`));
+    for (const day of ['09', '10', '16']) await publishDigest(bindings.SITE_BUCKET, digest(`Day ${day}`, `2026-10-${day}T20:00:00Z`), base, new Date(`2026-10-${day}T20:00:00Z`));
     const snapshot = await currentPublication(bindings.SITE_BUCKET);
     const html = await (await fetch('/')).text();
     expect(html).not.toContain('Day 09'); expect(html).toContain('Day 10'); expect(html).toContain('Day 16');
     await rebuildHomepage(bindings.SITE_BUCKET, base);
     expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
     expect(await (await fetch('/')).text()).toBe(html);
-    await publishDigest(bindings.SITE_BUCKET, digest('Next week'), base, new Date('2026-10-24T20:00:00Z'));
+    await publishDigest(bindings.SITE_BUCKET, digest('Next week', '2026-10-24T20:00:00Z'), base, new Date('2026-10-24T20:00:00Z'));
     expect(await (await fetch('/')).text()).not.toContain('Day 16');
   });
-  it('orders by receipt time and uses unique IDs for posts on the same date', async () => {
-    await publishDigest(bindings.SITE_BUCKET, digest('Earlier'), base, new Date('2026-10-16T19:00:00Z'));
-    await publishDigest(bindings.SITE_BUCKET, digest('Later'), base, new Date('2026-10-16T20:00:00Z'));
+  it('orders by original post time across receipt order and uses one heading per day', async () => {
+    await publishDigest(bindings.SITE_BUCKET, digest('Newer original post', '2026-10-16T18:30:00Z'), base, new Date('2026-10-16T19:00:00Z'));
+    await publishDigest(bindings.SITE_BUCKET, digest('Older original post', '2026-10-16T17:00:00Z'), base, new Date('2026-10-16T20:00:00Z'));
     const html = await (await fetch('/')).text();
-    expect(html.indexOf('Later')).toBeLessThan(html.indexOf('Earlier'));
-    const ids = [...html.matchAll(/id="post-([^"]+)"/g)].map(match => match[1]);
-    expect(new Set(ids).size).toBe(2);
+    expect(html.indexOf('Newer original post')).toBeLessThan(html.indexOf('Older original post'));
+    expect(html.match(/id="day-2026-10-16"/g)).toHaveLength(1);
+    expect(html.match(/<article class="digest-item"/g)).toHaveLength(2);
+    expect(new Set((await currentPublication(bindings.SITE_BUCKET)).posts.map(post => post.id)).size).toBe(2);
     expect(html).not.toContain('href="/digests/');
+  });
+  it('merges mixed-day batches into newest-first daily sections without mutating sources', () => {
+    const first = source('one', [
+      digest('Yesterday morning', '2026-10-15T09:00:00-07:00').items[0],
+      digest('Today morning', '2026-10-16T09:00:00-07:00').items[0],
+    ]);
+    const second = source('two', [
+      digest('Today afternoon', '2026-10-16T13:00:00-07:00').items[0],
+      digest('Yesterday evening', '2026-10-15T19:00:00-07:00').items[0],
+    ]);
+    const before = JSON.stringify([first, second]);
+    const html = snapshotPage([first, second]);
+    expect([...html.matchAll(/<h3>([^<]*)<\/h3>/g)].map(match => match[1])).toEqual([
+      'Today afternoon', 'Today morning', 'Yesterday evening', 'Yesterday morning',
+    ]);
+    expect([...html.matchAll(/<h2 id="([^"]+)"/g)].map(match => match[1])).toEqual(['day-2026-10-16', 'day-2026-10-15']);
+    expect(html).toContain('<time datetime="2026-10-16">Friday, October 16, 2026</time>');
+    expect(html).not.toContain(first.title);
+    expect(html).not.toContain('received-at');
+    expect(JSON.stringify([first, second])).toBe(before);
+  });
+  it('sorts equivalent timezone offsets stably, retaining every duplicate', () => {
+    const equal = digest('First equal post', '2026-10-16T10:00:00-07:00').items[0];
+    const html = snapshotPage([
+      source('one', [equal, { ...equal, headline: 'Second equal post', posted_at: '2026-10-16T17:00:00Z' }]),
+      source('two', [{ ...equal, headline: 'Third equal post', posted_at: '2026-10-16T19:00:00+02:00' }, equal]),
+    ]);
+    expect([...html.matchAll(/<h3>([^<]*)<\/h3>/g)].map(match => match[1])).toEqual([
+      'First equal post', 'Second equal post', 'Third equal post', 'First equal post',
+    ]);
+  });
+  it('filters the inclusive seven-day post window even inside a recently received batch', () => {
+    const html = snapshotPage([source('one', [
+      digest('Expired item', '2026-10-10T06:59:59Z').items[0],
+      digest('First eligible item', '2026-10-10T07:00:00Z').items[0],
+      digest('Last eligible item', '2026-10-17T06:59:59Z').items[0],
+      digest('Future item', '2026-10-17T07:00:00Z').items[0],
+    ])]);
+    expect(html).not.toMatch(/Expired item|Future item/);
+    expect(html).toContain('First eligible item');
+    expect(html).toContain('Last eligible item');
+    expect(html.match(/<section class="digest"/g)).toHaveLength(2);
+  });
+  it.each([
+    ['2026-10-16T06:59:59Z', '2026-10-15'], ['2026-10-16T07:00:00Z', '2026-10-16'],
+    ['2026-03-08T07:59:59Z', '2026-03-07'], ['2026-03-08T08:00:00Z', '2026-03-08'],
+    ['2026-11-01T06:59:59Z', '2026-10-31'], ['2026-11-01T07:00:00Z', '2026-11-01'],
+  ])('groups %s under the Los Angeles day %s', (timestamp, day) => {
+    const html = snapshotPage([source('one', digest('Boundary post', timestamp).items)], day);
+    expect(html).toContain(`<h2 id="day-${day}">`);
+    expect(html.match(/<section class="digest"/g)).toHaveLength(1);
+  });
+  it.each([
+    ['2026-03-08T09:59:59Z', '2026-03-08T10:00:00Z', '2026-03-08', 'PST', 'PDT'],
+    ['2026-11-01T08:30:00Z', '2026-11-01T09:30:00Z', '2026-11-01', 'PDT', 'PST'],
+  ])('orders across the DST change from %s to %s within one day', (earlier, later, day, firstZone, lastZone) => {
+    const html = snapshotPage([source('one', [digest('Earlier instant', earlier).items[0], digest('Later instant', later).items[0]])], day);
+    expect(html.indexOf('Later instant')).toBeLessThan(html.indexOf('Earlier instant'));
+    expect(html.match(/<section class="digest"/g)).toHaveLength(1);
+    expect(html).toContain(firstZone); expect(html).toContain(lastZone);
+  });
+  it('shows one empty state for empty batches and batches with no qualifying items', () => {
+    const html = snapshotPage([source('empty', []), source('expired', digest('Old news', '2026-10-09T12:00:00-07:00').items)]);
+    expect(html.match(/<p class="empty-state">/g)).toHaveLength(1);
+    expect(html).not.toContain('<section class="digest"');
+    expect(html).not.toContain('Old news');
+    expect(html).toContain('Last published');
+  });
+  it('keeps the browser title while shortening the masthead and moving metadata to the footer', () => {
+    const html = snapshotPage([]);
+    expect(html).toContain('<title>News from Lake Arrowhead . Town</title>');
+    expect(html).toContain('<meta property="og:title" content="News from Lake Arrowhead . Town">');
+    expect(html).toContain('<h1><a class="site-title" href="/">Lake Arrowhead . Town</a></h1>');
+    const footer = html.match(/<footer>([\s\S]*?)<\/footer>/)![1];
+    expect(footer).toContain('Posts from Saturday, October 10, 2026 through Friday, October 16, 2026.');
+    expect(footer).toContain('<time datetime="2026-10-16T21:57:00Z">Oct 16, 2:57 PM PDT</time>');
+    expect(footer.indexOf('Posts from')).toBeGreaterThan(footer.indexOf('Community news from around the mountain.'));
+    expect(html.match(/<main>([\s\S]*?)<\/main>/)![1]).not.toContain('snapshot-meta');
+    expect(html).not.toContain('Received ');
   });
   it('escapes HTML and unsafe links while preserving Markdown images', () => {
     const input: StoredPost = { ...digest('<img src=x onerror=alert(1)> $&'), id: 'sample', date: '2026-10-16', received_at: '2026-10-16T20:00:00Z' };
-    input.items[0].headline = '<script>alert(1)</script>';
+    input.items[0].headline = '<script>alert(1)</script> $&';
     input.items[0].category = '\"><script>bad()</script>';
     input.items[0].body = '<script>evil()</script>\n\n[bad](javascript:alert(1))\n\n![photo](https://lakearrowhead.town/images/photo.png)';
     const html = renderPage([input], { origin: base });
