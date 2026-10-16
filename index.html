@@ -440,7 +440,9 @@
         }
       });
       picker.addEventListener('focusout', event => {
-        if (!picker.contains(event.relatedTarget)) closePicker();
+        // WebKit blurs a radio before forwarding a label click, with no focus target.
+        // Only dismiss for a known outside target; pointerdown handles outside clicks.
+        if (event.relatedTarget && !picker.contains(event.relatedTarget)) closePicker();
       });
 
       applyTheme(document.documentElement.dataset.theme);
