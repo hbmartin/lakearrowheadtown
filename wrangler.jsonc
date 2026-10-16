@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "lakearrowheadtown",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "routes": [{ "pattern": "lakearrowhead.town", "custom_domain": true }],
+  "vars": { "SITE_ORIGIN": "https://lakearrowhead.town" },
+  "r2_buckets": [{ "binding": "SITE_BUCKET", "bucket_name": "lakearrowheadtown-content" }],
+  "durable_objects": {
+    "bindings": [{ "name": "PUBLISHER", "class_name": "DigestPublisher" }]
+  },
+  "exports": { "DigestPublisher": { "type": "durable-object", "storage": "sqlite" } },
+  "rules": [{ "type": "Text", "globs": ["**/*.html", "**/*.svg"], "fallthrough": true }],
+  "observability": { "enabled": true },
+  "env": {
+    "preview": {
+      "name": "lakearrowheadtown-preview",
+      "routes": [],
+      "vars": { "SITE_ORIGIN": "" },
+      "r2_buckets": [{ "binding": "SITE_BUCKET", "bucket_name": "lakearrowheadtown-content-preview" }],
+      "durable_objects": {
+        "bindings": [{ "name": "PUBLISHER", "class_name": "DigestPublisher" }]
+      }
+    }
+  }
+}

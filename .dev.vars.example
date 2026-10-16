@@ -1,0 +1,3 @@
+# Copy to .dev.vars.preview for local development only.
+# npm run secret -- preview generates and uploads a real preview credential.
+API_SECRET=replace-with-a-long-random-local-development-secret
