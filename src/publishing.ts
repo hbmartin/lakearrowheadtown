@@ -1,5 +1,5 @@
 import { recentDates, renderPage } from './render';
-import { isDate, validateDigest } from './validation';
+import { HttpError, isDate, validateDigest } from './validation';
 import type { ContentBucket, Digest, Migration, PostReference, Publication, StoredPost } from './types';
 
 export const HTML_CACHE = 'public, max-age=0, must-revalidate';
@@ -27,10 +27,28 @@ async function legacyReferences(bucket: ContentBucket): Promise<PostReference[]>
   return references;
 }
 
+class DamagedSource extends Error {
+  constructor(public reason: 'missing' | 'invalid_json' | 'invalid_digest') { super('Damaged published source'); }
+}
+
 export async function loadPost(bucket: ContentBucket, ref: PostReference): Promise<StoredPost> {
   const source = await bucket.get(ref.key);
-  if (!source) throw new Error('Missing published source');
-  return { ...validateDigest(await source.json()), id: ref.id, date: ref.date, received_at: ref.received_at };
+  if (!source) throw new DamagedSource('missing');
+  // Keep body transport errors outside the parse/validation catches.
+  const text = await source.text();
+  let input: unknown;
+  try { input = JSON.parse(text); }
+  catch (error) {
+    if (error instanceof SyntaxError) throw new DamagedSource('invalid_json');
+    throw error;
+  }
+  let digest: Digest;
+  try { digest = validateDigest(input); }
+  catch (error) {
+    if (error instanceof HttpError && error.status === 400) throw new DamagedSource('invalid_digest');
+    throw error;
+  }
+  return { ...digest, id: ref.id, date: ref.date, received_at: ref.received_at };
 }
 
 export async function currentPublication(bucket: ContentBucket): Promise<Publication> {
@@ -60,12 +78,24 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
   const post: StoredPost = { ...digest, id: crypto.randomUUID(), date: recentDates(now)[0], received_at: now.toISOString() };
   const previous = await currentPublication(bucket);
   const days = recentDates(now);
-  const candidates = [...previous.posts, ...(!migrationComplete ? await legacyReferences(bucket) : []), reference(post)];
+  // Existing references take precedence over duplicate legacy backup objects.
+  const candidates = [...(!migrationComplete ? await legacyReferences(bucket) : []), ...(previous.omitted_posts ?? []), ...previous.posts, reference(post)];
   const refs = [...new Map(candidates.filter(ref => days.includes(ref.date)).map(ref => [ref.id, ref])).values()].sort(order);
   await bucket.put(postKey(post), JSON.stringify(post), { httpMetadata: { contentType: 'application/json' } });
   const posts: StoredPost[] = [];
-  for (const ref of refs) posts.push(ref.id === post.id ? post : await loadPost(bucket, ref));
-  await writeHomepage(bucket, { version: 1, posts: refs, snapshot_date: days[0], published_at: now.toISOString() }, posts, origin);
+  const selected: PostReference[] = [];
+  const omitted: PostReference[] = [];
+  for (const ref of refs) {
+    try {
+      posts.push(ref.id === post.id ? post : await loadPost(bucket, ref));
+      selected.push(ref);
+    } catch (error) {
+      if (!(error instanceof DamagedSource)) throw error;
+      omitted.push(ref);
+      console.warn('Omitted damaged post', { id: ref.id, key: ref.key, reason: error.reason });
+    }
+  }
+  await writeHomepage(bucket, { version: 1, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin);
   return post;
 }
 

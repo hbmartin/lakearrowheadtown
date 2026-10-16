@@ -155,6 +155,164 @@ describe('append-only publication', () => {
   });
 });
 
+describe('damaged source omission and recovery', () => {
+  it.each(['missing', 'invalid_json', 'invalid_digest'] as const)('omits %s sources, freezes rebuilds, and recovers on new publication', async reason => {
+    const now = new Date('2026-10-16T20:00:00Z');
+    const damaged = await publishDigest(bindings.SITE_BUCKET, digest('Damaged historical post'), base, now, true);
+    await publishDigest(bindings.SITE_BUCKET, digest('Healthy historical post'), base, now, true);
+    const key = postKey(damaged);
+    const original = await (await bindings.SITE_BUCKET.get(key))!.text();
+    const ref = (await currentPublication(bindings.SITE_BUCKET)).posts.find(post => post.id === damaged.id)!;
+    if (reason === 'missing') await bindings.SITE_BUCKET.delete(key);
+    else await bindings.SITE_BUCKET.put(key, reason === 'invalid_json' ? 'broken private payload' : JSON.stringify({ title: 'private invalid digest' }));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await publishDigest(bindings.SITE_BUCKET, digest('New post'), base, now, true);
+    const snapshot = await currentPublication(bindings.SITE_BUCKET);
+    expect(snapshot.omitted_posts).toEqual([ref]);
+    expect(snapshot.posts).toHaveLength(2);
+    const html = await (await fetch('/')).text();
+    expect(html).toContain('Healthy historical post'); expect(html).toContain('New post'); expect(html).not.toContain('Damaged historical post');
+    expect(warning).toHaveBeenCalledExactlyOnceWith('Omitted damaged post', { id: damaged.id, key, reason });
+    expect(JSON.stringify(warning.mock.calls)).not.toMatch(/broken private payload|private invalid digest/);
+    const noOmittedReads = bucketWith({ get: async sourceKey => {
+      if (sourceKey === key) throw new Error('A rebuild must not read an omitted source');
+      return bindings.SITE_BUCKET.get(sourceKey);
+    } });
+    await rebuildHomepage(noOmittedReads, base);
+    expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
+    expect(await (await fetch('/')).text()).toBe(html);
+    await bindings.SITE_BUCKET.put(key, original);
+    await rebuildHomepage(bindings.SITE_BUCKET, base);
+    expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
+    expect(await (await fetch('/')).text()).toBe(html);
+    await publishDigest(bindings.SITE_BUCKET, digest('Publication after repair'), base, now, true);
+    const recovered = await currentPublication(bindings.SITE_BUCKET);
+    expect(recovered.posts).toHaveLength(4); expect(recovered.omitted_posts).toBeUndefined();
+    expect(await (await fetch('/')).text()).toContain('Damaged historical post');
+  });
+  it('expires omitted references by their original receipt date even after source repair', async () => {
+    const damaged = await publishDigest(bindings.SITE_BUCKET, digest('Expired omitted post'), base, new Date('2026-10-09T20:00:00Z'), true);
+    const key = postKey(damaged);
+    const original = await (await bindings.SITE_BUCKET.get(key))!.text();
+    await bindings.SITE_BUCKET.delete(key);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await publishDigest(bindings.SITE_BUCKET, digest('Day 10'), base, new Date('2026-10-10T20:00:00Z'), true);
+    expect((await currentPublication(bindings.SITE_BUCKET)).omitted_posts).toHaveLength(1);
+    await bindings.SITE_BUCKET.put(key, original);
+    await publishDigest(bindings.SITE_BUCKET, digest('Day 16'), base, new Date('2026-10-16T20:00:00Z'), true);
+    const snapshot = await currentPublication(bindings.SITE_BUCKET);
+    expect(snapshot.omitted_posts).toBeUndefined(); expect(snapshot.posts).toHaveLength(2);
+    expect(await (await fetch('/')).text()).not.toContain('Expired omitted post');
+  });
+  it.each(['get', 'body'] as const)('fails publication and preserves the committed index on %s transport failures', async stage => {
+    const damaged = await publishDigest(bindings.SITE_BUCKET, digest('Existing post'), base);
+    const snapshot = await currentPublication(bindings.SITE_BUCKET);
+    expect(snapshot.omitted_posts).toBeUndefined(); // Older manifests need no migration.
+    const html = await (await fetch('/')).text();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const broken = bucketWith({ get: async key => {
+      if (key !== postKey(damaged)) return bindings.SITE_BUCKET.get(key);
+      if (stage === 'get') throw new Error('R2 unavailable');
+      return { text: async () => { throw new SyntaxError('Body transport failed'); } } as unknown as R2ObjectBody;
+    } });
+    await expect(publishDigest(broken, digest('Uncommitted'), base, new Date(), true)).rejects.toThrow(stage === 'get' ? 'R2 unavailable' : 'Body transport failed');
+    expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
+    expect(await (await fetch('/')).text()).toBe(html); expect(warning).not.toHaveBeenCalled();
+  });
+  it('prefers the committed imported reference over a duplicate damaged legacy backup', async () => {
+    await legacy('2024-01-01', 'Imported historical post');
+    await migrateBatch(bindings.SITE_BUCKET, initialMigration());
+    await rebuildHomepage(bindings.SITE_BUCKET, base);
+    const ref = (await currentPublication(bindings.SITE_BUCKET)).posts[0];
+    expect(ref.key).toBe(postKey(ref));
+    await bindings.SITE_BUCKET.put('digests/2024-01-01.json', 'broken backup');
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await publishDigest(bindings.SITE_BUCKET, digest('During migration'), base);
+    const snapshot = await currentPublication(bindings.SITE_BUCKET);
+    expect(snapshot.posts.filter(post => post.id === ref.id)).toEqual([ref]);
+    expect(snapshot.omitted_posts).toBeUndefined(); expect(warning).not.toHaveBeenCalled();
+    expect(await (await fetch('/')).text()).toContain('Imported historical post');
+  });
+  it('lets a paused rebuild resume against a later publication that omitted its damaged source', async () => {
+    await post(digest('Damaged before rebuild'));
+    const original = await currentPublication(bindings.SITE_BUCKET);
+    await bindings.SITE_BUCKET.delete(original.posts[0].key);
+    const job = await queueRebuild(); await runDurableObjectAlarm(publisher());
+    expect((await jobStatus(job.id)).status).toBe('failed');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const response = await post(digest('New publication while rebuild paused'));
+    expect(response.status).toBe(200); expect(await response.json()).toEqual({ ok: true, url: '/' });
+    const snapshot = await currentPublication(bindings.SITE_BUCKET);
+    expect(snapshot.omitted_posts).toEqual(original.posts);
+    const html = await (await fetch('/')).text();
+    expect((await fetch(`/api/rebuild/${job.id}/resume`, { method: 'POST', headers: auth })).status).toBe(202);
+    await runDurableObjectAlarm(publisher());
+    expect((await jobStatus(job.id)).status).toBe('completed');
+    expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
+    expect(await (await fetch('/')).text()).toBe(html);
+  });
+});
+
+describe('request failure context', () => {
+  it('reserves the publication uncertainty warning for an attempted publisher call', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const failed = () => { throw new Error('private storage detail'); };
+    const PUBLISHER = { getByName: () => ({ publish: failed, enqueueRebuild: failed, jobStatus: failed, resumeRebuild: failed }) } as unknown as Env['PUBLISHER'];
+    const SITE_BUCKET = { get: failed, head: failed, put: failed } as unknown as R2Bucket;
+    const id = '00000000-0000-0000-0000-000000000000';
+    const responses = [
+      await fetch('/', {}, { SITE_BUCKET }), await fetch('/', { method: 'HEAD' }, { SITE_BUCKET }),
+      await fetch(`/images/${'a'.repeat(64)}.png`, {}, { SITE_BUCKET }), await upload(png, 'image/png', { SITE_BUCKET }),
+      await fetch('/api/rebuild', { method: 'POST', headers: auth }, { PUBLISHER }),
+      await fetch(`/api/rebuild/${id}`, { headers: auth }, { PUBLISHER }),
+      await fetch(`/api/rebuild/${id}/resume`, { method: 'POST', headers: auth }, { PUBLISHER }),
+      await fetch('/api/digests', { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(digest()) }, { PUBLISHER: { getByName: failed } as unknown as Env['PUBLISHER'] }),
+    ];
+    for (const response of responses) {
+      expect(response.status).toBe(500);
+      expect(await response.text()).not.toMatch(/publication may have completed|homepage before posting|private storage detail/);
+    }
+    const response = await fetch('/api/digests', { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(digest()) }, { PUBLISHER });
+    expect(response.status).toBe(500); expect(await response.text()).toContain('publication may have completed');
+  });
+});
+
+describe('conditional header parsing', () => {
+  it.each(['fallback', 'stored', 'image'] as const)('handles valid and malformed conditions consistently for %s GET/HEAD', async kind => {
+    let path = '/';
+    if (kind === 'stored') await post(digest());
+    if (kind === 'image') path = new URL((await (await upload()).json<{ url: string }>()).url).pathname;
+    const initial = await fetch(path); const etag = initial.headers.get('etag')!; await initial.arrayBuffer();
+    const strong = etag.replace(/^W\//, '');
+    const get = vi.fn((key: string, options?: R2GetOptions) => bindings.SITE_BUCKET.get(key, options));
+    const head = vi.fn((key: string) => bindings.SITE_BUCKET.head(key));
+    const SITE_BUCKET = { get, head } as unknown as R2Bucket;
+    for (const condition of [strong, `W/${strong}`, `"old,tag", ${etag}`, `W/${strong} , "old"`, `, , ${etag}, ,`, '*']) {
+      const response = await fetch(path, { headers: { 'If-None-Match': condition } }, { SITE_BUCKET });
+      expect(response.status, condition).toBe(304); expect(await response.text()).toBe('');
+      const object = await get.mock.results.at(-1)!.value;
+      expect(object && 'body' in object).toBe(kind === 'fallback' ? null : false);
+      const reads = get.mock.calls.length;
+      const responseHead = await fetch(path, { method: 'HEAD', headers: { 'If-None-Match': condition } }, { SITE_BUCKET });
+      expect(responseHead.status).toBe(304); expect(await responseHead.text()).toBe(''); expect(get.mock.calls.length).toBe(reads);
+    }
+    for (const condition of ['unquoted', '"unterminated', `"x", garbage, ${etag}`, `*, ${etag}`, `w/${strong}`, `${etag} ${etag}`, '"bad\u007f"']) {
+      for (const method of ['GET', 'HEAD']) {
+        const response = await fetch(path, { method, headers: { 'If-None-Match': condition } }, { SITE_BUCKET });
+        expect(response.status, condition).toBe(200);
+        if (method === 'GET') expect(get.mock.calls.at(-1)![1]).toBeUndefined();
+        expect((await response.arrayBuffer()).byteLength > 0).toBe(method === 'GET');
+      }
+    }
+    for (const condition of ['"unrelated"', '""', '"old,tag"']) {
+      for (const method of ['GET', 'HEAD']) {
+        const response = await fetch(path, { method, headers: { 'If-None-Match': condition } }, { SITE_BUCKET });
+        expect(response.status).toBe(200); await response.arrayBuffer();
+      }
+    }
+  });
+});
+
 describe('server dates, snapshots and rendering', () => {
   it.each([
     ['2026-10-16T06:59:59Z', '2026-10-15', '2026-10-09'], ['2026-10-16T07:00:00Z', '2026-10-16', '2026-10-10'],

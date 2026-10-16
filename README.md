@@ -64,10 +64,10 @@ The final command deploys the code and durably queues the first rebuild. It prin
 
 ```sh
 npm run rebuild:status -- preview JOB_UUID
-node scripts/smoke-preview.mjs https://lakearrowheadtown-preview.harold-martin.workers.dev --verify-edge
+node scripts/smoke-preview.mjs --verify-edge
 ```
 
-The smoke check uploads an image, appends three labeled posts (including a duplicate and a follow-up), checks public routes and ETags, and queues a rebuild. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The script accepts only the configured preview hostname or `http://localhost:<port>`.
+The smoke check uploads an image, appends three labeled posts (including a duplicate and a follow-up), checks public routes and ETags, and queues a rebuild. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
 
 ### 4. Connect the domain
 
@@ -142,6 +142,8 @@ npm run secret:migrate-production
 
 Migration backs up `.dev.vars`, preserves other variables, and refuses to overwrite a different production credential.
 
+Production provisioning warns if `API_SECRET` is still present in `.dev.vars`, then continues without changing that file. Prefer migrating before rotation. After a confirmed successful rotation, back up `.dev.vars` and remove only its obsolete `API_SECRET` assignment, preserving other settings. The migration command will refuse to replace the new production token with a different old token. If uploading the new secret fails, the previous remote token may still be live; keep the backup until recovery is complete. Warnings never print token values.
+
 For production curl examples:
 
 ```sh
@@ -201,6 +203,8 @@ Successful publication returns `200 {"ok":true,"url":"/"}` after the source, man
 
 A publish selects every published post received today and during the preceding six Los Angeles dates, newest receipt first. The homepage labels its date range and last publication time. It stays unchanged between posts, even when its covered week is old. There is no scheduled refresh. Template rebuilds retain the exact published selection and timestamp.
 
+If a historical source is missing, contains malformed JSON, or fails digest validation, a new publication omits that post and logs its ID, R2 key, and a fixed reason. Its reference is retained privately as `omitted_posts` in the manifest and reconsidered on later publications until its original receipt date leaves the seven-day window. Successful responses retain the same format. Storage outages and unexpected failures still fail publication instead of omitting content.
+
 R2 has no transaction spanning these objects. Index replacement is the commit point, and a failure can leave private source or manifest objects. After a timeout or `500`, check the homepage before posting again: publication may have completed, and another POST can create a duplicate.
 
 ## Upload images
@@ -241,6 +245,10 @@ Jobs use persistent Durable Object state and one-shot alarms, surviving object e
 
 For the initial snapshot, the old stored index's upload time supplies the publication time and date-window anchor. If there is no index, the latest legacy receipt time is used. Later rebuilds use the published manifest so they cannot advance the date window or introduce uncommitted source posts.
 
+To restore an omitted post, a Cloudflare operator must restore valid source JSON at the exact R2 key identified in the warning, using the dashboard or Wrangler. Use the original saved request or a backup; imported legacy posts may still have their original `digests/*.json` backup. This project does not keep a second source copy for newer posts. Restoring a source does not change the homepage immediately: a subsequent new digest publication includes it again only if its original receipt date remains eligible. Posting the content through the API instead creates a new post with a new receipt time.
+
+Template rebuilds neither read nor reconsider omitted references, even after restoration. If a selected source becomes damaged, the rebuild pauses and leaves the stored homepage unchanged. Restore that source and resume, or publish a new digest (which omits the damaged source) before resuming the job. Invalid legacy sources still pause migration and require repair before migration can finish.
+
 | R2 key | Contents |
 | --- | --- |
 | `posts/YYYY-MM-DD/<id>.json` | Private server-dated source posts |
@@ -251,7 +259,7 @@ For the initial snapshot, the old stored index's upload time supplies the public
 
 Only `/`, `/index.html`, `/images/<hash>.<extension>`, and `/favicon.svg` are public. Old daily routes return `404`. Sources, manifests, bucket listings, and config files are never exposed. There is no archive listing or public administration UI.
 
-HTML supports HEAD and weak ETag revalidation, requires revalidation, permits compression, and bypasses edge caching. Image GETs use Workers Caching. Protected APIs always return `no-store` JSON. Error statuses include `400`, `401`, `404`, `405`, `409` for invalid job resume, `413`, `415`, and `500`/`503`. Logs omit credentials and payloads.
+HTML supports HEAD and weak ETag revalidation, requires revalidation, permits compression, and bypasses edge caching. Malformed `If-None-Match` conditions are ignored consistently for public GET and HEAD requests. Image GETs use Workers Caching. Protected APIs always return `no-store` JSON. Error statuses include `400`, `401`, `404`, `405`, `409` for invalid job resume, `413`, `415`, and `500`/`503`. The publication uncertainty warning is limited to failed digest publisher calls; other routes use operation-specific errors. Maintenance CLI errors preserve HTTP status even when Cloudflare returns non-JSON content. Logs omit credentials and payloads.
 
 ```sh
 npx wrangler tail --env preview

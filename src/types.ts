@@ -32,6 +32,7 @@ export interface PostReference {
 export interface Publication {
   version: 1;
   posts: PostReference[];
+  omitted_posts?: PostReference[];
   snapshot_date: string | null;
   published_at: string | null;
 }

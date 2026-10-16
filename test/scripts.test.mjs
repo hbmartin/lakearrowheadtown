@@ -6,6 +6,8 @@ import { test } from 'node:test';
 import { migrateProductionCredential, readCredential, saveCredential, updateSecret } from '../scripts/credentials.mjs';
 import { deploy } from '../scripts/deploy.mjs';
 import { maintenance, maintenanceTarget } from '../scripts/maintenance.mjs';
+import { provisionSecret } from '../scripts/provision-secret.mjs';
+import { parseSmokeArgs, smoke } from '../scripts/smoke-preview.mjs';
 
 const secret = 'a'.repeat(64);
 const id = '00000000-0000-0000-0000-000000000001';
@@ -85,4 +87,78 @@ test('maintenance status and resume use the proper method and route without retr
   let calls = 0;
   await assert.rejects(maintenance('start', 'preview', undefined, { secret, origin: 'http://localhost:8787', request: async () => { calls++; return Response.json({ error: 'Unavailable' }, { status: 503 }); } }), /503/);
   assert.equal(calls, 1);
+});
+
+test('maintenance preserves HTTP status for non-JSON failures without retrying', async () => {
+  for (const [status, body] of [[403, '<html>Forbidden</html>'], [524, 'Gateway timeout'], [500, ''], [503, '{broken']]) {
+    let calls = 0;
+    await assert.rejects(maintenance('start', 'preview', undefined, { secret, origin: 'http://localhost:8787', request: async () => {
+      calls++; return new Response(body, { status });
+    } }), error => {
+      assert.match(error.message, new RegExp(`Maintenance request failed \\(${status}\\): non-JSON response`));
+      assert.doesNotMatch(error.message, /Forbidden|Gateway timeout|SyntaxError/);
+      return true;
+    });
+    assert.equal(calls, 1);
+  }
+  await assert.rejects(maintenance('start', 'preview', undefined, { secret, origin: 'http://localhost:8787', request: async () => Response.json(null, { status: 502 }) }), /failed \(502\): Unknown error/);
+});
+test('maintenance reports malformed successful responses with their HTTP status', async () => {
+  for (const body of ['', 'not JSON', 'null', '{}', JSON.stringify({ job: { id, status: 'unknown' } }), JSON.stringify({ job: { id: 3, status: 'queued' } })]) {
+    await assert.rejects(maintenance('start', 'preview', undefined, { secret, origin: 'http://localhost:8787', request: async () => new Response(body, { status: 200 }) }), /Invalid maintenance response \(200\)/);
+  }
+});
+test('smoke arguments support a default URL, flag alone, and either argument order', () => {
+  const remote = 'https://lakearrowheadtown-preview.harold-martin.workers.dev';
+  assert.deepEqual(parseSmokeArgs([]), { origin: remote, edge: false });
+  assert.deepEqual(parseSmokeArgs(['--verify-edge']), { origin: remote, edge: true });
+  for (const args of [[remote, '--verify-edge'], ['--verify-edge', remote]]) assert.deepEqual(parseSmokeArgs(args), { origin: remote, edge: true });
+  assert.deepEqual(parseSmokeArgs(['http://localhost:8787']), { origin: 'http://localhost:8787', edge: false });
+});
+test('bad smoke arguments fail before reading credentials or making requests', async () => {
+  for (const args of [['--unknown'], ['http://localhost:8787', 'http://localhost:8788'], ['https://evil.example'], ['--verify-edge=false']]) {
+    const calls = [];
+    await assert.rejects(smoke(args, { credential: () => { calls.push('credential'); return secret; }, request: () => { calls.push('request'); } }));
+    assert.deepEqual(calls, []);
+  }
+});
+for (const status of [0, 1]) test(`production provisioning warns and continues with a legacy credential (upload status ${status})`, t => {
+  const root = directory(t);
+  const original = `# Local settings\nOTHER=keep\nAPI_SECRET=${secret}\n`;
+  writeFileSync(join(root, '.dev.vars'), original);
+  const file = saveCredential('production', secret, root);
+  writeFileSync(file, `PRODUCTION_SETTING=keep\nAPI_SECRET=${secret}\n`);
+  const replacement = Buffer.alloc(32, 0xbb);
+  const events = [];
+  const warnings = [];
+  const options = {
+    root,
+    warn: value => { warnings.push(value); events.push('warning'); },
+    randomBytes: size => { assert.equal(size, 32); events.push('generate'); return replacement; },
+    run: (command, args, init) => {
+      events.push('upload'); assert.equal(command, 'npx');
+      assert.deepEqual(args, ['wrangler', 'secret', 'put', 'API_SECRET', '--env', '']);
+      assert.equal(init.cwd, root); assert.equal(init.input, replacement.toString('hex'));
+      assert.equal(readCredential('production', root), init.input);
+      return { status };
+    },
+  };
+  if (status) assert.throws(() => provisionSecret('production', options), error => { assert.equal(error.exitCode, status); assert.match(error.message, /retry with this value/); return true; });
+  else assert.equal(provisionSecret('production', options), file);
+  assert.deepEqual(events, ['warning', 'generate', 'upload']);
+  assert.equal(warnings.length, 1); assert.match(warnings[0], /API_SECRET remains in \.dev\.vars/);
+  assert(!warnings[0].includes(secret)); assert(!warnings[0].includes(replacement.toString('hex')));
+  assert.equal(readFileSync(join(root, '.dev.vars'), 'utf8'), original);
+  assert.match(readFileSync(file, 'utf8'), /PRODUCTION_SETTING=keep/);
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+});
+test('provisioning does not warn for preview or unrelated local variables', t => {
+  const root = directory(t);
+  const warnings = [];
+  const options = { root, warn: value => warnings.push(value), randomBytes: () => Buffer.alloc(32), run: () => ({ status: 0 }) };
+  writeFileSync(join(root, '.dev.vars'), `API_SECRET=${secret}\n`);
+  provisionSecret('preview', options);
+  writeFileSync(join(root, '.dev.vars'), 'OTHER=keep\n');
+  provisionSecret('production', options);
+  assert.deepEqual(warnings, []);
 });
