@@ -46,7 +46,9 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     const html = await homepage.text();
     assert(html.includes('<strong>Markdown works.</strong>'));
     assert(html.includes('Last published'));
-    assert.equal(html.split(`<h3>${run}`).length - 1, attempt + 1);
+    assert.equal(html.split(`rel="noopener noreferrer">${run}`).length - 1, attempt + 1);
+    assert(html.includes('class="article-image article-thumbnail"'));
+    assert(!html.includes('class="post-link"'));
     assert(html.indexOf('Posts from') > html.indexOf('</main>'));
     assert(!html.includes('href="/digests/'));
     previousTag = homepage.headers.get('etag');

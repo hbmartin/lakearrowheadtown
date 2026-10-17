@@ -242,6 +242,8 @@ The response is `200 {"ok":true,"url":"https://lakearrowhead.town/images/<sha256
 
 Upload images first, include their returned URLs as `![Description](https://lakearrowhead.town/images/<hash>.jpg)` in Markdown, then publish. Two image uploads may process concurrently per isolate; excess requests return `503` with `Retry-After: 1` before their bodies are processed.
 
+The first Markdown image appears at the upper left of the article body, with text wrapping beside and below it. Thumbnails fit within 160 × 160 px, or 96 × 96 px on screens up to 600 px wide, preserving the full image without cropping. Additional images keep their body positions and use the same size limits. Every image and article headline links to the original `post_url`; articles without images use the linked headline. Captions, formatting, and other body links are preserved. These are rendering changes only: the stored Markdown and uploaded image bytes stay intact, and template rebuilds apply the layout to the existing published snapshot.
+
 ## Rebuilds, migration, and operations
 
 Normal code deployments queue background rebuilds automatically:
