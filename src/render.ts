@@ -121,7 +121,7 @@ function renderItem(item: DigestItem): string {
   const displayTime = escapeHtml(timeFormat.format(postedAt));
   return `<article class="digest-item">
     <div class="item-meta"><a class="item-group" href="${escapeHtml(item.group_url)}" rel="noopener noreferrer">${escapeHtml(item.group)}</a>
-      <time class="post-time" datetime="${escapeHtml(item.posted_at)}"><span class="post-age">${displayTime}</span><span class="time-tooltip" aria-hidden="true" title="${exactTime}"></span></time>
+      <time class="post-time" datetime="${escapeHtml(item.posted_at)}" title="${exactTime}">${displayTime}</time>
       ${item.category ? `<span class="category">${escapeHtml(item.category)}</span>` : ''}</div>
     <h3><a class="headline-link" href="${escapeHtml(item.post_url)}" rel="noopener noreferrer">${escapeHtml(item.headline)}</a></h3>
     <div class="markdown">${renderBody(item)}</div>

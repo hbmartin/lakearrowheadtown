@@ -29,12 +29,8 @@ export function readPublishingCredential(environment, variables = process.env, r
 }
 function secretAssignment(secret) {
   validateCredential(secret);
-  for (const quote of ['', "'", '`', '"']) {
-    if (quote && secret.includes(quote)) continue;
-    const assignment = `API_SECRET=${quote}${secret}${quote}\n`;
-    if (parseEnv(assignment).API_SECRET === secret) return assignment;
-  }
-  throw new Error('Cannot safely store this credential in dotenv; use an environment variable instead');
+  if (secret.includes("'")) throw new Error('Credentials containing apostrophes cannot be saved to dotenv; use an environment variable instead');
+  return `API_SECRET='${secret}'\n`;
 }
 export function updateSecret(text, secret) {
   const before = parseEnv(text);

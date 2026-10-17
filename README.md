@@ -113,7 +113,7 @@ Each push to `main`, including a merged pull request, runs validation and then d
 
 The deployment and maintenance commands prefer the environment-specific `PRODUCTION_API_SECRET` or `PREVIEW_API_SECRET` process variable when present, then fall back to the matching local credential file. An invalid process variable fails instead of falling back. Credentials must contain at least 32 printable ASCII characters with no spaces or control characters, so they survive the Node-to-Workers header encoding boundary unchanged. ASCII punctuation is accepted; hexadecimal is not required. Invalid credentials fail with a value-free error before deployment or requests; valid tokens are used unchanged. Secret provisioning and migration continue to use local files.
 
-Credential saves quote dotenv values when needed, including tokens containing `#` or leading quotes, and verify that they read back unchanged. Rare punctuation combinations that dotenv cannot represent safely fail with a value-free error before replacing the file; those tokens can still be supplied through the environment-specific process variable. When editing a file manually, quote a token containing `#` so it is not interpreted as a comment.
+Credential saves always use single-quoted dotenv assignments and verify that they read back unchanged. Apostrophes are rejected on file writes with a value-free error; those tokens remain supported through environment variables, explicit script overrides, and existing credential reads. Existing files are not rewritten automatically. The shell examples below read credentials as data through Node, preserving literal punctuation and ignoring executable-looking settings elsewhere in the file.
 
 ## Local development and verification
 
@@ -123,9 +123,10 @@ Create a local preview credential without changing any remote secret:
 npm ci
 node --input-type=module <<'JS'
 import { randomBytes } from 'node:crypto';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
+import { saveCredential } from './scripts/credentials.mjs';
 if (!existsSync('.dev.vars.preview')) {
-  writeFileSync('.dev.vars.preview', `API_SECRET=${randomBytes(32).toString('hex')}\n`, { mode: 0o600 });
+  saveCredential('preview', randomBytes(32).toString('hex'));
 }
 JS
 npm run dev
@@ -162,26 +163,25 @@ Production credentials live in `.secrets/production.vars`, outside Wrangler's au
 npm run secret:migrate-production
 ```
 
-Migration backs up `.dev.vars`, preserves other variables, and refuses to overwrite a different production credential.
+Migration backs up `.dev.vars`, preserves other variables, and refuses to overwrite a different production credential. A rejected file write can leave a private recovery backup while keeping the original files intact.
 
 Production provisioning warns if `API_SECRET` is still present in `.dev.vars`, then continues without changing that file. Prefer migrating before rotation. After a confirmed successful rotation, back up `.dev.vars` and remove only its obsolete `API_SECRET` assignment, preserving other settings. The migration command will refuse to replace the new production token with a different old token. If uploading the new secret fails, the previous remote token may still be live; keep the backup until recovery is complete. Warnings never print token values.
 
 For production curl examples:
 
 ```sh
-. ./.secrets/production.vars
-export API_SECRET
-export SITE_URL=https://lakearrowhead.town
+API_SECRET="$(node --input-type=module -e 'import { readCredential } from "./scripts/credentials.mjs"; process.stdout.write(readCredential("production"));')" &&
+  export API_SECRET SITE_URL=https://lakearrowhead.town
 ```
 
-For preview, source `.dev.vars.preview` and use the preview URL. For local testing, source the same file and set `SITE_URL=http://localhost:8787`. An automated publisher should get its token from its own secret store.
+For preview, change the reader argument to `"preview"` and use the preview URL. For local testing, use that reader and set `SITE_URL=http://localhost:8787`. A failed read leaves `API_SECRET` empty, so the guarded curl examples below do not send a request. An automated publisher should get its token from its own secret store.
 
 If a secret upload fails, upload the same saved value rather than generating another:
 
 ```sh
-. ./.secrets/production.vars
-printf '%s' "$API_SECRET" | npx wrangler secret put API_SECRET --env=''
-# Preview: source .dev.vars.preview and use --env preview.
+API_SECRET="$(node --input-type=module -e 'import { readCredential } from "./scripts/credentials.mjs"; process.stdout.write(readCredential("production"));')" &&
+  printf '%s' "$API_SECRET" | npx wrangler secret put API_SECRET --env=''
+# Preview: change the reader argument to "preview" and use --env preview.
 ```
 
 A missing secret or one shorter than 32 characters disables protected endpoints with `503`. See [Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/).
@@ -209,7 +209,7 @@ Prepare [`examples/digest.json`](examples/digest.json) with actual titles, sourc
 ```
 
 ```sh
-curl --fail-with-body "$SITE_URL/api/digests" \
+[ -n "${API_SECRET:-}" ] && curl --fail-with-body "$SITE_URL/api/digests" \
   -H "Authorization: Bearer $API_SECRET" \
   -H 'Content-Type: application/json' \
   --data-binary @examples/digest.json
@@ -225,9 +225,9 @@ Successful publication returns `200 {"ok":true,"url":"/"}` after the source, man
 
 A publish retains sources received today and during the preceding six Los Angeles dates. The homepage combines their items into one feed, showing only items whose original `posted_at` falls within those same seven calendar dates in Los Angeles. Items appear newest first under one heading per populated day; equal timestamps preserve source and submitted item order, and duplicate submissions remain visible. Older and future-day items and empty digests create no sections. Source timestamps describe already-published material; this feed does not schedule future posts.
 
-The footer labels the post-date range and last publication time. Feed contents and calendar datelines stay unchanged between publications, even when the covered week is old. There is no scheduled feed refresh. In the browser, post timestamps display relative ages such as “3 hr ago” or “2 days ago”; they update each minute while the page is visible and when returning to the page. Timestamps ahead of the reader’s clock retain future labels such as “in 3 min”. Each age is rendered once for reading and copying. Screen readers receive the relative age only; full Los Angeles timestamps remain in mouse tooltips and original `datetime` values stay intact. Without JavaScript, absolute timestamps display and are announced once. Daily headings and footer dates stay absolute. Template rebuilds retain the exact published selection, date window, and publication timestamp, while applying the current layout.
+The footer labels the post-date range and last publication time. Feed contents and calendar datelines stay unchanged between publications, even when the covered week is old. There is no scheduled feed refresh. In the browser, post timestamps display relative ages such as “3 hr ago” or “2 days ago”; they update each minute while the page is visible and when returning to the page. Timestamps ahead of the reader’s clock retain future labels such as “in 3 min”. Each age is rendered once for reading and copying, including double-click and drag selection. Full Los Angeles timestamps use native browser tooltips, which screen readers may announce alongside the age; original `datetime` values stay intact. Without JavaScript, absolute timestamps display once. Daily headings and footer dates stay absolute. Template rebuilds retain the exact published selection, date window, and publication timestamp, while applying the current layout.
 
-The masthead reads “Lake Arrowhead . Town” with a centered accent dot; the browser page title remains “News from Lake Arrowhead . Town”. Its type uses `clamp(1.5rem, 6.3vw, 3.5rem)` and can wrap on narrow screens. The unboxed palette icon shares the masthead row inside a 44px touch target, has no button shadow, and scrolls with the header. It opens a five-theme picker and remembers the selected theme in a cookie. Arrow keys apply and save themes while keeping the picker open; clicking a theme or pressing Space/Enter selects it, closes the picker, and returns focus to the button. Escape keeps the selected theme and closes; Tab continues normal navigation, and outside clicks or leaving the window dismiss the panel. An open panel stays attached to the masthead when it scrolls away; resizing fits it to the viewport without moving the page. Night Sky adds a navy dark theme with pale text and static stars; it is selected manually, and device dark-mode preference does not change the default Deep Lake & Lodge theme. Themes use subtle woodgrain, dock boards, mist contours, paper, and star textures that follow the document, strongest at the masthead and page edges. Background colour washes retain their existing strength.
+The masthead reads “Lake Arrowhead . Town” with a centered accent dot; the browser page title remains “News from Lake Arrowhead . Town”. Its type uses `clamp(1.5rem, 6.3vw, 3.5rem)` and can wrap on narrow screens. The palette icon shares the masthead row inside a 44px circle with a solid theme-surface background and a control-colour border. It has no button shadow and scrolls with the header. It opens a five-theme picker and remembers the selected theme in a cookie. Arrow keys apply and save themes while keeping the picker open; clicking a theme or pressing Space/Enter selects it, closes the picker, and returns focus to the button. Escape keeps the selected theme and closes; Tab continues normal navigation, and outside clicks or leaving the window dismiss the panel. An open panel stays attached to the masthead when it scrolls away; resizing fits it to the viewport without moving the page. Night Sky adds a navy dark theme with pale text and static stars; it is selected manually, and device dark-mode preference does not change the default Deep Lake & Lodge theme. Themes use subtle woodgrain, dock boards, mist contours, paper, and star textures that follow the document, strongest at the masthead and page edges. Background colour washes retain their existing strength.
 
 At widths up to 600px, 16px side gutters, compact header/article spacing, quiet 13px daily headings, and 20–22px story headlines bring the first story higher on the page. Group links are hidden on mobile while post times and categories remain visible. Body text stays 16px with a 1.6 line height, and full stories, images, captions, and links remain available without expansion. Desktop retains group links. Daily headings have no redundant rule below them. Headline links fill their heading’s width, underline on hover, and show a rectangular outline without an underline on keyboard focus, including when hovered. Body-only thumbnails and footer placement remain in use.
 
@@ -269,7 +269,7 @@ Code deployment alone does not update an existing R2 homepage. Use the normal `d
 ## Upload images
 
 ```sh
-curl --fail-with-body "$SITE_URL/api/images" \
+[ -n "${API_SECRET:-}" ] && curl --fail-with-body "$SITE_URL/api/images" \
   -H "Authorization: Bearer $API_SECRET" \
   -F 'file=@photo.jpg;type=image/jpeg'
 ```

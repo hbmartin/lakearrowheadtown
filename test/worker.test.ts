@@ -440,7 +440,7 @@ describe('server dates, snapshots and rendering', () => {
     const timestamp = '2026-10-16T17:12:34.123Z';
     const html = snapshotPage([source('one', digest('Original post', timestamp).items)]);
     expect(html).toContain('class="item-group" href="https://facebook.com/groups/2241141482782874/"');
-    expect(html).toContain(`<time class="post-time" datetime="${timestamp}"><span class="post-age">Oct 16, 10:12 AM PDT</span><span class="time-tooltip" aria-hidden="true" title="Friday, October 16, 2026 at 10:12:34 AM PDT"></span></time>`);
+    expect(html).toContain(`<time class="post-time" datetime="${timestamp}" title="Friday, October 16, 2026 at 10:12:34 AM PDT">Oct 16, 10:12 AM PDT</time>`);
     expect(html).toContain('<time datetime="2026-10-16">Friday, October 16, 2026</time>');
   });
   it('escapes HTML and unsafe links while preserving Markdown images', () => {
