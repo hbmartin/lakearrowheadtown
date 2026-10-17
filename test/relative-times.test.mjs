@@ -12,19 +12,19 @@ function page(timestamps) {
   let clock = now;
   const elements = timestamps.map(timestamp => {
     const attributes = new Map([['datetime', timestamp]]);
-    const visible = { title: 'Exact Los Angeles time', textContent: 'Oct 17, 12:00 PM PDT' };
-    const spoken = { textContent: 'Oct 17, 12:00 PM PDT' };
+    const visible = { textContent: 'Oct 17, 12:00 PM PDT' };
+    const tooltip = { title: 'Exact Los Angeles time', textContent: '' };
     return {
-      visible, spoken,
+      visible, tooltip,
       getAttribute: name => attributes.get(name),
-      querySelector: selector => selector === '[aria-hidden="true"]' ? visible : spoken,
+      querySelector: selector => selector === '.post-age' ? visible : selector === '.time-tooltip' ? tooltip : null,
     };
   });
   const listeners = new Map();
   const timers = [];
   const document = {
     hidden: false,
-    querySelectorAll: () => elements,
+    querySelectorAll: selector => selector === 'time.post-time[datetime]' ? elements : [],
     addEventListener: (event, callback) => listeners.set(event, callback),
   };
   runInNewContext(script, {
@@ -53,9 +53,9 @@ test('post ages use minute, hour, and day boundaries without changing original i
   for (const [index, [, label]] of cases.entries()) {
     const element = view.elements[index];
     assert.equal(element.visible.textContent, label);
-    assert.equal(element.spoken.textContent, label);
     assert.equal(element.getAttribute('datetime'), timestamps[index]);
-    assert.equal(element.visible.title, 'Exact Los Angeles time');
+    assert.equal(element.tooltip.title, 'Exact Los Angeles time');
+    assert.equal(element.tooltip.textContent, '');
     assert.equal(element.getAttribute('aria-label'), undefined);
   }
 });
@@ -69,17 +69,14 @@ test('relative times refresh each minute and immediately when a hidden page retu
   view.visibility(true);
   view.advance(3 * 3600000);
   assert.equal(view.elements[0].visible.textContent, '1 min ago');
-  assert.equal(view.elements[0].spoken.textContent, '1 min ago');
   view.visibility(false);
   assert.equal(view.elements[0].visible.textContent, '3 hr ago');
-  assert.equal(view.elements[0].spoken.textContent, '3 hr ago');
 });
 
 test('equivalent timezone offsets show the same age across a daylight-saving transition', () => {
   const view = page(['2026-11-01T01:30:00-07:00', '2026-11-01T08:30:00Z', '2026-11-01T01:30:00-08:00']);
   view.advance(Date.parse('2026-11-01T10:30:00Z') - now);
   assert.deepEqual(view.elements.map(element => element.visible.textContent), ['2 hr ago', '2 hr ago', '1 hr ago']);
-  assert.deepEqual(view.elements.map(element => element.spoken.textContent), ['2 hr ago', '2 hr ago', '1 hr ago']);
 });
 
 test('empty feeds and invalid timestamps retain their fallback without starting a timer', () => {
@@ -87,6 +84,10 @@ test('empty feeds and invalid timestamps retain their fallback without starting 
   const invalid = page(['not a timestamp']);
   assert.equal(invalid.timers.length, 0);
   assert.equal(invalid.elements[0].visible.textContent, 'Oct 17, 12:00 PM PDT');
-  assert.equal(invalid.elements[0].spoken.textContent, 'Oct 17, 12:00 PM PDT');
   assert.equal(invalid.elements[0].getAttribute('aria-label'), undefined);
+});
+
+test('timestamp mocks reject unknown selectors instead of supplying another span', () => {
+  const { elements } = page([new Date(now).toISOString()]);
+  assert.equal(elements[0].querySelector('.incorrect-selector'), null);
 });
