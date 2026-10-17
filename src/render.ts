@@ -10,6 +10,7 @@ const markdown = new MarkdownIt({ html: false, linkify: false, typographer: fals
 const dateFormat = new Intl.DateTimeFormat('en-CA', { timeZone: TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
 const dayFormat = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 const timeFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+const fullTimeFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });
 const emptyContent = template.match(/<!-- digests:start -->([\s\S]*?)<!-- digests:end -->/)![1].trim();
 
 const prunableTags = new Set(['a', 'em', 'strong', 's', 'p', 'blockquote', 'li', 'ol', 'ul', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
@@ -78,9 +79,11 @@ function renderBody(item: DigestItem): string {
 }
 
 function renderItem(item: DigestItem): string {
+  const postedAt = new Date(item.posted_at);
+  const exactTime = escapeHtml(fullTimeFormat.format(postedAt));
   return `<article class="digest-item">
-    <div class="item-meta"><a href="${escapeHtml(item.group_url)}" rel="noopener noreferrer">${escapeHtml(item.group)}</a>
-      <time datetime="${escapeHtml(item.posted_at)}">${escapeHtml(timeFormat.format(new Date(item.posted_at)))}</time>
+    <div class="item-meta"><a class="item-group" href="${escapeHtml(item.group_url)}" rel="noopener noreferrer">${escapeHtml(item.group)}</a>
+      <time class="post-time" datetime="${escapeHtml(item.posted_at)}" title="${exactTime}" aria-label="${exactTime}">${escapeHtml(timeFormat.format(postedAt))}</time>
       ${item.category ? `<span class="category">${escapeHtml(item.category)}</span>` : ''}</div>
     <h3><a class="headline-link" href="${escapeHtml(item.post_url)}" rel="noopener noreferrer">${escapeHtml(item.headline)}</a></h3>
     <div class="markdown">${renderBody(item)}</div>
