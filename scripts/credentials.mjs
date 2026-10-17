@@ -27,10 +27,19 @@ export function readPublishingCredential(environment, variables = process.env, r
   if (!Object.hasOwn(variables, name)) return readCredential(environment, root);
   return validateCredential(variables[name]);
 }
+function secretAssignment(secret) {
+  validateCredential(secret);
+  for (const quote of ['', "'", '`', '"']) {
+    if (quote && secret.includes(quote)) continue;
+    const assignment = `API_SECRET=${quote}${secret}${quote}\n`;
+    if (parseEnv(assignment).API_SECRET === secret) return assignment;
+  }
+  throw new Error('Cannot safely store this credential in dotenv; use an environment variable instead');
+}
 export function updateSecret(text, secret) {
   const before = parseEnv(text);
   const result = text.replace(/^[ \t]*(?:export[ \t]+)?API_SECRET[ \t]*=.*(?:\r?\n|$)/gm, '');
-  const updated = secret === null ? result : `${result}${result && !result.endsWith('\n') ? '\n' : ''}API_SECRET=${secret}\n`;
+  const updated = secret === null ? result : `${result}${result && !result.endsWith('\n') ? '\n' : ''}${secretAssignment(secret)}`;
   const after = parseEnv(updated);
   // Refuse unusual multiline secret syntax rather than silently alter other values.
   for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
@@ -55,12 +64,13 @@ export function backup(file, environment, root = process.cwd()) {
 }
 export function saveCredential(environment, secret, root = process.cwd()) {
   const file = credentialFile(environment, root);
+  const updated = updateSecret(existsSync(file) ? readFileSync(file, 'utf8') : '', secret);
   if (environment === 'production') {
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
     chmodSync(dirname(file), 0o700);
   }
   backup(file, environment, root);
-  atomicPrivateWrite(file, updateSecret(existsSync(file) ? readFileSync(file, 'utf8') : '', secret));
+  atomicPrivateWrite(file, updated);
   return file;
 }
 export function migrateProductionCredential(root = process.cwd()) {

@@ -28,7 +28,7 @@ function page() {
   const outside = element('outside');
   const attributes = new Map();
   const trigger = { ...element('trigger'), setAttribute: (name, value) => attributes.set(name, value), getBoundingClientRect: () => ({ bottom: triggerBottom }) };
-  const panel = { ...element('panel'), hidden: true, style: {}, scrollTop: 0, get clientHeight() { return Number.parseFloat(this.style.maxHeight) || 800; } };
+  const panel = { ...element('panel'), hidden: true, style: {}, scrollTop: 0, get clientHeight() { const height = Number.parseFloat(this.style.maxHeight); return Number.isNaN(height) ? 800 : height; } };
   const radios = ['deep-lake-lodge', 'golden-hour-dock', 'morning-mist', 'village-heritage', 'night-sky'].map((value, index) => {
     let checked = index === 0;
     const label = { querySelector: () => ({ textContent: value }), offsetTop: 50 + index * 100, offsetHeight: 90, scrollIntoView() { throw new Error('Picker must not scroll the page'); } };
@@ -146,6 +146,9 @@ test('fits the selected option within the panel and caps height when the masthea
   view.resize(650, -500);
   assert.equal(view.panel.style.maxHeight, '626px');
   assert.equal(view.panel.hidden, false);
+  view.resize(24);
+  assert.equal(view.panel.style.maxHeight, '0px');
+  assert.equal(view.panel.clientHeight, 0);
 });
 
 test('pointer selection and document keyup recover from interrupted arrow navigation', () => {
