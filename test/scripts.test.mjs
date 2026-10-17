@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { unstable_getVarsForDev } from 'wrangler';
 import { migrateProductionCredential, readCredential, readPublishingCredential, saveCredential, updateSecret, validateCredential } from '../scripts/credentials.mjs';
 import { deploy } from '../scripts/deploy.mjs';
 import { maintenance, maintenanceTarget } from '../scripts/maintenance.mjs';
@@ -107,37 +110,33 @@ test('migration refuses conflicting credentials without altering either file', t
   assert.equal(readCredential('production', root), 'b'.repeat(64));
 });
 test('dotenv updates handle exports and duplicates and refuse destructive multiline changes', () => {
-  assert.equal(updateSecret('OTHER=yes\nexport API_SECRET=old\nAPI_SECRET=duplicate\n', secret), `OTHER=yes\nAPI_SECRET=${secret}\n`);
+  assert.equal(updateSecret('OTHER=yes\nexport API_SECRET=old\nAPI_SECRET=duplicate\n', secret), `OTHER=yes\nAPI_SECRET='${secret}'\n`);
   assert.throws(() => updateSecret('OTHER="one\nAPI_SECRET=embedded\nlast"\nAPI_SECRET=old\n', secret), /unrelated values/);
 });
-test('credential files and migration round-trip dotenv-compatible punctuation without changing values', t => {
+test('credential files and migration round-trip literal punctuation without changing values', t => {
   const cases = [
-    [`${secret}#suffix`, "'"],
-    [`"${secret}"`, "'"],
-    [`'${secret}'`, '"'],
-    ['`' + secret + '`', "'"],
-    [secret + '#\'', '`'],
-    [secret + "#'`", '"'],
-    [secret + '#\\n\\r\\path\\', "'"],
-    [secret + "'\"`", ''],
+    `${secret}#suffix`, `"${secret}"`, `"${secret}#tail`, '`' + secret + '#tail',
+    secret + '#\\n\\r\\path\\', secret + ';:>INJECTED', secret + '$(touch${IFS}INJECTED)',
+    secret + '`touch${IFS}INJECTED`', '~+/' + secret,
   ];
-  for (const [value, quote] of cases) {
+  for (const value of cases) {
     const root = directory(t);
     for (const environment of ['preview', 'production']) {
       const file = saveCredential(environment, value, root);
       assert.equal(readCredential(environment, root), value);
+      assert.equal(readFileSync(file, 'utf8'), `API_SECRET='${value}'\n`);
       assert.equal(statSync(file).mode & 0o777, 0o600);
     }
-    const legacy = `OTHER=keep\nAPI_SECRET=${quote}${value}${quote}\n`;
+    const legacy = `OTHER=keep\nAPI_SECRET='${value}'\n`;
     writeFileSync(join(root, '.dev.vars'), legacy);
     migrateProductionCredential(root);
     assert.equal(readCredential('production', root), value);
     assert.equal(readFileSync(join(root, '.dev.vars'), 'utf8'), 'OTHER=keep\n');
   }
 });
-test('unrepresentable dotenv tokens fail before writing and remain valid environment credentials', t => {
-  const message = 'Cannot safely store this credential in dotenv; use an environment variable instead';
-  for (const value of [secret + '#"\'`', secret + "#'`\\n"]) {
+test('apostrophes fail before file writes but remain valid for readers, environment and request overrides', async t => {
+  const message = 'Credentials containing apostrophes cannot be saved to dotenv; use an environment variable instead';
+  for (const value of ["'" + secret, secret + "'middle", secret + "#'`\\r", secret + "'"]) {
     const root = directory(t);
     for (const environment of ['preview', 'production']) {
       const file = saveCredential(environment, secret, root);
@@ -147,11 +146,73 @@ test('unrepresentable dotenv tokens fail before writing and remain valid environ
       assert.equal(readFileSync(file, 'utf8'), original);
       assert.deepEqual(readdirSync(root, { recursive: true }), entries);
       assert.equal(readPublishingCredential(environment, { [`${environment.toUpperCase()}_API_SECRET`]: value }, root), value);
+      writeFileSync(file, `API_SECRET="${value}"\n`);
+      assert.equal(readCredential(environment, root), value);
     }
     const fresh = directory(t);
     assert.throws(() => saveCredential('production', value, fresh), { message });
     assert.deepEqual(readdirSync(fresh), []);
+    await maintenance('status', 'preview', id, { secret: value, origin: 'http://localhost:8787', request: async (_url, options) => {
+      assert.equal(options.headers.Authorization, `Bearer ${value}`);
+      return Response.json({ job: { id, status: 'completed' } });
+    } });
   }
+});
+test('single-quoted assignments agree with Node and Wrangler for every supported ASCII character', t => {
+  const root = directory(t);
+  const file = join(root, '.dev.vars.preview');
+  const values = ['"' + secret + '#tail', '`' + secret + '#tail', secret + '\\r', secret + '\\n', secret + '\\'];
+  for (let code = 33; code <= 126; code++) {
+    const character = String.fromCharCode(code);
+    if (character !== "'") values.push(character + secret, secret + character + secret, secret + character);
+  }
+  for (const value of values) {
+    writeFileSync(file, updateSecret('', value));
+    assert.equal(readCredential('preview', root), value);
+    const vars = unstable_getVarsForDev(join(root, 'wrangler.jsonc'), undefined, {}, 'preview', true);
+    assert.equal(vars.API_SECRET.value, value);
+  }
+});
+test('migration rejection retains its private backup and leaves original files intact', t => {
+  const root = directory(t);
+  const original = `OTHER=keep\nAPI_SECRET="${secret}'"\n`;
+  writeFileSync(join(root, '.dev.vars'), original);
+  assert.throws(() => migrateProductionCredential(root), /apostrophes cannot be saved/);
+  assert.equal(readFileSync(join(root, '.dev.vars'), 'utf8'), original);
+  const backups = readdirSync(join(root, '.secrets'));
+  assert.equal(backups.length, 1);
+  assert.equal(readFileSync(join(root, '.secrets', backups[0]), 'utf8'), original);
+  assert.equal(statSync(join(root, '.secrets', backups[0])).mode & 0o777, 0o600);
+  assert.equal(existsSync(join(root, '.secrets/production.vars')), false);
+});
+test('documented shell reads treat files as data and gate curl and upload hooks on read success', t => {
+  const root = directory(t);
+  symlinkSync(fileURLToPath(new URL('../scripts', import.meta.url)), join(root, 'scripts'), 'dir');
+  const blocks = [...readFileSync(new URL('../README.md', import.meta.url), 'utf8').matchAll(/```sh\n([\s\S]*?)```/g)].map(match => match[1]);
+  const setup = blocks.find(block => block.startsWith('API_SECRET=') && block.includes('export API_SECRET SITE_URL'));
+  const upload = blocks.find(block => block.startsWith('API_SECRET=') && block.includes('wrangler secret put'));
+  const requests = blocks.filter(block => block.startsWith('[ -n "${API_SECRET:-}" ] && curl'));
+  assert(setup && upload);
+  assert.equal(requests.length, 2);
+  const hooks = 'curl() { printf REQUEST_HOOK; }\nnpx() { cat >/dev/null; printf UPLOAD_HOOK; }\n';
+  const value = secret + '$DUMMY;:>INJECTED#`echo`';
+  const file = saveCredential('production', value, root);
+  const unrelated = 'OTHER=$(touch${IFS}UNRELATED_EXECUTED)\n';
+  const run = script => spawnSync('/bin/sh', ['-c', hooks + script], { cwd: root, encoding: 'utf8', env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, DUMMY: 'CHANGED' } });
+  writeFileSync(file, unrelated + readFileSync(file, 'utf8'));
+  const loaded = run(setup + '\nprintf "<VALUE>%s</VALUE>" "$API_SECRET"\n' + requests.join('\n') + '\n' + upload);
+  assert.equal(loaded.status, 0);
+  assert.equal(loaded.stderr, '');
+  assert(loaded.stdout.includes(`<VALUE>${value}</VALUE>`));
+  assert.equal(loaded.stdout.match(/REQUEST_HOOK/g).length, 2);
+  assert.equal(loaded.stdout.match(/UPLOAD_HOOK/g).length, 1);
+  assert.equal(existsSync(join(root, 'INJECTED')), false);
+  assert.equal(existsSync(join(root, 'UNRELATED_EXECUTED')), false);
+  writeFileSync(file, unrelated + 'API_SECRET=short\n');
+  const rejected = run(setup + '\n' + requests.join('\n') + '\n' + upload);
+  assert.equal(rejected.stdout, '');
+  assert(rejected.stderr.includes(credentialError));
+  assert.equal(existsSync(join(root, 'UNRELATED_EXECUTED')), false);
 });
 test('maintenance targets reject credential leaks and allow preview localhost only', () => {
   assert.equal(maintenanceTarget('preview', 'http://localhost:8787'), 'http://localhost:8787');
