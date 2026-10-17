@@ -11,20 +11,27 @@ export function credentialFile(environment, root = process.cwd()) {
   checkEnvironment(environment);
   return join(root, environment === 'preview' ? '.dev.vars.preview' : '.secrets/production.vars');
 }
+export function validateCredential(value) {
+  // Preserve supported token formats without allowing native header errors to
+  // expose the value. Header construction also rejects non-byte characters.
+  if (typeof value === 'string' && value.length >= 32 && !/[\s\p{Cc}]/u.test(value)) {
+    try {
+      new Headers({ Authorization: `Bearer ${value}` });
+      return value;
+    } catch { /* Report only the fixed error below. */ }
+  }
+  throw new Error('Publishing credential must contain at least 32 characters and be a valid HTTP header token without whitespace or control characters');
+}
 export function readCredential(environment, root = process.cwd()) {
   const file = credentialFile(environment, root);
   if (!existsSync(file)) throw new Error(`Missing ${file}; provision credentials first (or migrate the existing production credential)`);
-  const value = parseEnv(readFileSync(file, 'utf8')).API_SECRET;
-  if (!value || value.length < 32) throw new Error(`API_SECRET is missing or too short in ${file}`);
-  return value;
+  return validateCredential(parseEnv(readFileSync(file, 'utf8')).API_SECRET);
 }
 export function readPublishingCredential(environment, variables = process.env, root = process.cwd()) {
   checkEnvironment(environment);
   const name = `${environment.toUpperCase()}_API_SECRET`;
   if (!Object.hasOwn(variables, name)) return readCredential(environment, root);
-  const value = variables[name];
-  if (typeof value !== 'string' || value.length < 32) throw new Error(`${name} is missing or too short`);
-  return value;
+  return validateCredential(variables[name]);
 }
 export function updateSecret(text, secret) {
   const before = parseEnv(text);
@@ -66,8 +73,7 @@ export function migrateProductionCredential(root = process.cwd()) {
   const source = join(root, '.dev.vars');
   if (!existsSync(source)) throw new Error('No .dev.vars file to migrate');
   const text = readFileSync(source, 'utf8');
-  const secret = parseEnv(text).API_SECRET;
-  if (!secret || secret.length < 32) throw new Error('No valid API_SECRET in .dev.vars');
+  const secret = validateCredential(parseEnv(text).API_SECRET);
   const target = credentialFile('production', root);
   if (existsSync(target) && readCredential('production', root) !== secret) throw new Error('Production credential file already contains a different value; nothing changed');
   const remainder = updateSecret(text, null);

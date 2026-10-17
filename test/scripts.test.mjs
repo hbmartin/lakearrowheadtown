@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { migrateProductionCredential, readCredential, readPublishingCredential, saveCredential, updateSecret } from '../scripts/credentials.mjs';
+import { migrateProductionCredential, readCredential, readPublishingCredential, saveCredential, updateSecret, validateCredential } from '../scripts/credentials.mjs';
 import { deploy } from '../scripts/deploy.mjs';
 import { maintenance, maintenanceTarget } from '../scripts/maintenance.mjs';
 import { provisionSecret } from '../scripts/provision-secret.mjs';
@@ -11,6 +11,7 @@ import { parseSmokeArgs, smoke } from '../scripts/smoke-preview.mjs';
 
 const secret = 'a'.repeat(64);
 const id = '00000000-0000-0000-0000-000000000001';
+const credentialError = 'Publishing credential must contain at least 32 characters and be a valid HTTP header token without whitespace or control characters';
 function directory(t) { const root = mkdtempSync(join(tmpdir(), 'lakearrowhead-test-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root; }
 
 test('rotation preserves unrelated dotenv fields and backs up the complete original', t => {
@@ -51,14 +52,43 @@ test('publishing credentials prefer build secrets and otherwise use the environm
     assert.equal(readPublishingCredential(environment, {}, root), local);
     assert.equal(readPublishingCredential(environment, { [name]: secret }, root), secret);
     for (const value of ['', 'too-short']) {
-      assert.throws(() => readPublishingCredential(environment, { [name]: value }, root), error => {
-        assert.match(error.message, new RegExp(`${name} is missing or too short`));
-        assert(!error.message.includes(value || secret));
-        return true;
-      });
+      assert.throws(() => readPublishingCredential(environment, { [name]: value }, root), { message: credentialError });
     }
   }
   assert.throws(() => readPublishingCredential('invalid', { INVALID_API_SECRET: secret }, root), /Choose preview or production/);
+});
+test('credential validation preserves supported nonhex tokens and rejects unsafe header values without echoing them', t => {
+  const root = directory(t);
+  for (const value of [secret, 'valid-punctuation_+./=~!'.repeat(2), 'é'.repeat(32)]) {
+    assert.equal(validateCredential(value), value);
+  }
+  for (const value of [undefined, '', 'short', ...[' ', '\t', '\n', '\r', '\0', '\x01', '\x7f', '\x85', '\u0100'].map(char => `${secret}${char}suffix`)]) {
+    assert.throws(() => validateCredential(value), { message: credentialError });
+    for (const environment of ['preview', 'production']) {
+      const name = `${environment.toUpperCase()}_API_SECRET`;
+      assert.throws(() => readPublishingCredential(environment, { [name]: value }, root), { message: credentialError });
+    }
+  }
+  // Quoting keeps whitespace intact through dotenv parsing, including newlines.
+  for (const value of [`${secret}\nextra`, `${secret} extra`, `${secret}\x7f`, `${secret}\u0100`]) {
+    writeFileSync(join(root, '.dev.vars.preview'), `API_SECRET="${value}"\n`);
+    assert.throws(() => readCredential('preview', root), { message: credentialError });
+    const legacy = `API_SECRET="${value}"\nOTHER=keep\n`;
+    writeFileSync(join(root, '.dev.vars'), legacy);
+    assert.throws(() => migrateProductionCredential(root), { message: credentialError });
+    assert.equal(readFileSync(join(root, '.dev.vars'), 'utf8'), legacy);
+    assert.equal(readdirSync(root).includes('.secrets'), false);
+  }
+});
+test('unsafe explicit credentials fail before deployment, maintenance, or smoke requests', async () => {
+  for (const value of [`${secret}\nextra`, `${secret}\0extra`, `${secret} extra`, `${secret}\u0100`]) {
+    const calls = [];
+    const options = { secret: value, origin: 'https://lakearrowheadtown-preview.harold-martin.workers.dev', run: () => { calls.push('deploy'); return { status: 0 }; }, request: () => { calls.push('request'); } };
+    await assert.rejects(deploy('preview', options), { message: credentialError });
+    await assert.rejects(maintenance('start', 'preview', undefined, options), { message: credentialError });
+    await assert.rejects(smoke([], { credential: () => value, request: options.request }), { message: credentialError });
+    assert.deepEqual(calls, []);
+  }
 });
 test('explicit migration preserves the token and unrelated variables without any remote call', t => {
   const root = directory(t);

@@ -1,15 +1,15 @@
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { checkEnvironment, readPublishingCredential } from './credentials.mjs';
+import { checkEnvironment, readPublishingCredential, validateCredential } from './credentials.mjs';
 import { maintenance, maintenanceTarget } from './maintenance.mjs';
 
 export async function deploy(environment, options = {}) {
   checkEnvironment(environment);
   const origin = maintenanceTarget(environment, options.origin);
   if (new URL(origin).hostname === 'localhost') throw new Error('Deployment rebuilds must target the deployed Worker, not localhost; unset SITE_URL or select the remote environment URL');
-  // Validate the build secret or local credential before deployment.
-  const secret = options.secret ?? readPublishingCredential(environment);
+  // Validate the credential's format before deployment; authentication follows it.
+  const secret = validateCredential(options.secret ?? readPublishingCredential(environment));
   const result = (options.run ?? spawnSync)('npx', ['wrangler', 'deploy', '--env', environment === 'preview' ? 'preview' : ''], { stdio: 'inherit' });
   if (result.error || result.status !== 0) throw new Error('Worker deployment failed; no rebuild was requested');
   const job = await maintenance('start', environment, undefined, { origin, secret, request: options.request });

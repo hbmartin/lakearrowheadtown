@@ -13,44 +13,71 @@ const timeFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, month
 const fullTimeFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });
 const emptyContent = template.match(/<!-- digests:start -->([\s\S]*?)<!-- digests:end -->/)![1].trim();
 
-const prunableTags = new Set(['a', 'em', 'strong', 's', 'p', 'blockquote', 'li', 'ol', 'ul', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
 const emptyToken = (token: Token): boolean => token.type === 'inline'
   ? (token.children ?? []).every(emptyToken)
   : token.type === 'text' ? !token.content.trim() : ['softbreak', 'hardbreak'].includes(token.type);
 
-// Removing an image can leave an empty link, paragraph, or list item behind.
-function pruneEmptyWrappers(tokens: Token[]): Token[] {
+// Only remove ancestors changed by image extraction or link splitting.
+function removeEmptiedWrappers(tokens: Token[], affected: Set<Token>): Token[] {
   const result: Token[] = [];
   const openings: number[] = [];
   for (const token of tokens) {
     if (token.nesting === 1) openings.push(result.length);
     if (token.nesting === -1) {
       const start = openings.pop()!;
-      if (prunableTags.has(result[start].tag) && result.slice(start + 1).every(emptyToken)) {
+      if (affected.has(result[start]) && result.slice(start + 1).every(emptyToken)) {
         result.splice(start);
         continue;
       }
     }
     result.push(token);
   }
-  return result.every(emptyToken) ? [] : result;
+  return result;
+}
+
+function textEdge(tokens: Token[], last = false): string {
+  for (let i = last ? tokens.length - 1 : 0; i >= 0 && i < tokens.length; i += last ? -1 : 1) {
+    const token = tokens[i];
+    if (token.nesting || (token.type === 'text' && !token.content)) continue;
+    if (!['text', 'code_inline'].includes(token.type)) return '';
+    const characters = Array.from(token.content);
+    return (last ? characters.at(-1) : characters[0]) ?? '';
+  }
+  return '';
 }
 
 function renderBody(item: DigestItem): string {
   const env = {};
   const tokens = markdown.parse(item.body, env);
   let thumbnail: Token | undefined;
+  const blocks: Token[] = [];
+  const affectedBlocks = new Set<Token>();
+  const itemLists = new Map<Token, Token>();
+  const listSizes = new Map<Token, number>();
   const imageLink = (image: Token, primary = false): Token[] => {
     const open = new MarkdownIt.Token('link_open', 'a', 1);
     open.attrs = [
       ['class', `article-image${primary ? ' article-thumbnail' : ''}`],
       ['href', item.post_url], ['rel', 'noopener noreferrer'],
-      ['aria-label', `View original post: ${item.headline}`],
     ];
+    if (!markdown.renderer.renderInlineAsText(image.children ?? [], markdown.options, env).trim()) {
+      open.attrSet('aria-label', `View original post: ${item.headline}`);
+    }
     return [open, image, new MarkdownIt.Token('link_close', 'a', -1)];
   };
   for (const token of tokens) {
+    if (token.nesting === 1) {
+      if (token.tag === 'li') {
+        const list = blocks.at(-1)!;
+        itemLists.set(token, list);
+        listSizes.set(list, (listSizes.get(list) ?? 0) + 1);
+      }
+      blocks.push(token);
+    }
+    if (token.nesting === -1) blocks.pop();
     if (token.type !== 'inline' || !token.children?.some(child => child.type === 'image')) continue;
+    const affectedInline = new Set<Token>();
+    let extracted = false;
     const closing = new Map<Token, Token>();
     const stack: Token[] = [];
     for (const child of token.children) {
@@ -58,10 +85,20 @@ function renderBody(item: DigestItem): string {
       if (child.nesting === -1) closing.set(stack.pop()!, child);
     }
     const rewritten: Token[] = [];
-    for (const child of token.children) {
+    for (const [index, child] of token.children.entries()) {
       if (child.type === 'image') {
-        if (!thumbnail) thumbnail = child;
-        else {
+        stack.forEach(open => affectedInline.add(open));
+        if (!thumbnail) {
+          thumbnail = child;
+          extracted = true;
+          blocks.forEach(open => affectedBlocks.add(open));
+          // A moved inline image must not concatenate the words around it.
+          if (/[\p{L}\p{N}_]/u.test(textEdge(rewritten, true)) && /[\p{L}\p{N}_]/u.test(textEdge(token.children.slice(index + 1)))) {
+            const space = new MarkdownIt.Token('text', '', 0);
+            space.content = ' ';
+            rewritten.push(space);
+          }
+        } else {
           // Split surrounding links/formatting so image links never nest inside them.
           rewritten.push(...[...stack].reverse().map(open => closing.get(open)!));
           rewritten.push(...imageLink(child), ...stack);
@@ -72,10 +109,24 @@ function renderBody(item: DigestItem): string {
         if (child.nesting === -1) stack.pop();
       }
     }
-    token.children = pruneEmptyWrappers(rewritten);
+    token.children = removeEmptiedWrappers(rewritten, affectedInline);
+    if (extracted) {
+      // Moving a leading image can leave its caption's separator at the start.
+      const leadingBreaks = new Set<Token>();
+      for (const child of token.children) {
+        if (child.nesting || (child.type === 'text' && !child.content.trim())) continue;
+        if (!['softbreak', 'hardbreak'].includes(child.type)) break;
+        leadingBreaks.add(child);
+      }
+      token.children = token.children.filter(child => !leadingBreaks.has(child));
+    }
+  }
+  // Keep an extracted image's marker when siblings remain, including empty ones.
+  for (const [listItem, list] of itemLists) {
+    if (listSizes.get(list)! > 1) affectedBlocks.delete(listItem);
   }
   const image = thumbnail ? markdown.renderer.renderInline(imageLink(thumbnail, true), markdown.options, env) : '';
-  return image + markdown.renderer.render(thumbnail ? pruneEmptyWrappers(tokens) : tokens, markdown.options, env);
+  return image + markdown.renderer.render(removeEmptiedWrappers(tokens, affectedBlocks), markdown.options, env);
 }
 
 function renderItem(item: DigestItem): string {

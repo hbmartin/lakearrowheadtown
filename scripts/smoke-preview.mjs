@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { readCredential } from './credentials.mjs';
+import { readCredential, validateCredential } from './credentials.mjs';
 import { maintenance, maintenanceTarget } from './maintenance.mjs';
 
 export function parseSmokeArgs(args = process.argv.slice(2)) {
@@ -14,7 +14,7 @@ export function parseSmokeArgs(args = process.argv.slice(2)) {
 export async function smoke(args = process.argv.slice(2), options = {}) {
   const { origin, edge } = parseSmokeArgs(args);
   const fetch = (url, init = {}) => (options.request ?? globalThis.fetch)(url, { ...init, signal: AbortSignal.timeout(30000) });
-  const secret = (options.credential ?? readCredential)('preview');
+  const secret = validateCredential((options.credential ?? readCredential)('preview'));
   const headers = { Authorization: `Bearer ${secret}` };
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
   const form = new FormData();
