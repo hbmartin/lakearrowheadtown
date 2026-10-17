@@ -14,7 +14,10 @@
     "bindings": [{ "name": "PUBLISHER", "class_name": "DigestPublisher" }]
   },
   "exports": { "DigestPublisher": { "type": "durable-object", "storage": "sqlite" } },
-  "rules": [{ "type": "Text", "globs": ["**/*.html", "**/*.svg"], "fallthrough": true }],
+  "rules": [
+    { "type": "Text", "globs": ["**/*.html", "**/*.svg"], "fallthrough": true },
+    { "type": "Data", "globs": ["**/*.png", "**/*.ico"], "fallthrough": true }
+  ],
   "observability": { "enabled": true },
   "env": {
     "preview": {

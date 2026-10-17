@@ -40,6 +40,7 @@ export CLOUDFLARE_ACCOUNT_ID=your-cloudflare-account-id
 Wrangler provisions the SQLite-backed publisher and separate namespaces. Keep R2 buckets private, with public development URLs disabled and no R2 custom domain. The Worker exposes only the specified public routes; no S3 credentials are required. See [R2 Worker bindings](https://developers.cloudflare.com/r2/api/workers/workers-api-usage/).
 
 For another domain or account, update the Worker names, buckets, route, and `SITE_ORIGIN`, plus the URL defaults and target allowlists in [`scripts/maintenance.mjs`](scripts/maintenance.mjs). `SITE_ORIGIN` must be an HTTP(S) origin without credentials, a path, query, or fragment.
+Also update the production indexing origin in [`src/site.ts`](src/site.ts) when changing domains.
 
 ### 2. Create buckets
 
@@ -230,6 +231,37 @@ If a historical source is missing, contains malformed JSON, or fails digest vali
 
 R2 has no transaction spanning these objects. Index replacement is the commit point, and a failure can leave private source or manifest objects. After a timeout or `500`, check the homepage before posting again: publication may have completed, and another POST can create a duplicate.
 
+## Search, sharing, and browser metadata
+
+[`src/site.ts`](src/site.ts) holds the shared name, description, production origin, colors, and versioned artwork paths. Empty pages, publications, and template rebuilds all render the same complete metadata through [`src/metadata.ts`](src/metadata.ts): canonical URL, application name, robots, Open Graph, Twitter large-image cards, favicon/touch-icon links, and the web manifest. The theme picker continues to update the browser's theme color.
+
+The description and 1200 × 630 share card describe the site consistently, regardless of current headlines. JSON-LD connects the `WebSite`, homepage `CollectionPage`, and an ordered `ItemList` of exactly the visible headlines and original source URLs, including visible duplicates. It does not expose digest titles, stored post IDs, or storage references. `dateModified` uses the saved publication time and is absent before first publication.
+
+Only `https://lakearrowhead.town` is indexable. Preview, localhost, alternate production hostnames, and invalid-origin configurations receive `X-Robots-Tag: noindex`, including HEAD and 304 responses. Preview HTML also carries a `noindex` meta tag. Production HTML served from an alternate hostname retains the production canonical URL; its response header enforces `noindex` on that hostname. Crawling remains allowed so search engines can read the directive.
+
+| Public resource | Behavior |
+| --- | --- |
+| `/robots.txt` | Allows public content, disallows `/api/`, and advertises the sitemap only on the production origin. |
+| `/sitemap.xml` | Production only; lists the canonical homepage. `lastmod` comes from the manifest referenced by the committed index, never the current clock or a rebuild's R2 upload time. Missing/malformed metadata omits the date; storage outages return an error. |
+| `/site.webmanifest` | English browser-mode manifest with relative root URLs, theme colors, and 192/512px icons. |
+| `/favicon.svg`, `/favicon.ico` | SVG mark and conventional ICO fallback; cached for one day. |
+| `/assets/social-card-v1.png` | 1200 × 630 branded share image. |
+| `/assets/favicon-v1.ico`, `/assets/favicon-48-v1.png` | ICO with 16/32/48px frames and 48px PNG favicon. |
+| `/assets/apple-touch-icon-v1.png` | 180px Apple touch icon. |
+| `/assets/icon-192-v1.png`, `/assets/icon-512-v1.png` | Square manifest icons. |
+
+These routes support GET, HEAD, and ETag revalidation. Versioned artwork has one-year immutable caching. Robots and manifest responses are cached for one hour; the sitemap revalidates like the homepage and bypasses CDN caching. Artwork is bundled with the Worker and needs no upload to R2. Source artwork and fonts are not public routes.
+
+Regenerate artwork locally with Node.js 24+ after installing dependencies:
+
+```sh
+npm run artwork
+```
+
+The generator uses the existing tree path from `favicon.svg`, editable SVG templates in `assets/source/`, and bundled Instrument Serif / DM Sans fonts with their SIL Open Font Licenses. It does not require network access or installed system fonts. The share card uses the site's default cream and forest-green palette. Commit generated PNG/ICO files along with source changes. When replacing released artwork bytes, bump the versioned filenames in the site constants and Worker imports so immutable caches remain correct.
+
+Code deployment alone does not update an existing R2 homepage. Use the normal `deploy:preview` or `deploy` command, which queues a rebuild, and check its job until completed. Then check the rendered homepage, `/robots.txt`, `/sitemap.xml` on production, the manifest, and its linked images. Rebuilds apply metadata changes while retaining the saved feed selection and publication timestamp. Search engines and social platforms may take time to refresh their own cached previews.
+
 ## Upload images
 
 ```sh
@@ -282,7 +314,7 @@ Template rebuilds neither read nor reconsider omitted references, even after res
 | `images/<sha256>.<extension>` | Immutable uploaded images |
 | `digests/*.json`, `pages/digests/*.html` | Retained private legacy backups |
 
-Only `/`, `/index.html`, `/images/<hash>.<extension>`, and `/favicon.svg` are public. Old daily routes return `404`. Sources, manifests, bucket listings, and config files are never exposed. There is no archive listing or public administration UI.
+Only `/`, `/index.html`, `/images/<hash>.<extension>`, and the explicit metadata/artwork routes listed above are public. Old daily routes return `404`. Digest sources, publication manifests, bucket listings, artwork source files, and config files are never exposed. There is no archive listing or public administration UI.
 
 HTML supports HEAD and weak ETag revalidation, requires revalidation, permits compression, and bypasses edge caching. Malformed `If-None-Match` conditions are ignored consistently for public GET and HEAD requests. Image GETs use Workers Caching. Protected APIs always return `no-store` JSON. Error statuses include `400`, `401`, `404`, `405`, `409` for invalid job resume, `413`, `415`, and `500`/`503`. The publication uncertainty warning is limited to failed digest publisher calls; other routes use operation-specific errors. Maintenance CLI errors preserve HTTP status even when Cloudflare returns non-JSON content. Logs omit credentials and payloads.
 
