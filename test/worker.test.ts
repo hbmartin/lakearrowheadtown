@@ -421,17 +421,27 @@ describe('server dates, snapshots and rendering', () => {
     expect(html).not.toContain('Old news');
     expect(html).toContain('Last published');
   });
-  it('keeps the browser title while shortening the masthead and moving metadata to the footer', () => {
+  it('keeps the site name and footer dates while styling the masthead and including the theme picker', () => {
     const html = snapshotPage([]);
     expect(html).toContain('<title>News from Lake Arrowhead . Town</title>');
     expect(html).toContain('<meta property="og:title" content="News from Lake Arrowhead . Town">');
-    expect(html).toContain('<h1><a class="site-title" href="/">Lake Arrowhead . Town</a></h1>');
+    expect(html).toContain('<a class="site-title" href="/" aria-label="Lake Arrowhead . Town">Lake Arrowhead <span class="site-title-tail"><span class="site-dot" aria-hidden="true">.</span> Town</span></a>');
+    const header = html.match(/<header>([\s\S]*?)<\/header>/)![1];
+    expect(header).toContain('class="theme-picker"');
+    expect(header).toContain('value="night-sky"');
     const footer = html.match(/<footer>([\s\S]*?)<\/footer>/)![1];
     expect(footer).toContain('Posts from Saturday, October 10, 2026 through Friday, October 16, 2026.');
     expect(footer).toContain('<time datetime="2026-10-16T21:57:00Z">Oct 16, 2:57 PM PDT</time>');
     expect(footer.indexOf('Posts from')).toBeGreaterThan(footer.indexOf('Community news from around the mountain.'));
     expect(html.match(/<main>([\s\S]*?)<\/main>/)![1]).not.toContain('snapshot-meta');
     expect(html).not.toContain('Received ');
+  });
+  it('keeps original post instants and absolute Los Angeles timestamps for no-JavaScript and accessible reading', () => {
+    const timestamp = '2026-10-16T17:12:34.123Z';
+    const html = snapshotPage([source('one', digest('Original post', timestamp).items)]);
+    expect(html).toContain('class="item-group" href="https://facebook.com/groups/2241141482782874/"');
+    expect(html).toContain(`<time class="post-time" datetime="${timestamp}" title="Friday, October 16, 2026 at 10:12:34 AM PDT" aria-label="Friday, October 16, 2026 at 10:12:34 AM PDT">Oct 16, 10:12 AM PDT</time>`);
+    expect(html).toContain('<time datetime="2026-10-16">Friday, October 16, 2026</time>');
   });
   it('escapes HTML and unsafe links while preserving Markdown images', () => {
     const input: StoredPost = { ...digest('<img src=x onerror=alert(1)> $&'), id: 'sample', date: '2026-10-16', received_at: '2026-10-16T20:00:00Z' };

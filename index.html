@@ -5,7 +5,7 @@
   <script>
     // Restore the saved palette before styles or page content can paint.
     (() => {
-      const themes = ['deep-lake-lodge', 'golden-hour-dock', 'morning-mist', 'village-heritage'];
+      const themes = ['deep-lake-lodge', 'golden-hour-dock', 'morning-mist', 'village-heritage', 'night-sky'];
       try {
         const cookie = document.cookie.split(';').map(part => part.trim())
           .find(part => part.startsWith('lakearrowhead_theme='));
@@ -72,8 +72,10 @@
       --on-primary: #F8F6F1;
       --accent: #8A6B4F;
       --texture-ink: #8A6B4F;
-      --texture: repeating-linear-gradient(93deg, transparent 0 19px, var(--texture-ink) 20px, transparent 21px 47px);
-      --texture-size: 100% 100%;
+      --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='480' fill='none' stroke='%238A6B4F' stroke-width='1'%3E%3Cpath d='M18-20Q42 90 20 190T22 500M40-20Q66 95 45 190T48 500M68-20Q92 110 70 210T74 500M100-20Q124 120 98 235T104 500M134-20Q154 120 132 240T138 500M168-20Q188 140 166 260T174 500M206-20Q224 140 204 260T210 500'/%3E%3Cellipse cx='98' cy='234' rx='8' ry='36'/%3E%3Cellipse cx='98' cy='234' rx='3' ry='18'/%3E%3C/svg%3E");
+      --texture-size: 240px 480px;
+      --texture-opacity: 0.22;
+      --atmosphere: radial-gradient(ellipse at 0 0, rgb(138 107 79 / 12%), transparent 65%), radial-gradient(ellipse at 100% 12%, rgb(46 95 115 / 9%), transparent 60%);
       --shadow: 0 12px 40px rgb(27 59 31 / 10%), 0 2px 6px rgb(27 59 31 / 5%);
       --gutter: clamp(1.5rem, 6vw, 6rem);
       --radius: 14px;
@@ -94,7 +96,10 @@
       --on-primary: #F5EEDC;
       --accent: #D9782F;
       --texture-ink: #8B5E3C;
-      --texture: repeating-linear-gradient(88deg, transparent 0 24px, var(--texture-ink) 25px, transparent 26px 61px);
+      --texture: repeating-linear-gradient(0deg, transparent 0 76px, var(--texture-ink) 77px, transparent 79px 80px), repeating-linear-gradient(1deg, transparent 0 12px, rgb(139 94 60 / 35%) 13px, transparent 14px 29px);
+      --texture-size: 360px 240px;
+      --texture-opacity: 0.24;
+      --atmosphere: radial-gradient(ellipse at 100% 0, rgb(217 120 47 / 19%), transparent 65%), radial-gradient(ellipse at 0 20%, rgb(90 63 95 / 8%), transparent 60%);
       --shadow: 0 12px 40px rgb(90 63 95 / 10%), 0 2px 6px rgb(90 63 95 / 5%);
     }
 
@@ -116,6 +121,8 @@
       --texture-ink: #A3B5B2;
       --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='400' viewBox='0 0 600 400' fill='none' stroke='%232C3633' stroke-width='1.5'%3E%3Cdefs%3E%3Cpath id='line' d='M0 0C100-60 200-60 300 0S500 60 600 0'/%3E%3C/defs%3E%3Cuse href='%23line' y='-50'/%3E%3Cuse href='%23line' y='-25'/%3E%3Cuse href='%23line' y='0'/%3E%3Cuse href='%23line' y='25'/%3E%3Cuse href='%23line' y='50'/%3E%3Cuse href='%23line' y='75'/%3E%3Cuse href='%23line' y='100'/%3E%3Cuse href='%23line' y='125'/%3E%3Cuse href='%23line' y='150'/%3E%3Cuse href='%23line' y='175'/%3E%3Cuse href='%23line' y='200'/%3E%3Cuse href='%23line' y='225'/%3E%3Cuse href='%23line' y='250'/%3E%3Cuse href='%23line' y='275'/%3E%3Cuse href='%23line' y='300'/%3E%3Cuse href='%23line' y='325'/%3E%3Cuse href='%23line' y='350'/%3E%3Cuse href='%23line' y='375'/%3E%3Cuse href='%23line' y='400'/%3E%3Cuse href='%23line' y='425'/%3E%3Cuse href='%23line' y='450'/%3E%3C/svg%3E");
       --texture-size: 600px 400px;
+      --texture-opacity: 0.16;
+      --atmosphere: radial-gradient(ellipse at 0 0, rgb(163 181 178 / 28%), transparent 65%), radial-gradient(ellipse at 100% 30%, rgb(255 255 255 / 90%), transparent 65%);
       --shadow: 0 12px 40px rgb(44 54 51 / 8%), 0 2px 6px rgb(44 54 51 / 4%);
     }
 
@@ -135,17 +142,45 @@
       --on-primary: #FFF9F0;
       --accent: #A33529;
       --texture-ink: #2B4C3F;
-      --texture: radial-gradient(var(--texture-ink) 0.6px, transparent 0.8px), radial-gradient(var(--texture-ink) 0.5px, transparent 0.7px);
-      --texture-size: 19px 23px, 31px 37px;
+      --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' fill='none' stroke='%238A6B4F' stroke-width='.7'%3E%3Cpath d='m8 22 12-3m32 18 16 2m49-24 7 4m32 30-13 2M18 80l7 3m36-17 14-2m28 28 11 3m38-20 14-1M7 144l13-2m30 21 9-4m32-31 17 1m37 26 11-4'/%3E%3C/svg%3E"), radial-gradient(var(--texture-ink) 0.7px, transparent 1px), radial-gradient(var(--texture-ink) 0.5px, transparent 0.8px);
+      --texture-size: 180px 180px, 19px 23px, 31px 37px;
+      --texture-opacity: 0.28;
+      --atmosphere: radial-gradient(ellipse at 0 0, rgb(194 178 128 / 22%), transparent 70%), radial-gradient(ellipse at 100% 15%, rgb(163 53 41 / 6%), transparent 60%);
       --shadow: 0 12px 40px rgb(43 76 63 / 10%), 0 2px 6px rgb(43 76 63 / 5%);
+    }
+
+    :root[data-theme="night-sky"] {
+      color-scheme: dark;
+      --page-bg: #0B1426;
+      --surface: #13213A;
+      --surface-hover: #1B2D49;
+      --selected-bg: #203654;
+      --heading: #F2F4FA;
+      --text: #DEE5F0;
+      --muted: #A7B7CF;
+      --border: #344761;
+      --control-border: #7F96B5;
+      --primary: #9FC7F5;
+      --on-primary: #0B1426;
+      --accent: #E0C58A;
+      --texture-ink: #DEE5F0;
+      --texture: radial-gradient(circle at 24px 20px, var(--texture-ink) 0 1px, transparent 1.5px), radial-gradient(circle at 101px 91px, var(--texture-ink) 0 0.7px, transparent 1.2px), radial-gradient(circle at 48px 115px, var(--accent) 0 0.8px, transparent 1.3px);
+      --texture-size: 173px 191px, 257px 227px, 311px 283px;
+      --texture-opacity: 0.65;
+      --atmosphere: radial-gradient(ellipse at 100% 0, rgb(64 100 156 / 25%), transparent 70%), radial-gradient(ellipse at 0 20%, rgb(91 77 126 / 14%), transparent 65%);
+      --shadow: 0 12px 40px rgb(0 0 0 / 35%), 0 2px 6px rgb(0 0 0 / 20%);
     }
 
     body {
       isolation: isolate;
       padding-bottom: 3rem;
-      background: var(--page-bg);
+      background-color: var(--page-bg);
+      background-image: var(--atmosphere);
+      background-size: 100% 34rem;
+      background-repeat: no-repeat;
       color: var(--text);
       font-family: var(--body-font);
+      font-size: 1rem;
       font-optical-sizing: auto;
     }
     body::before {
@@ -156,14 +191,19 @@
       pointer-events: none;
       background-image: var(--texture);
       background-size: var(--texture-size);
-      opacity: 0.04;
+      opacity: var(--texture-opacity);
+      mask-image: linear-gradient(90deg, #000, transparent 22%, transparent 78%, #000), linear-gradient(#000, transparent 26rem);
     }
     body > header, main, body > footer {
       width: min(calc(100% - var(--gutter) * 2), 72rem);
       margin-inline: auto;
     }
     body > header {
-      padding-block: 4.5rem 1.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding-block: 1.5rem 1rem;
       border-bottom: 1px solid var(--border);
     }
     h1, h2, h3, h4, h5, h6 {
@@ -173,18 +213,21 @@
       letter-spacing: -0.035em;
       line-height: 1.06;
     }
-    body > header h1 { font-size: clamp(1.25rem, 5.5vw, 3.5rem); white-space: nowrap; }
+    body > header h1 { flex: 1; min-width: 0; font-size: clamp(1.5rem, 6.3vw, 3.5rem); line-height: 1.1; text-wrap: wrap; }
     main { padding-block: clamp(2rem, 5vw, 4rem); }
     a { color: var(--primary); text-underline-offset: 0.2em; }
     ::selection { background: var(--selected-bg); color: var(--text); }
 
     .site-title { color: inherit; text-decoration: none; }
+    .site-title-tail { white-space: nowrap; }
+    .site-dot { display: inline-block; width: 0.16em; height: 0.16em; overflow: hidden; border-radius: 50%; background: var(--accent); color: transparent; line-height: 0; vertical-align: 0.2em; }
     .digest { max-width: 52rem; }
     .snapshot-meta { max-width: 52rem; margin-top: 0.75rem; }
     .digest + .digest { margin-top: 4rem; padding-top: 3rem; border-top: 1px solid var(--border); }
-    .digest-header { margin-bottom: 2rem; }
-    .digest-header h2 { font-family: var(--body-font); font-size: 1rem; font-weight: 600; line-height: 1.5; letter-spacing: normal; }
+    .digest-header { margin-bottom: 1rem; }
+    .digest-header h2 { color: var(--muted); font-family: var(--body-font); font-size: 0.875rem; font-weight: 500; line-height: 1.5; letter-spacing: normal; }
     .digest-item { padding-block: 1.75rem; border-top: 1px solid var(--border); }
+    .digest-header + .digest-item { padding-top: 0; border-top: 0; }
     .item-meta { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: baseline; color: var(--muted); font-size: 0.8125rem; }
     .category { padding: 0.125rem 0.5rem; border: 1px solid var(--border); border-radius: 0.375rem; }
     .digest-item h3 { margin-top: 0.875rem; font-size: clamp(1.5rem, 3vw, 2rem); line-height: 1.2; }
@@ -204,17 +247,26 @@
     .markdown table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
     .markdown :is(th, td) { padding: 0.5rem 0.75rem; border: 1px solid var(--border); }
     @media (max-width: 600px) {
-      .markdown { --thumbnail-size: 96px; --thumbnail-gap: 12px; }
+      :root { --gutter: 1rem; }
+      body > header { gap: 0.5rem; padding-block: 1rem 0.75rem; }
+      main { padding-block: 1rem 2rem; }
+      .digest + .digest { margin-top: 1.5rem; padding-top: 1rem; }
+      .digest-header { margin-bottom: 0.75rem; }
+      .digest-header h2 { font-size: 0.8125rem; }
+      .digest-item { padding-block: 1rem; }
+      .item-meta { gap: 0.375rem 0.75rem; }
+      .item-group { display: none; }
+      .digest-item h3 { margin-top: 0.5rem; font-size: clamp(1.25rem, 5.1vw, 1.375rem); }
+      .markdown { --thumbnail-size: 96px; --thumbnail-gap: 12px; margin-top: 0.625rem; line-height: 1.6; }
+      .markdown > * + * { margin-top: 0.75rem; }
     }
     .empty-state { max-width: 45ch; color: var(--muted); line-height: 1.75; }
     body > footer { padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.8125rem; }
 
     .theme-picker {
-      position: fixed;
+      position: relative;
       z-index: 10;
-      right: max(1rem, env(safe-area-inset-right));
-      top: max(1rem, env(safe-area-inset-top));
-      max-width: calc(100vw - 2rem - env(safe-area-inset-left) - env(safe-area-inset-right));
+      flex: 0 0 auto;
       font-size: 0.875rem;
     }
     .theme-trigger {
@@ -224,18 +276,17 @@
       height: 44px;
       margin-left: auto;
       padding: 0;
-      border: 1px solid var(--control-border);
-      border-radius: var(--radius);
-      background: var(--surface);
-      box-shadow: var(--shadow);
+      border: 0;
+      border-radius: 50%;
+      background: transparent;
     }
     .theme-trigger:hover, .theme-trigger[aria-expanded="true"] { background: var(--surface-hover); }
     .theme-trigger > svg { color: var(--primary); }
     .theme-panel {
       position: absolute;
       right: 0;
-      top: calc(100% + 0.75rem);
-      width: min(22rem, calc(100vw - 2rem - env(safe-area-inset-left) - env(safe-area-inset-right)));
+      top: calc(100% + 0.5rem);
+      width: min(22rem, calc(100vw - var(--gutter) * 2));
       max-height: calc(100vh - 6rem);
       max-height: calc(100svh - 6rem - env(safe-area-inset-top) - env(safe-area-inset-bottom));
       overflow-y: auto;
@@ -293,7 +344,72 @@
 </head>
 <body>
   <header>
-    <h1><a class="site-title" href="/">Lake Arrowhead . Town</a></h1>
+    <h1><a class="site-title" href="/" aria-label="Lake Arrowhead . Town">Lake Arrowhead <span class="site-title-tail"><span class="site-dot" aria-hidden="true">.</span> Town</span></a></h1>
+    <div class="theme-picker" hidden>
+      <div class="theme-panel" id="theme-panel" hidden>
+        <fieldset>
+          <legend>Choose a theme</legend>
+          <div class="theme-options">
+            <label class="theme-option">
+              <input type="radio" name="theme" value="deep-lake-lodge" checked>
+              <span class="theme-option-copy">
+                <span class="theme-name">Deep Lake &amp; Lodge</span>
+                <span class="theme-description">Evergreen, lake blue &amp; cedar</span>
+                <span class="theme-swatches" aria-hidden="true">
+                  <span style="--swatch: #1B3B1F"></span><span style="--swatch: #2E5F73"></span><span style="--swatch: #CBD6D6"></span><span style="--swatch: #8A8E93"></span><span style="--swatch: #8A6B4F"></span><span style="--swatch: #F8F6F1"></span>
+                </span>
+              </span>
+            </label>
+            <label class="theme-option">
+              <input type="radio" name="theme" value="golden-hour-dock">
+              <span class="theme-option-copy">
+                <span class="theme-name">Golden Hour Dock</span>
+                <span class="theme-description">Warm amber, plum &amp; linen</span>
+                <span class="theme-swatches" aria-hidden="true">
+                  <span style="--swatch: #D9782F"></span><span style="--swatch: #5A3F5F"></span><span style="--swatch: #8B5E3C"></span><span style="--swatch: #F5EEDC"></span><span style="--swatch: #496E6E"></span>
+                </span>
+              </span>
+            </label>
+            <label class="theme-option">
+              <input type="radio" name="theme" value="morning-mist">
+              <span class="theme-option-copy">
+                <span class="theme-name">Morning Mist</span>
+                <span class="theme-description">Airy fog, pine &amp; soft blue-gray</span>
+                <span class="theme-swatches" aria-hidden="true">
+                  <span style="--swatch: #F2F4F3"></span><span style="--swatch: #D9E2E1"></span><span style="--swatch: #A3B5B2"></span><span style="--swatch: #2C3633"></span><span style="--swatch: #C2B280"></span>
+                </span>
+              </span>
+            </label>
+            <label class="theme-option">
+              <input type="radio" name="theme" value="village-heritage">
+              <span class="theme-option-copy">
+                <span class="theme-name">Village Heritage</span>
+                <span class="theme-description">Alpine cream, forest &amp; barn red</span>
+                <span class="theme-swatches" aria-hidden="true">
+                  <span style="--swatch: #FFF9F0"></span><span style="--swatch: #2B4C3F"></span><span style="--swatch: #A33529"></span><span style="--swatch: #E8DCC3"></span><span style="--swatch: #1E1E1E"></span>
+                </span>
+              </span>
+            </label>
+            <label class="theme-option">
+              <input type="radio" name="theme" value="night-sky">
+              <span class="theme-option-copy">
+                <span class="theme-name">Night Sky</span>
+                <span class="theme-description">Midnight blue, starlight &amp; warm gold</span>
+                <span class="theme-swatches" aria-hidden="true">
+                  <span style="--swatch: #0B1426"></span><span style="--swatch: #13213A"></span><span style="--swatch: #DEE5F0"></span><span style="--swatch: #9FC7F5"></span><span style="--swatch: #E0C58A"></span>
+                </span>
+              </span>
+            </label>
+          </div>
+        </fieldset>
+      </div>
+      <button class="theme-trigger" type="button" aria-label="Choose theme (current: Deep Lake &amp; Lodge)" aria-expanded="false" aria-controls="theme-panel">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M12 3a9 9 0 1 0 0 18h1.2a2.3 2.3 0 0 0 1.5-4c-.7-.6-.3-1.8.6-1.8H17a4 4 0 0 0 4-4C21 6.6 17 3 12 3Z"/>
+          <circle cx="7.5" cy="10" r=".8"/><circle cx="11" cy="7" r=".8"/><circle cx="15.5" cy="8" r=".8"/>
+        </svg>
+      </button>
+    </div>
   </header>
   <main>
     <!-- digests:start -->
@@ -304,61 +420,6 @@
     <p>Community news from around the mountain.</p>
     <!-- snapshot-meta -->
   </footer>
-  <div class="theme-picker" hidden>
-    <div class="theme-panel" id="theme-panel" hidden>
-      <fieldset>
-        <legend>Choose a theme</legend>
-        <div class="theme-options">
-          <label class="theme-option">
-            <input type="radio" name="theme" value="deep-lake-lodge" checked>
-            <span class="theme-option-copy">
-              <span class="theme-name">Deep Lake &amp; Lodge</span>
-              <span class="theme-description">Evergreen, lake blue &amp; cedar</span>
-              <span class="theme-swatches" aria-hidden="true">
-                <span style="--swatch: #1B3B1F"></span><span style="--swatch: #2E5F73"></span><span style="--swatch: #CBD6D6"></span><span style="--swatch: #8A8E93"></span><span style="--swatch: #8A6B4F"></span><span style="--swatch: #F8F6F1"></span>
-              </span>
-            </span>
-          </label>
-          <label class="theme-option">
-            <input type="radio" name="theme" value="golden-hour-dock">
-            <span class="theme-option-copy">
-              <span class="theme-name">Golden Hour Dock</span>
-              <span class="theme-description">Warm amber, plum &amp; linen</span>
-              <span class="theme-swatches" aria-hidden="true">
-                <span style="--swatch: #D9782F"></span><span style="--swatch: #5A3F5F"></span><span style="--swatch: #8B5E3C"></span><span style="--swatch: #F5EEDC"></span><span style="--swatch: #496E6E"></span>
-              </span>
-            </span>
-          </label>
-          <label class="theme-option">
-            <input type="radio" name="theme" value="morning-mist">
-            <span class="theme-option-copy">
-              <span class="theme-name">Morning Mist</span>
-              <span class="theme-description">Airy fog, pine &amp; soft blue-gray</span>
-              <span class="theme-swatches" aria-hidden="true">
-                <span style="--swatch: #F2F4F3"></span><span style="--swatch: #D9E2E1"></span><span style="--swatch: #A3B5B2"></span><span style="--swatch: #2C3633"></span><span style="--swatch: #C2B280"></span>
-              </span>
-            </span>
-          </label>
-          <label class="theme-option">
-            <input type="radio" name="theme" value="village-heritage">
-            <span class="theme-option-copy">
-              <span class="theme-name">Village Heritage</span>
-              <span class="theme-description">Alpine cream, forest &amp; barn red</span>
-              <span class="theme-swatches" aria-hidden="true">
-                <span style="--swatch: #FFF9F0"></span><span style="--swatch: #2B4C3F"></span><span style="--swatch: #A33529"></span><span style="--swatch: #E8DCC3"></span><span style="--swatch: #1E1E1E"></span>
-              </span>
-            </span>
-          </label>
-        </div>
-      </fieldset>
-    </div>
-    <button class="theme-trigger" type="button" aria-label="Choose theme (current: Deep Lake &amp; Lodge)" aria-expanded="false" aria-controls="theme-panel">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-        <path d="M12 3a9 9 0 1 0 0 18h1.2a2.3 2.3 0 0 0 1.5-4c-.7-.6-.3-1.8.6-1.8H17a4 4 0 0 0 4-4C21 6.6 17 3 12 3Z"/>
-        <circle cx="7.5" cy="10" r=".8"/><circle cx="11" cy="7" r=".8"/><circle cx="15.5" cy="8" r=".8"/>
-      </svg>
-    </button>
-  </div>
   <script>
     (() => {
       const picker = document.querySelector('.theme-picker');
@@ -391,9 +452,17 @@
         if (restoreFocus) trigger.focus({ preventScroll: true });
       }
 
+      function fitPanel() {
+        const available = innerHeight - trigger.getBoundingClientRect().bottom - 24;
+        panel.style.maxHeight = `${Math.max(44, available)}px`;
+        radios.find(radio => radio.checked).closest('label').scrollIntoView({ block: 'nearest' });
+      }
+
+      window.addEventListener('resize', () => { if (!panel.hidden) fitPanel(); });
       trigger.addEventListener('click', () => {
         if (panel.hidden) {
           panel.hidden = false;
+          fitPanel();
           trigger.setAttribute('aria-expanded', 'true');
           radios.find(radio => radio.checked).focus({ preventScroll: true });
         } else {
@@ -431,6 +500,36 @@
 
       applyTheme(document.documentElement.dataset.theme);
       picker.hidden = false;
+    })();
+  </script>
+  <script id="relative-times">
+    (() => {
+      const times = [...document.querySelectorAll('time.post-time[datetime]')].map(time => ({
+        element: time, timestamp: Date.parse(time.getAttribute('datetime')), exact: time.title,
+      })).filter(time => Number.isFinite(time.timestamp));
+      if (!times.length) return;
+
+      function updateTimes() {
+        if (document.hidden) return;
+        const now = Date.now();
+        for (const { element, timestamp, exact } of times) {
+          const seconds = (now - timestamp) / 1000;
+          const age = Math.abs(seconds);
+          let label = 'just now';
+          if (age >= 60) {
+            const unit = age < 3600 ? 'min' : age < 86400 ? 'hr' : 'day';
+            const count = Math.floor(age / (unit === 'min' ? 60 : unit === 'hr' ? 3600 : 86400));
+            const amount = `${count} ${unit}${unit === 'day' && count !== 1 ? 's' : ''}`;
+            label = seconds < 0 ? `in ${amount}` : `${amount} ago`;
+          }
+          element.textContent = label;
+          element.setAttribute('aria-label', `${label}; ${exact}`);
+        }
+      }
+
+      updateTimes();
+      setInterval(updateTimes, 60000);
+      document.addEventListener('visibilitychange', updateTimes);
     })();
   </script>
 </body>
