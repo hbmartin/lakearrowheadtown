@@ -18,7 +18,7 @@ const emptyToken = (token: Token): boolean => token.type === 'inline'
   : token.type === 'text' ? !token.content.trim() : ['softbreak', 'hardbreak'].includes(token.type);
 
 // Only remove ancestors changed by image extraction or link splitting.
-function removeEmptiedWrappers(tokens: Token[], affected: Set<Token>): Token[] {
+function removeEmptiedWrappers(tokens: Token[], affected: Set<Token>, preserveWhitespace = false): Token[] {
   const result: Token[] = [];
   const openings: number[] = [];
   for (const token of tokens) {
@@ -26,7 +26,8 @@ function removeEmptiedWrappers(tokens: Token[], affected: Set<Token>): Token[] {
     if (token.nesting === -1) {
       const start = openings.pop()!;
       if (affected.has(result[start]) && result.slice(start + 1).every(emptyToken)) {
-        result.splice(start);
+        if (preserveWhitespace) result.splice(start, 1);
+        else result.splice(start);
         continue;
       }
     }
@@ -91,9 +92,12 @@ function renderBody(item: DigestItem): string {
         if (!thumbnail) {
           thumbnail = child;
           extracted = true;
-          blocks.forEach(open => affectedBlocks.add(open));
+          blocks.forEach(open => {
+            if (open.tag !== 'td' && open.tag !== 'th') affectedBlocks.add(open);
+          });
           // A moved inline image must not concatenate the words around it.
-          if (/[\p{L}\p{N}_]/u.test(textEdge(rewritten, true)) && /[\p{L}\p{N}_]/u.test(textEdge(token.children.slice(index + 1)))) {
+          const edges = [textEdge(rewritten, true), textEdge(token.children.slice(index + 1))];
+          if (edges.every(edge => /[\p{L}\p{N}_]/u.test(edge) && !/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(edge))) {
             const space = new MarkdownIt.Token('text', '', 0);
             space.content = ' ';
             rewritten.push(space);
@@ -109,7 +113,7 @@ function renderBody(item: DigestItem): string {
         if (child.nesting === -1) stack.pop();
       }
     }
-    token.children = removeEmptiedWrappers(rewritten, affectedInline);
+    token.children = removeEmptiedWrappers(rewritten, affectedInline, true);
     if (extracted) {
       // Moving a leading image can leave its caption's separator at the start.
       const leadingBreaks = new Set<Token>();
@@ -132,9 +136,10 @@ function renderBody(item: DigestItem): string {
 function renderItem(item: DigestItem): string {
   const postedAt = new Date(item.posted_at);
   const exactTime = escapeHtml(fullTimeFormat.format(postedAt));
+  const displayTime = escapeHtml(timeFormat.format(postedAt));
   return `<article class="digest-item">
     <div class="item-meta"><a class="item-group" href="${escapeHtml(item.group_url)}" rel="noopener noreferrer">${escapeHtml(item.group)}</a>
-      <time class="post-time" datetime="${escapeHtml(item.posted_at)}" title="${exactTime}" aria-label="${exactTime}">${escapeHtml(timeFormat.format(postedAt))}</time>
+      <time class="post-time" datetime="${escapeHtml(item.posted_at)}"><span aria-hidden="true" title="${exactTime}">${displayTime}</span><span class="visually-hidden">${displayTime}</span></time>
       ${item.category ? `<span class="category">${escapeHtml(item.category)}</span>` : ''}</div>
     <h3><a class="headline-link" href="${escapeHtml(item.post_url)}" rel="noopener noreferrer">${escapeHtml(item.headline)}</a></h3>
     <div class="markdown">${renderBody(item)}</div>

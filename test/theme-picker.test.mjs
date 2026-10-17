@@ -8,6 +8,7 @@ const script = template.match(/<script id="theme-picker">([\s\S]*?)<\/script>/)[
 
 // Exercise the real script's event handlers; browser QA covers native focus/keys.
 function page() {
+  let triggerBottom = 100;
   const listeners = new Map();
   const focus = [];
   const cookies = [];
@@ -26,11 +27,12 @@ function page() {
   const body = element('body');
   const outside = element('outside');
   const attributes = new Map();
-  const trigger = { ...element('trigger'), setAttribute: (name, value) => attributes.set(name, value), getBoundingClientRect: () => ({ bottom: 100 }) };
-  const panel = { ...element('panel'), hidden: true, style: {} };
+  const trigger = { ...element('trigger'), setAttribute: (name, value) => attributes.set(name, value), getBoundingClientRect: () => ({ bottom: triggerBottom }) };
+  const panel = { ...element('panel'), hidden: true, style: {}, scrollTop: 0, get clientHeight() { return Number.parseFloat(this.style.maxHeight) || 800; } };
   const radios = ['deep-lake-lodge', 'golden-hour-dock', 'morning-mist', 'village-heritage', 'night-sky'].map((value, index) => {
     let checked = index === 0;
-    const radio = { ...element(value), value, closest: () => ({ querySelector: () => ({ textContent: value }), scrollIntoView() {} }) };
+    const label = { querySelector: () => ({ textContent: value }), offsetTop: 50 + index * 100, offsetHeight: 90, scrollIntoView() { throw new Error('Picker must not scroll the page'); } };
+    const radio = { ...element(value), value, closest: () => label };
     Object.defineProperty(radio, 'checked', {
       get: () => checked,
       set(value) { checked = value; if (value) for (const other of radios) if (other !== radio) other.checked = false; },
@@ -45,7 +47,8 @@ function page() {
     querySelector: selector => selector === '.theme-picker' ? picker : themeColor,
     getElementById: () => panel,
   });
-  runInNewContext(script, { document, window: { addEventListener: listen('window') }, innerHeight: 800, location: { protocol: 'https:' }, getComputedStyle: () => ({ getPropertyValue: () => '#F8F6F1' }) });
+  const context = { document, window: { addEventListener: listen('window') }, innerHeight: 800, location: { protocol: 'https:' }, getComputedStyle: () => ({ getPropertyValue: () => '#F8F6F1' }) };
+  runInNewContext(script, context);
   const key = (value, target = document.activeElement, shiftKey = false) => {
     const event = { key: value, target, shiftKey, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
     emit(target.name, 'keydown', event);
@@ -57,7 +60,8 @@ function page() {
     document, trigger, panel, radios, outside, attributes, focus, cookies, emit, key,
     open: () => emit('trigger', 'click'),
     change(index) { const radio = radios[index]; radio.checked = true; emit(radio.name, 'change'); },
-    choose(index) { const radio = radios[index]; radio.checked = true; emit(radio.name, 'click'); emit(radio.name, 'change'); },
+    choose(index) { const radio = radios[index]; emit('document', 'pointerdown', { target: radio }); radio.checked = true; emit(radio.name, 'click'); emit(radio.name, 'change'); },
+    resize(height, bottom = triggerBottom) { context.innerHeight = height; triggerBottom = bottom; emit('window', 'resize'); },
   };
 }
 
@@ -88,7 +92,7 @@ test('arrow changes keep saving with the panel open; Enter, Space, and Escape cl
   view.radios[1].checked = true;
   view.emit(view.radios[1].name, 'click');
   view.change(1);
-  view.emit('picker', 'keyup');
+  view.emit('document', 'keyup');
   assert.equal(view.panel.hidden, false);
   assert.equal(view.document.documentElement.dataset.theme, 'golden-hour-dock');
   assert.match(view.cookies.at(-1), /lakearrowhead_theme=golden-hour-dock/);
@@ -130,4 +134,43 @@ test('outside clicks, outside focus, and window blur close without restoring foc
     assert.equal(view.focus.slice(count).includes('trigger'), false);
     if (departure === 'focus') assert.equal(view.document.activeElement, view.outside);
   }
+});
+
+test('fits the selected option within the panel and caps height when the masthead is offscreen', () => {
+  const view = page();
+  view.radios[4].checked = true;
+  view.resize(220);
+  view.open();
+  assert.equal(view.panel.style.maxHeight, '96px');
+  assert.equal(view.panel.scrollTop, 444);
+  view.resize(650, -500);
+  assert.equal(view.panel.style.maxHeight, '626px');
+  assert.equal(view.panel.hidden, false);
+});
+
+test('pointer selection and document keyup recover from interrupted arrow navigation', () => {
+  const pointer = page(); pointer.open(); pointer.key('ArrowDown');
+  pointer.choose(3);
+  assert.equal(pointer.panel.hidden, true);
+  assert.equal(pointer.document.documentElement.dataset.theme, 'village-heritage');
+  const keyup = page(); keyup.open(); keyup.key('ArrowDown');
+  keyup.document.activeElement = { name: 'body' };
+  keyup.emit('document', 'keyup');
+  keyup.radios[2].checked = true;
+  keyup.emit(keyup.radios[2].name, 'click');
+  assert.equal(keyup.panel.hidden, true);
+  assert.equal(keyup.document.documentElement.dataset.theme, 'morning-mist');
+});
+
+test('restored theme colour is synchronized in the head before body parsing', () => {
+  const head = template.split('</head>')[0];
+  const restore = head.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const color = head.match(/<script id="theme-color">([\s\S]*?)<\/script>/)[1];
+  const meta = { content: '#F8F6F1' };
+  const document = { cookie: 'lakearrowhead_theme=night-sky', documentElement: { dataset: { theme: 'deep-lake-lodge' } }, querySelector: () => meta };
+  const context = { document, getComputedStyle: element => ({ getPropertyValue: () => element.dataset.theme === 'night-sky' ? '#0B1426' : '#F8F6F1' }) };
+  runInNewContext(restore, context);
+  runInNewContext(color, context);
+  assert.equal(document.documentElement.dataset.theme, 'night-sky');
+  assert.equal(meta.content, '#0B1426');
 });

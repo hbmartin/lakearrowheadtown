@@ -44,6 +44,7 @@
     h1, h2, h3, h4, h5, h6 { text-wrap: balance; }
     p { text-wrap: pretty; }
     [hidden] { display: none !important; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
     :focus-visible { outline: 3px solid var(--primary, #2E5F73); outline-offset: 4px; }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -74,7 +75,7 @@
       --texture-ink: #8A6B4F;
       --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='480' fill='none' stroke='%238A6B4F' stroke-width='1'%3E%3Cpath d='M18-20Q42 90 20 190T22 500M40-20Q66 95 45 190T48 500M68-20Q92 110 70 210T74 500M100-20Q124 120 98 235T104 500M134-20Q154 120 132 240T138 500M168-20Q188 140 166 260T174 500M206-20Q224 140 204 260T210 500'/%3E%3Cellipse cx='98' cy='234' rx='8' ry='36'/%3E%3Cellipse cx='98' cy='234' rx='3' ry='18'/%3E%3C/svg%3E");
       --texture-size: 240px 480px;
-      --texture-opacity: 0.22;
+      --texture-opacity: 0.132;
       --atmosphere: radial-gradient(ellipse at 0 0, rgb(138 107 79 / 12%), transparent 65%), radial-gradient(ellipse at 100% 12%, rgb(46 95 115 / 9%), transparent 60%);
       --shadow: 0 12px 40px rgb(27 59 31 / 10%), 0 2px 6px rgb(27 59 31 / 5%);
       --gutter: clamp(1.5rem, 6vw, 6rem);
@@ -98,7 +99,7 @@
       --texture-ink: #8B5E3C;
       --texture: repeating-linear-gradient(0deg, transparent 0 76px, var(--texture-ink) 77px, transparent 79px 80px), repeating-linear-gradient(1deg, transparent 0 12px, rgb(139 94 60 / 35%) 13px, transparent 14px 29px);
       --texture-size: 360px 240px;
-      --texture-opacity: 0.24;
+      --texture-opacity: 0.144;
       --atmosphere: radial-gradient(ellipse at 100% 0, rgb(217 120 47 / 19%), transparent 65%), radial-gradient(ellipse at 0 20%, rgb(90 63 95 / 8%), transparent 60%);
       --shadow: 0 12px 40px rgb(90 63 95 / 10%), 0 2px 6px rgb(90 63 95 / 5%);
     }
@@ -121,7 +122,7 @@
       --texture-ink: #A3B5B2;
       --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='400' viewBox='0 0 600 400' fill='none' stroke='%232C3633' stroke-width='1.5'%3E%3Cdefs%3E%3Cpath id='line' d='M0 0C100-60 200-60 300 0S500 60 600 0'/%3E%3C/defs%3E%3Cuse href='%23line' y='-50'/%3E%3Cuse href='%23line' y='-25'/%3E%3Cuse href='%23line' y='0'/%3E%3Cuse href='%23line' y='25'/%3E%3Cuse href='%23line' y='50'/%3E%3Cuse href='%23line' y='75'/%3E%3Cuse href='%23line' y='100'/%3E%3Cuse href='%23line' y='125'/%3E%3Cuse href='%23line' y='150'/%3E%3Cuse href='%23line' y='175'/%3E%3Cuse href='%23line' y='200'/%3E%3Cuse href='%23line' y='225'/%3E%3Cuse href='%23line' y='250'/%3E%3Cuse href='%23line' y='275'/%3E%3Cuse href='%23line' y='300'/%3E%3Cuse href='%23line' y='325'/%3E%3Cuse href='%23line' y='350'/%3E%3Cuse href='%23line' y='375'/%3E%3Cuse href='%23line' y='400'/%3E%3Cuse href='%23line' y='425'/%3E%3Cuse href='%23line' y='450'/%3E%3C/svg%3E");
       --texture-size: 600px 400px;
-      --texture-opacity: 0.16;
+      --texture-opacity: 0.096;
       --atmosphere: radial-gradient(ellipse at 0 0, rgb(163 181 178 / 28%), transparent 65%), radial-gradient(ellipse at 100% 30%, rgb(255 255 255 / 90%), transparent 65%);
       --shadow: 0 12px 40px rgb(44 54 51 / 8%), 0 2px 6px rgb(44 54 51 / 4%);
     }
@@ -144,7 +145,7 @@
       --texture-ink: #2B4C3F;
       --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' fill='none' stroke='%238A6B4F' stroke-width='.7'%3E%3Cpath d='m8 22 12-3m32 18 16 2m49-24 7 4m32 30-13 2M18 80l7 3m36-17 14-2m28 28 11 3m38-20 14-1M7 144l13-2m30 21 9-4m32-31 17 1m37 26 11-4'/%3E%3C/svg%3E"), radial-gradient(var(--texture-ink) 0.7px, transparent 1px), radial-gradient(var(--texture-ink) 0.5px, transparent 0.8px);
       --texture-size: 180px 180px, 19px 23px, 31px 37px;
-      --texture-opacity: 0.28;
+      --texture-opacity: 0.168;
       --atmosphere: radial-gradient(ellipse at 0 0, rgb(194 178 128 / 22%), transparent 70%), radial-gradient(ellipse at 100% 15%, rgb(163 53 41 / 6%), transparent 60%);
       --shadow: 0 12px 40px rgb(43 76 63 / 10%), 0 2px 6px rgb(43 76 63 / 5%);
     }
@@ -166,12 +167,13 @@
       --texture-ink: #DEE5F0;
       --texture: radial-gradient(circle at 24px 20px, var(--texture-ink) 0 1px, transparent 1.5px), radial-gradient(circle at 101px 91px, var(--texture-ink) 0 0.7px, transparent 1.2px), radial-gradient(circle at 48px 115px, var(--accent) 0 0.8px, transparent 1.3px);
       --texture-size: 173px 191px, 257px 227px, 311px 283px;
-      --texture-opacity: 0.65;
+      --texture-opacity: 0.39;
       --atmosphere: radial-gradient(ellipse at 100% 0, rgb(64 100 156 / 25%), transparent 70%), radial-gradient(ellipse at 0 20%, rgb(91 77 126 / 14%), transparent 65%);
       --shadow: 0 12px 40px rgb(0 0 0 / 35%), 0 2px 6px rgb(0 0 0 / 20%);
     }
 
     body {
+      position: relative;
       isolation: isolate;
       padding-bottom: 3rem;
       background-color: var(--page-bg);
@@ -185,13 +187,14 @@
     }
     body::before {
       content: '';
-      position: fixed;
+      position: absolute;
       z-index: -1;
       inset: 0;
       pointer-events: none;
       background-image: var(--texture);
       background-size: var(--texture-size);
       opacity: var(--texture-opacity);
+      -webkit-mask-image: linear-gradient(90deg, #000, transparent 22%, transparent 78%, #000), linear-gradient(#000, transparent 26rem);
       mask-image: linear-gradient(90deg, #000, transparent 22%, transparent 78%, #000), linear-gradient(#000, transparent 26rem);
     }
     body > header, main, body > footer {
@@ -337,10 +340,16 @@
       }
     }
     @media (forced-colors: active) {
+      .site-dot { forced-color-adjust: none; background: LinkText; }
       .theme-option:has(input:checked) { border-color: Highlight; }
       .theme-swatches { forced-color-adjust: none; }
     }
   </style>
+  <script id="theme-color">
+    // The restored theme and its styles are available before body content parses.
+    const themeColor = document.querySelector('meta[name="theme-color"]');
+    if (themeColor) themeColor.content = getComputedStyle(document.documentElement).getPropertyValue('--page-bg').trim();
+  </script>
 </head>
 <body>
   <header>
@@ -456,8 +465,13 @@
 
       function fitPanel() {
         const available = innerHeight - trigger.getBoundingClientRect().bottom - 24;
-        panel.style.maxHeight = `${Math.max(44, available)}px`;
-        radios.find(radio => radio.checked).closest('label').scrollIntoView({ block: 'nearest' });
+        panel.style.maxHeight = `${Math.min(Math.max(0, innerHeight - 24), Math.max(44, available))}px`;
+        const selected = radios.find(radio => radio.checked).closest('label');
+        if (selected.offsetTop < panel.scrollTop || selected.offsetHeight > panel.clientHeight) {
+          panel.scrollTop = selected.offsetTop;
+        } else if (selected.offsetTop + selected.offsetHeight > panel.scrollTop + panel.clientHeight) {
+          panel.scrollTop = selected.offsetTop + selected.offsetHeight - panel.clientHeight;
+        }
       }
 
       window.addEventListener('resize', () => { if (!panel.hidden) fitPanel(); });
@@ -498,7 +512,7 @@
         // Continue native Tab navigation from the button after hiding the radios.
         if (event.key === 'Tab' && !panel.hidden) closePicker(true);
       });
-      picker.addEventListener('keyup', () => { arrowNavigation = false; });
+      document.addEventListener('keyup', () => { arrowNavigation = false; });
       document.addEventListener('keydown', event => {
         if (event.key === 'Escape' && !panel.hidden) {
           event.preventDefault();
@@ -506,6 +520,7 @@
         }
       });
       document.addEventListener('pointerdown', event => {
+        arrowNavigation = false;
         if (!panel.hidden && !picker.contains(event.target)) {
           closePicker();
         }
@@ -523,14 +538,15 @@
   <script id="relative-times">
     (() => {
       const times = [...document.querySelectorAll('time.post-time[datetime]')].map(time => ({
-        element: time, timestamp: Date.parse(time.getAttribute('datetime')), exact: time.title,
+        visible: time.querySelector('[aria-hidden="true"]'), spoken: time.querySelector('.visually-hidden'),
+        timestamp: Date.parse(time.getAttribute('datetime')),
       })).filter(time => Number.isFinite(time.timestamp));
       if (!times.length) return;
 
       function updateTimes() {
         if (document.hidden) return;
         const now = Date.now();
-        for (const { element, timestamp, exact } of times) {
+        for (const { visible, spoken, timestamp } of times) {
           const seconds = (now - timestamp) / 1000;
           const age = Math.abs(seconds);
           let label = 'just now';
@@ -540,8 +556,7 @@
             const amount = `${count} ${unit}${unit === 'day' && count !== 1 ? 's' : ''}`;
             label = seconds < 0 ? `in ${amount}` : `${amount} ago`;
           }
-          element.textContent = label;
-          element.setAttribute('aria-label', `${label}; ${exact}`);
+          visible.textContent = spoken.textContent = label;
         }
       }
 

@@ -11,7 +11,7 @@ import { parseSmokeArgs, smoke } from '../scripts/smoke-preview.mjs';
 
 const secret = 'a'.repeat(64);
 const id = '00000000-0000-0000-0000-000000000001';
-const credentialError = 'Publishing credential must contain at least 32 characters and be a valid HTTP header token without whitespace or control characters';
+const credentialError = 'Publishing credential must contain at least 32 printable ASCII characters without spaces or control characters';
 function directory(t) { const root = mkdtempSync(join(tmpdir(), 'lakearrowhead-test-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root; }
 
 test('rotation preserves unrelated dotenv fields and backs up the complete original', t => {
@@ -59,10 +59,10 @@ test('publishing credentials prefer build secrets and otherwise use the environm
 });
 test('credential validation preserves supported nonhex tokens and rejects unsafe header values without echoing them', t => {
   const root = directory(t);
-  for (const value of [secret, 'valid-punctuation_+./=~!'.repeat(2), 'é'.repeat(32)]) {
+  for (const value of [secret, 'valid-punctuation_+./=~!'.repeat(2), '!~'.repeat(16), Array.from({ length: 94 }, (_, i) => String.fromCharCode(i + 33)).join('')]) {
     assert.equal(validateCredential(value), value);
   }
-  for (const value of [undefined, '', 'short', ...[' ', '\t', '\n', '\r', '\0', '\x01', '\x7f', '\x85', '\u0100'].map(char => `${secret}${char}suffix`)]) {
+  for (const value of [undefined, '', 'short', 'é'.repeat(32), ...[' ', '\t', '\n', '\r', '\r\n', '\0', '\x01', '\x7f', '\x85', 'é', '\u0100', '漢', '😀'].flatMap(char => [`${secret}${char}suffix`, `${secret}${char}`])]) {
     assert.throws(() => validateCredential(value), { message: credentialError });
     for (const environment of ['preview', 'production']) {
       const name = `${environment.toUpperCase()}_API_SECRET`;
@@ -70,7 +70,7 @@ test('credential validation preserves supported nonhex tokens and rejects unsafe
     }
   }
   // Quoting keeps whitespace intact through dotenv parsing, including newlines.
-  for (const value of [`${secret}\nextra`, `${secret} extra`, `${secret}\x7f`, `${secret}\u0100`]) {
+  for (const value of [`${secret}\nextra`, `${secret}\n`, `${secret} extra`, `${secret}\x7f`, `${secret}\u0100`, 'é'.repeat(32), `${secret}漢`, `${secret}😀`]) {
     writeFileSync(join(root, '.dev.vars.preview'), `API_SECRET="${value}"\n`);
     assert.throws(() => readCredential('preview', root), { message: credentialError });
     const legacy = `API_SECRET="${value}"\nOTHER=keep\n`;
@@ -81,7 +81,7 @@ test('credential validation preserves supported nonhex tokens and rejects unsafe
   }
 });
 test('unsafe explicit credentials fail before deployment, maintenance, or smoke requests', async () => {
-  for (const value of [`${secret}\nextra`, `${secret}\0extra`, `${secret} extra`, `${secret}\u0100`]) {
+  for (const value of [`${secret}\nextra`, `${secret}\n`, `${secret}\0extra`, `${secret} extra`, `${secret}\u0100`, 'é'.repeat(32), `${secret}漢`, `${secret}😀`]) {
     const calls = [];
     const options = { secret: value, origin: 'https://lakearrowheadtown-preview.harold-martin.workers.dev', run: () => { calls.push('deploy'); return { status: 0 }; }, request: () => { calls.push('request'); } };
     await assert.rejects(deploy('preview', options), { message: credentialError });

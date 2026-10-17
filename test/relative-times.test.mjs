@@ -11,11 +11,13 @@ const now = Date.parse('2026-10-17T19:00:00Z');
 function page(timestamps) {
   let clock = now;
   const elements = timestamps.map(timestamp => {
-    const attributes = new Map([['datetime', timestamp], ['aria-label', 'Exact Los Angeles time']]);
+    const attributes = new Map([['datetime', timestamp]]);
+    const visible = { title: 'Exact Los Angeles time', textContent: 'Oct 17, 12:00 PM PDT' };
+    const spoken = { textContent: 'Oct 17, 12:00 PM PDT' };
     return {
-      title: 'Exact Los Angeles time', textContent: 'Oct 17, 12:00 PM PDT',
+      visible, spoken,
       getAttribute: name => attributes.get(name),
-      setAttribute: (name, value) => attributes.set(name, value),
+      querySelector: selector => selector === '[aria-hidden="true"]' ? visible : spoken,
     };
   });
   const listeners = new Map();
@@ -50,36 +52,41 @@ test('post ages use minute, hour, and day boundaries without changing original i
   const view = page(timestamps);
   for (const [index, [, label]] of cases.entries()) {
     const element = view.elements[index];
-    assert.equal(element.textContent, label);
+    assert.equal(element.visible.textContent, label);
+    assert.equal(element.spoken.textContent, label);
     assert.equal(element.getAttribute('datetime'), timestamps[index]);
-    assert.equal(element.title, 'Exact Los Angeles time');
-    assert.equal(element.getAttribute('aria-label'), `${label}; Exact Los Angeles time`);
+    assert.equal(element.visible.title, 'Exact Los Angeles time');
+    assert.equal(element.getAttribute('aria-label'), undefined);
   }
 });
 
 test('relative times refresh each minute and immediately when a hidden page returns', () => {
   const view = page([new Date(now - 59000).toISOString()]);
   assert.equal(view.timers[0].delay, 60000);
-  assert.equal(view.elements[0].textContent, 'just now');
+  assert.equal(view.elements[0].visible.textContent, 'just now');
   view.advance(60000);
-  assert.equal(view.elements[0].textContent, '1 min ago');
+  assert.equal(view.elements[0].visible.textContent, '1 min ago');
   view.visibility(true);
   view.advance(3 * 3600000);
-  assert.equal(view.elements[0].textContent, '1 min ago');
+  assert.equal(view.elements[0].visible.textContent, '1 min ago');
+  assert.equal(view.elements[0].spoken.textContent, '1 min ago');
   view.visibility(false);
-  assert.equal(view.elements[0].textContent, '3 hr ago');
+  assert.equal(view.elements[0].visible.textContent, '3 hr ago');
+  assert.equal(view.elements[0].spoken.textContent, '3 hr ago');
 });
 
 test('equivalent timezone offsets show the same age across a daylight-saving transition', () => {
   const view = page(['2026-11-01T01:30:00-07:00', '2026-11-01T08:30:00Z', '2026-11-01T01:30:00-08:00']);
   view.advance(Date.parse('2026-11-01T10:30:00Z') - now);
-  assert.deepEqual(view.elements.map(element => element.textContent), ['2 hr ago', '2 hr ago', '1 hr ago']);
+  assert.deepEqual(view.elements.map(element => element.visible.textContent), ['2 hr ago', '2 hr ago', '1 hr ago']);
+  assert.deepEqual(view.elements.map(element => element.spoken.textContent), ['2 hr ago', '2 hr ago', '1 hr ago']);
 });
 
 test('empty feeds and invalid timestamps retain their fallback without starting a timer', () => {
   assert.equal(page([]).timers.length, 0);
   const invalid = page(['not a timestamp']);
   assert.equal(invalid.timers.length, 0);
-  assert.equal(invalid.elements[0].textContent, 'Oct 17, 12:00 PM PDT');
-  assert.equal(invalid.elements[0].getAttribute('aria-label'), 'Exact Los Angeles time');
+  assert.equal(invalid.elements[0].visible.textContent, 'Oct 17, 12:00 PM PDT');
+  assert.equal(invalid.elements[0].spoken.textContent, 'Oct 17, 12:00 PM PDT');
+  assert.equal(invalid.elements[0].getAttribute('aria-label'), undefined);
 });
