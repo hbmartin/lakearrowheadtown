@@ -36,17 +36,6 @@ function removeEmptiedWrappers(tokens: Token[], affected: Set<Token>, preserveWh
   return result;
 }
 
-function textEdge(tokens: Token[], last = false): string {
-  for (let i = last ? tokens.length - 1 : 0; i >= 0 && i < tokens.length; i += last ? -1 : 1) {
-    const token = tokens[i];
-    if (token.nesting || (token.type === 'text' && !token.content)) continue;
-    if (!['text', 'code_inline'].includes(token.type)) return '';
-    const characters = Array.from(token.content);
-    return (last ? characters.at(-1) : characters[0]) ?? '';
-  }
-  return '';
-}
-
 function renderBody(item: DigestItem): string {
   const env = {};
   const tokens = markdown.parse(item.body, env);
@@ -86,7 +75,7 @@ function renderBody(item: DigestItem): string {
       if (child.nesting === -1) closing.set(stack.pop()!, child);
     }
     const rewritten: Token[] = [];
-    for (const [index, child] of token.children.entries()) {
+    for (const child of token.children) {
       if (child.type === 'image') {
         stack.forEach(open => affectedInline.add(open));
         if (!thumbnail) {
@@ -95,13 +84,6 @@ function renderBody(item: DigestItem): string {
           blocks.forEach(open => {
             if (open.tag !== 'td' && open.tag !== 'th') affectedBlocks.add(open);
           });
-          // A moved inline image must not concatenate the words around it.
-          const edges = [textEdge(rewritten, true), textEdge(token.children.slice(index + 1))];
-          if (edges.every(edge => /[\p{L}\p{N}_]/u.test(edge) && !/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(edge))) {
-            const space = new MarkdownIt.Token('text', '', 0);
-            space.content = ' ';
-            rewritten.push(space);
-          }
         } else {
           // Split surrounding links/formatting so image links never nest inside them.
           rewritten.push(...[...stack].reverse().map(open => closing.get(open)!));
@@ -139,7 +121,7 @@ function renderItem(item: DigestItem): string {
   const displayTime = escapeHtml(timeFormat.format(postedAt));
   return `<article class="digest-item">
     <div class="item-meta"><a class="item-group" href="${escapeHtml(item.group_url)}" rel="noopener noreferrer">${escapeHtml(item.group)}</a>
-      <time class="post-time" datetime="${escapeHtml(item.posted_at)}"><span aria-hidden="true" title="${exactTime}">${displayTime}</span><span class="visually-hidden">${displayTime}</span></time>
+      <time class="post-time" datetime="${escapeHtml(item.posted_at)}"><span class="post-age">${displayTime}</span><span class="time-tooltip" aria-hidden="true" title="${exactTime}"></span></time>
       ${item.category ? `<span class="category">${escapeHtml(item.category)}</span>` : ''}</div>
     <h3><a class="headline-link" href="${escapeHtml(item.post_url)}" rel="noopener noreferrer">${escapeHtml(item.headline)}</a></h3>
     <div class="markdown">${renderBody(item)}</div>

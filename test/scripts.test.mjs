@@ -110,6 +110,49 @@ test('dotenv updates handle exports and duplicates and refuse destructive multil
   assert.equal(updateSecret('OTHER=yes\nexport API_SECRET=old\nAPI_SECRET=duplicate\n', secret), `OTHER=yes\nAPI_SECRET=${secret}\n`);
   assert.throws(() => updateSecret('OTHER="one\nAPI_SECRET=embedded\nlast"\nAPI_SECRET=old\n', secret), /unrelated values/);
 });
+test('credential files and migration round-trip dotenv-compatible punctuation without changing values', t => {
+  const cases = [
+    [`${secret}#suffix`, "'"],
+    [`"${secret}"`, "'"],
+    [`'${secret}'`, '"'],
+    ['`' + secret + '`', "'"],
+    [secret + '#\'', '`'],
+    [secret + "#'`", '"'],
+    [secret + '#\\n\\r\\path\\', "'"],
+    [secret + "'\"`", ''],
+  ];
+  for (const [value, quote] of cases) {
+    const root = directory(t);
+    for (const environment of ['preview', 'production']) {
+      const file = saveCredential(environment, value, root);
+      assert.equal(readCredential(environment, root), value);
+      assert.equal(statSync(file).mode & 0o777, 0o600);
+    }
+    const legacy = `OTHER=keep\nAPI_SECRET=${quote}${value}${quote}\n`;
+    writeFileSync(join(root, '.dev.vars'), legacy);
+    migrateProductionCredential(root);
+    assert.equal(readCredential('production', root), value);
+    assert.equal(readFileSync(join(root, '.dev.vars'), 'utf8'), 'OTHER=keep\n');
+  }
+});
+test('unrepresentable dotenv tokens fail before writing and remain valid environment credentials', t => {
+  const message = 'Cannot safely store this credential in dotenv; use an environment variable instead';
+  for (const value of [secret + '#"\'`', secret + "#'`\\n"]) {
+    const root = directory(t);
+    for (const environment of ['preview', 'production']) {
+      const file = saveCredential(environment, secret, root);
+      const original = readFileSync(file, 'utf8');
+      const entries = readdirSync(root, { recursive: true });
+      assert.throws(() => saveCredential(environment, value, root), { message });
+      assert.equal(readFileSync(file, 'utf8'), original);
+      assert.deepEqual(readdirSync(root, { recursive: true }), entries);
+      assert.equal(readPublishingCredential(environment, { [`${environment.toUpperCase()}_API_SECRET`]: value }, root), value);
+    }
+    const fresh = directory(t);
+    assert.throws(() => saveCredential('production', value, fresh), { message });
+    assert.deepEqual(readdirSync(fresh), []);
+  }
+});
 test('maintenance targets reject credential leaks and allow preview localhost only', () => {
   assert.equal(maintenanceTarget('preview', 'http://localhost:8787'), 'http://localhost:8787');
   for (const target of ['https://evil.example', 'https://lakearrowhead.town/path', 'http://lakearrowhead.town', 'https://lakearrowhead.town:444', 'http://localhost:8787']) assert.throws(() => maintenanceTarget('production', target));
