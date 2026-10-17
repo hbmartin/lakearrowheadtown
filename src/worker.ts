@@ -1,9 +1,9 @@
 import { timingSafeEqual } from 'node:crypto';
-import favicon from '../favicon.svg';
 import { matchesEtag, parseIfNoneMatch } from './conditions';
 import { hashBytes, IMAGE_CACHE, imageUpload, withImageUploadSlot } from './images';
 import { HTML_CACHE } from './publishing';
 import { renderPage } from './render';
+import { isIndexable, metadataResource } from './public-metadata';
 import type { Env } from './types';
 import { HttpError, readLimited, validateDigest } from './validation';
 export { DigestPublisher } from './publisher';
@@ -71,7 +71,7 @@ async function publicObject(request: Request, env: Env, key: string, image = fal
   return new Response(body, { headers });
 }
 
-export default {
+const handler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     let operation: 'read' | 'digest' | 'image' | 'rebuild' = 'read';
     let publicationAttempted = false;
@@ -122,9 +122,10 @@ export default {
         });
       }
       if (!['GET', 'HEAD'].includes(request.method)) return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: 'GET, HEAD' });
+      const metadata = await metadataResource(request, env.SITE_BUCKET, originFor(request, env));
+      if (metadata) return metadata;
       if (path === '/' || path === '/index.html') return await publicObject(request, env, 'pages/index.html');
       if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return await publicObject(request, env, path.slice(1), true);
-      if (path === '/favicon.svg') return new Response(request.method === 'HEAD' ? null : favicon, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400', 'X-Content-Type-Options': 'nosniff' } });
       return json({ ok: false, error: 'Not found' }, 404);
     } catch (error) {
       if (error instanceof HttpError) return json({ ok: false, error: error.message }, error.status, error.headers);
@@ -134,5 +135,22 @@ export default {
         : { read: 'Unable to load content', digest: 'Unable to process digest', image: 'Unable to upload image', rebuild: 'Unable to complete rebuild request' }[operation];
       return json({ ok: false, error: message }, 500);
     }
+  },
+};
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const response = await handler.fetch(request, env);
+    // Stored HTML may have production metadata even when served from workers.dev.
+    // Apply the actual serving-origin policy to every response, including 304s.
+    let indexable = false;
+    try { indexable = isIndexable(originFor(request, env), new URL(request.url).origin); }
+    catch { /* Invalid configuration must never enable indexing. */ }
+    if (!indexable) response.headers.set('X-Robots-Tag', 'noindex');
+    if (request.method === 'HEAD' && response.body) {
+      await response.body.cancel();
+      return new Response(null, response);
+    }
+    return response;
   },
 } satisfies ExportedHandler<Env>;

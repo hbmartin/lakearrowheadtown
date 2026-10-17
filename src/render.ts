@@ -1,6 +1,9 @@
 import MarkdownIt, { type Token } from 'markdown-it';
 import template from '../index.html';
+import { escapeHtml } from './html';
+import { renderMetadata } from './metadata';
 import type { DigestItem, Publication, StoredPost } from './types';
+export { escapeHtml } from './html';
 
 export const TIME_ZONE = 'America/Los_Angeles';
 const markdown = new MarkdownIt({ html: false, linkify: false, typographer: false });
@@ -8,10 +11,6 @@ const dateFormat = new Intl.DateTimeFormat('en-CA', { timeZone: TIME_ZONE, year:
 const dayFormat = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 const timeFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
 const emptyContent = template.match(/<!-- digests:start -->([\s\S]*?)<!-- digests:end -->/)![1].trim();
-
-export function escapeHtml(text: string): string {
-  return text.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
-}
 
 const prunableTags = new Set(['a', 'em', 'strong', 's', 'p', 'blockquote', 'li', 'ol', 'ul', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
 const emptyToken = (token: Token): boolean => token.type === 'inline'
@@ -94,12 +93,16 @@ function localDate(now: Date): string {
   return `${part('year')}-${part('month')}-${part('day')}`;
 }
 
-function renderFeed(digests: StoredPost[], dates: string[]): string {
+function feedItems(digests: StoredPost[], dates: string[]) {
   const items = digests.flatMap(digest => digest.items).map(item => ({
     item, date: localDate(new Date(item.posted_at)), timestamp: Date.parse(item.posted_at),
   })).filter(({ date }) => !dates.length || dates.includes(date));
   // Stable sorting preserves input order for equal instants, including duplicates.
   items.sort((a, b) => b.timestamp - a.timestamp);
+  return items;
+}
+
+function renderFeed(items: ReturnType<typeof feedItems>): string {
   const days = new Map<string, DigestItem[]>();
   for (const { item, date } of items) {
     if (!days.has(date)) days.set(date, []);
@@ -114,15 +117,14 @@ function renderFeed(digests: StoredPost[], dates: string[]): string {
 }
 
 export function renderPage(digests: StoredPost[], options: { origin: string; publication?: Publication }): string {
-  const title = 'News from Lake Arrowhead . Town';
   const snapshot = options.publication;
   const dates = snapshot?.snapshot_date ? recentDates(new Date(`${snapshot.snapshot_date}T12:00:00Z`)) : [];
   const metadata = snapshot?.published_at && dates.length
     ? `<p class="snapshot-meta">Posts from ${escapeHtml(dayFormat.format(new Date(`${dates[6]}T12:00:00Z`)))} through ${escapeHtml(dayFormat.format(new Date(`${dates[0]}T12:00:00Z`)))}. Last published <time datetime="${escapeHtml(snapshot.published_at)}">${escapeHtml(timeFormat.format(new Date(snapshot.published_at)))}</time>.</p>` : '';
-  const content = renderFeed(digests, dates);
+  const items = feedItems(digests, dates);
+  const content = renderFeed(items);
   return template
-    .replace(/<title>[^<]*<\/title>/, () => `<title>${escapeHtml(title)}</title>`)
-    .replace('<!-- page-meta -->', () => `<link rel="canonical" href="${escapeHtml(options.origin + '/')}">\n  <meta property="og:title" content="${escapeHtml(title)}">`)
+    .replace('<!-- page-meta -->', () => renderMetadata(options.origin, items.map(({ item }) => item), snapshot?.published_at))
     .replace('<!-- snapshot-meta -->', () => metadata)
     .replace(/<!-- digests:start -->[\s\S]*?<!-- digests:end -->/, () => `<!-- digests:start -->\n${content}\n<!-- digests:end -->`);
 }
