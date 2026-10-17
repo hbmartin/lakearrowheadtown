@@ -440,7 +440,7 @@ describe('server dates, snapshots and rendering', () => {
     const timestamp = '2026-10-16T17:12:34.123Z';
     const html = snapshotPage([source('one', digest('Original post', timestamp).items)]);
     expect(html).toContain('class="item-group" href="https://facebook.com/groups/2241141482782874/"');
-    expect(html).toContain(`<time class="post-time" datetime="${timestamp}" title="Friday, October 16, 2026 at 10:12:34 AM PDT" aria-label="Friday, October 16, 2026 at 10:12:34 AM PDT">Oct 16, 10:12 AM PDT</time>`);
+    expect(html).toContain(`<time class="post-time" datetime="${timestamp}"><span aria-hidden="true" title="Friday, October 16, 2026 at 10:12:34 AM PDT">Oct 16, 10:12 AM PDT</span><span class="visually-hidden">Oct 16, 10:12 AM PDT</span></time>`);
     expect(html).toContain('<time datetime="2026-10-16">Friday, October 16, 2026</time>');
   });
   it('escapes HTML and unsafe links while preserving Markdown images', () => {
@@ -588,6 +588,40 @@ describe('linked article thumbnails', () => {
     expect(numbered).toMatch(/<li><\/li>\s*<li>second<\/li>\s*<li>third<\/li>/);
     const emptySibling = bodyHtml(article(`- ![Photo](${photo})\n-`));
     expect(emptySibling.match(/<li>/g)).toHaveLength(2);
+    expect(bodyHtml(article(`- ![Photo](${photo})\n- second`))).toMatch(/<li><\/li>\s*<li>second<\/li>/);
+  });
+  it('preserves table columns and headers when their image is promoted', () => {
+    const cell = bodyHtml(article(`| A | B |\n| --- | --- |\n| ![Photo](${photo}) | b |`));
+    expect(cell).toContain('<th>A</th>\n<th>B</th>');
+    expect(cell).toContain('<td></td>\n<td>b</td>');
+    const heading = bodyHtml(article(`| ![Photo](${photo}) | B |\n| --- | --- |\n| a | b |`));
+    expect(heading).toContain('<th></th>\n<th>B</th>');
+    expect(heading).toContain('<td>a</td>\n<td>b</td>');
+  });
+  it('keeps separators outside emptied links and formatting without changing authored spaces', () => {
+    for (const image of [`[![Photo](${photo})](https://example.com/context)`, `[**![Photo](${photo})**](https://example.com/context)`, `[*![Photo](${photo})*](https://example.com/context)`]) {
+      const content = bodyHtml(article(`word${image}word`));
+      expect(content).toContain('<p>word word</p>');
+      expect(content).not.toContain('href="https://example.com/context"');
+      expectSeparateLinks(content);
+    }
+    expect(bodyHtml(article(`word[ ![Photo](${photo}) ](https://example.com/context)word`))).toContain('<p>word  word</p>');
+    expect(bodyHtml(article(`word  **![Photo](${photo})**  word`))).toContain('<p>word    word</p>');
+  });
+  it('avoids invented spaces beside Han, Hiragana, and Katakana while separating other words', () => {
+    for (const text of ['日本語', '中文', 'ひらがな', 'カタカナ']) {
+      const chars = Array.from(text);
+      expect(bodyHtml(article(`${chars[0]}[![Photo](${photo})](https://example.com/context)${chars.slice(1).join('')}`))).toContain(`<p>${text}</p>`);
+    }
+    for (const [before, after] of [['日本', 'word'], ['word', '語']]) {
+      expect(bodyHtml(article(`${before}![Photo](${photo})${after}`))).toContain(`<p>${before}${after}</p>`);
+    }
+    expect(bodyHtml(article(`café![Photo](${photo})noir`))).toContain('<p>café noir</p>');
+    expect(bodyHtml(article(`part1![Photo](${photo})part2`))).toContain('<p>part1 part2</p>');
+  });
+  it('leaves middle and trailing hard breaks unchanged after extraction', () => {
+    expect(bodyHtml(article(`Before  \n![Photo](${photo})  \nAfter`))).toContain('<p>Before<br>\n<br>\nAfter</p>');
+    expect(bodyHtml(article(`Before  \n![Photo](${photo})`))).toContain('<p>Before<br>\n</p>');
   });
   it('uses image descriptions as link names and supplies a safe fallback for empty descriptions', () => {
     const described = article(`![A *pine* tree](${photo})\n\n![Another tree](${other})`);

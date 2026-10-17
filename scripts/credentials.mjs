@@ -12,15 +12,9 @@ export function credentialFile(environment, root = process.cwd()) {
   return join(root, environment === 'preview' ? '.dev.vars.preview' : '.secrets/production.vars');
 }
 export function validateCredential(value) {
-  // Preserve supported token formats without allowing native header errors to
-  // expose the value. Header construction also rejects non-byte characters.
-  if (typeof value === 'string' && value.length >= 32 && !/[\s\p{Cc}]/u.test(value)) {
-    try {
-      new Headers({ Authorization: `Bearer ${value}` });
-      return value;
-    } catch { /* Report only the fixed error below. */ }
-  }
-  throw new Error('Publishing credential must contain at least 32 characters and be a valid HTTP header token without whitespace or control characters');
+  // ASCII survives the Node-to-Workers header encoding boundary unchanged.
+  if (typeof value === 'string' && value.length >= 32 && !/[^\x21-\x7e]/.test(value)) return value;
+  throw new Error('Publishing credential must contain at least 32 printable ASCII characters without spaces or control characters');
 }
 export function readCredential(environment, root = process.cwd()) {
   const file = credentialFile(environment, root);
