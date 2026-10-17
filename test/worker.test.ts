@@ -3,7 +3,7 @@ import { evictDurableObject, reset, runDurableObjectAlarm, runInDurableObject } 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/worker';
 import { currentPublication, initialMigration, migrateBatch, postKey, publishDigest, rebuildHomepage } from '../src/publishing';
-import { recentDates, renderPage } from '../src/render';
+import { escapeHtml, recentDates, renderPage } from '../src/render';
 import { readLimited, validateDigest } from '../src/validation';
 import { IMAGE_LIMIT, withImageUploadSlot } from '../src/images';
 import type { ContentBucket, Digest, DigestItem, Env, RebuildJob, StoredPost } from '../src/types';
@@ -85,7 +85,7 @@ describe('append-only publication', () => {
     const html = await (await fetch('/')).text();
     expect(html.match(/<section class="digest"/g)).toHaveLength(1);
     expect(html.match(/<article class="digest-item"/g)).toHaveLength(3);
-    expect(html.match(/<h3>Wind update<\/h3>/g)).toHaveLength(2);
+    expect(html.match(/>Wind update<\/a><\/h3>/g)).toHaveLength(2);
     expect(html).not.toContain(duplicate.title);
     expect(html).toContain('Correction');
     expect(html).not.toContain('Empty batch');
@@ -365,7 +365,7 @@ describe('server dates, snapshots and rendering', () => {
     ]);
     const before = JSON.stringify([first, second]);
     const html = snapshotPage([first, second]);
-    expect([...html.matchAll(/<h3>([^<]*)<\/h3>/g)].map(match => match[1])).toEqual([
+    expect([...html.matchAll(/<h3><a\b[^>]*>([^<]*)<\/a><\/h3>/g)].map(match => match[1])).toEqual([
       'Today afternoon', 'Today morning', 'Yesterday evening', 'Yesterday morning',
     ]);
     expect([...html.matchAll(/<h2 id="([^"]+)"/g)].map(match => match[1])).toEqual(['day-2026-10-16', 'day-2026-10-15']);
@@ -380,7 +380,7 @@ describe('server dates, snapshots and rendering', () => {
       source('one', [equal, { ...equal, headline: 'Second equal post', posted_at: '2026-10-16T17:00:00Z' }]),
       source('two', [{ ...equal, headline: 'Third equal post', posted_at: '2026-10-16T19:00:00+02:00' }, equal]),
     ]);
-    expect([...html.matchAll(/<h3>([^<]*)<\/h3>/g)].map(match => match[1])).toEqual([
+    expect([...html.matchAll(/<h3><a\b[^>]*>([^<]*)<\/a><\/h3>/g)].map(match => match[1])).toEqual([
       'First equal post', 'Second equal post', 'Third equal post', 'First equal post',
     ]);
   });
@@ -448,6 +448,124 @@ describe('server dates, snapshots and rendering', () => {
     expect(validateDigest(input)).toEqual(input);
     input.items[0].posted_at = '2023-02-29T00:00:00Z';
     expect(() => validateDigest(input)).toThrow();
+  });
+});
+
+describe('linked article thumbnails', () => {
+  const photo = 'https://lakearrowhead.town/images/photo.png';
+  const other = 'https://example.com/another.png';
+  const sourceUrl = 'https://facebook.com/posts/example?one=1&two=2';
+  function article(body: string, headline = 'Mountain news') {
+    const input: StoredPost = { ...digest(headline), id: 'images', date: '2026-10-16', received_at: '2026-10-16T20:00:00Z' };
+    input.items[0].body = body;
+    input.items[0].post_url = sourceUrl;
+    const html = renderPage([input], { origin: base });
+    return html.match(/<article class="digest-item">([\s\S]*?)<\/article>/)![1];
+  }
+  const bodyHtml = (html: string) => html.match(/<div class="markdown">([\s\S]*?)<\/div>/)![1];
+  function expectSeparateLinks(html: string) {
+    let depth = 0;
+    for (const [tag] of html.matchAll(/<\/?a\b[^>]*>/g)) {
+      depth += tag.startsWith('</') ? -1 : 1;
+      expect(depth).toBeGreaterThanOrEqual(0);
+      expect(depth).toBeLessThanOrEqual(1);
+    }
+    expect(depth).toBe(0);
+  }
+  it.each([
+    `![Pine trees](${photo})\n\nBody **text** with a [weather link](https://example.com/weather).`,
+    `Body **text** with a [weather link](https://example.com/weather).\n\n![Pine trees](${photo})`,
+  ])('promotes the first image before the body regardless of source order: %s', body => {
+    const html = article(body);
+    const content = bodyHtml(html);
+    expect(content).toMatch(/^<a class="article-image article-thumbnail"/);
+    expect(content.indexOf('<img')).toBeLessThan(content.indexOf('Body'));
+    expect(content.match(/<img\b/g)).toHaveLength(1);
+    expect(content).toContain('alt="Pine trees"');
+    expect(content).toContain('<strong>text</strong>');
+    expect(content).toContain('<a href="https://example.com/weather">weather link</a>');
+    expect(content).not.toMatch(/<p>\s*<\/p>|<a\b[^>]*>\s*<\/a>/);
+    expectSeparateLinks(html);
+  });
+  it('preserves text, captions, image titles, and formatting around inline images', () => {
+    const html = article(`Before **![A *pine* tree](${photo} "Mountain view")** after.\n\n*Caption text.*`);
+    expect(html).toContain('alt="A pine tree"');
+    expect(html).toContain('title="Mountain view"');
+    expect(html).toContain('<p>Before  after.</p>');
+    expect(html).toContain('<p><em>Caption text.</em></p>');
+    expect(html).not.toContain('<strong></strong>');
+  });
+  it('links headlines and images to the original post and removes the standalone link', () => {
+    const html = article(`Body.\n\n![Photo](${photo})`, 'Wind & weather');
+    expect(html).toContain(`<h3><a class="headline-link" href="${escapeHtml(sourceUrl)}" rel="noopener noreferrer">Wind &amp; weather</a></h3>`);
+    expect(html).toContain(`class="article-image article-thumbnail" href="${escapeHtml(sourceUrl)}"`);
+    expect(html).toContain('aria-label="View original post: Wind &amp; weather"');
+    expect(html).not.toContain('class="post-link"');
+    expect(html).not.toContain('target=');
+  });
+  it('keeps image-free body links and formatting without adding a thumbnail', () => {
+    const html = article('Read [the bulletin](https://example.com/bulletin).\n\n- First item\n- Second item');
+    expect(html).toContain('class="headline-link"');
+    expect(html).toContain('<a href="https://example.com/bulletin">the bulletin</a>');
+    expect(html).toContain('<li>First item</li>');
+    expect(html).not.toContain('article-thumbnail');
+    expect(html).not.toContain('post-link');
+  });
+  it.each([
+    `![Photo](${photo})`,
+    `[![Photo](${photo})](https://example.com/image-page)`,
+    `> **![Photo](${photo})**`,
+    `- [![Photo](${photo})](https://example.com/image-page)`,
+  ])('renders image-only bodies without empty containers: %s', body => {
+    const content = bodyHtml(article(body));
+    expect(content.match(/<img\b/g)).toHaveLength(1);
+    expect(content).toMatch(/^<a class="article-image article-thumbnail"[^>]*><img[^>]*><\/a>$/);
+    expectSeparateLinks(content);
+  });
+  it('preserves text links around a promoted image', () => {
+    const html = article(`[Before **![Photo](${photo})** after](https://example.com/context).`);
+    expect(html).toContain('<a href="https://example.com/context">Before  after</a>');
+    expectSeparateLinks(html);
+  });
+  it('keeps additional images in place and splits their enclosing links without losing text', () => {
+    const html = article(`![First](${photo})\n\nStart. [Before **![Second](${other})** after](https://example.com/context). End.`);
+    const content = bodyHtml(html);
+    expect(content.match(/<img\b/g)).toHaveLength(2);
+    expect(content.match(/class="article-image article-thumbnail"/g)).toHaveLength(1);
+    expect(content.indexOf('Start.')).toBeLessThan(content.indexOf(`src="${other}"`));
+    expect(content.indexOf(`src="${other}"`)).toBeLessThan(content.indexOf('End.'));
+    expect(content).toContain('<a href="https://example.com/context">Before </a>');
+    expect(content).toContain('<a href="https://example.com/context"> after</a>');
+    expect(content.match(new RegExp(`href="${escapeHtml(sourceUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`, 'g'))).toHaveLength(2);
+    expect(content).not.toMatch(/<(?:strong|a|p)\b[^>]*>\s*<\/(?:strong|a|p)>/);
+    expectSeparateLinks(html);
+  });
+  it('resolves reference images and leaves code samples untouched', () => {
+    const html = article(`![Photo][picture]\n\n\`![Example](https://example.com/code.png)\`\n\n[picture]: ${photo} "Reference title"`);
+    expect(html).toContain(`src="${photo}"`);
+    expect(html).toContain('title="Reference title"');
+    expect(html).toContain('<code>![Example](https://example.com/code.png)</code>');
+    expect(html.match(/<img\b/g)).toHaveLength(1);
+  });
+  it('retains HTML escaping and blocks unsafe Markdown images and links', () => {
+    const html = article(`<script>bad()</script>\n\n![Unsafe](javascript:alert(1))\n\n[unsafe](javascript:alert(1))\n\n![A & B](${photo} "A & B")`, 'News " & <script>bad()</script>');
+    expect(html).not.toMatch(/<script>|(?:href|src)="javascript:|onerror=/);
+    expect(html).toContain('&lt;script&gt;');
+    expect(html).toContain('alt="A &amp; B"');
+    expect(html).toContain('title="A &amp; B"');
+    expect(html).toContain('aria-label="View original post: News &quot; &amp; &lt;script&gt;bad()&lt;/script&gt;"');
+    expectSeparateLinks(html);
+  });
+  it('rebuilds image layouts without changing source Markdown or the publication snapshot', async () => {
+    const input = digest(); input.items[0].body = `Body.\n\n![Photo](${photo})`;
+    await post(input);
+    const snapshot = await currentPublication(bindings.SITE_BUCKET);
+    const stored = await (await bindings.SITE_BUCKET.get(snapshot.posts[0].key))!.text();
+    const html = await (await fetch('/')).text();
+    await rebuildHomepage(bindings.SITE_BUCKET, base);
+    expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
+    expect(await (await bindings.SITE_BUCKET.get(snapshot.posts[0].key))!.text()).toBe(stored);
+    expect(await (await fetch('/')).text()).toBe(html);
   });
 });
 
