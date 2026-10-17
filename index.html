@@ -420,13 +420,14 @@
     <p>Community news from around the mountain.</p>
     <!-- snapshot-meta -->
   </footer>
-  <script>
+  <script id="theme-picker">
     (() => {
       const picker = document.querySelector('.theme-picker');
       const trigger = picker.querySelector('.theme-trigger');
       const panel = document.getElementById('theme-panel');
       const radios = [...picker.querySelectorAll('input[name="theme"]')];
       const themeColor = document.querySelector('meta[name="theme-color"]');
+      let arrowNavigation = false;
 
       function applyTheme(value, persist = false) {
         const selected = radios.find(radio => radio.value === value) || radios[0];
@@ -447,6 +448,7 @@
       }
 
       function closePicker(restoreFocus = false) {
+        arrowNavigation = false;
         panel.hidden = true;
         trigger.setAttribute('aria-expanded', 'false');
         if (restoreFocus) trigger.focus({ preventScroll: true });
@@ -459,6 +461,7 @@
       }
 
       window.addEventListener('resize', () => { if (!panel.hidden) fitPanel(); });
+      window.addEventListener('blur', () => { if (!panel.hidden) closePicker(); });
       trigger.addEventListener('click', () => {
         if (panel.hidden) {
           panel.hidden = false;
@@ -476,11 +479,26 @@
         });
         radio.addEventListener('click', () => {
           // An explicit choice also persists when that radio was already checked.
-          if (radio.checked && radio.value === document.documentElement.dataset.theme) {
+          if (radio.checked && !arrowNavigation) {
             applyTheme(radio.value, true);
+            closePicker(true);
+          }
+        });
+        radio.addEventListener('keydown', event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            applyTheme(radio.value, true);
+            closePicker(true);
           }
         });
       }
+      picker.addEventListener('keydown', event => {
+        // Native radio arrow navigation can also synthesize a click.
+        arrowNavigation = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key);
+        // Continue native Tab navigation from the button after hiding the radios.
+        if (event.key === 'Tab' && !panel.hidden) closePicker(true);
+      });
+      picker.addEventListener('keyup', () => { arrowNavigation = false; });
       document.addEventListener('keydown', event => {
         if (event.key === 'Escape' && !panel.hidden) {
           event.preventDefault();
@@ -489,7 +507,7 @@
       });
       document.addEventListener('pointerdown', event => {
         if (!panel.hidden && !picker.contains(event.target)) {
-          closePicker(panel.contains(document.activeElement));
+          closePicker();
         }
       });
       picker.addEventListener('focusout', event => {

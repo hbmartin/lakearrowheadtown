@@ -509,7 +509,7 @@ describe('linked article thumbnails', () => {
     const html = article(`Body.\n\n![Photo](${photo})`, 'Wind & weather');
     expect(html).toContain(`<h3><a class="headline-link" href="${escapeHtml(sourceUrl)}" rel="noopener noreferrer">Wind &amp; weather</a></h3>`);
     expect(html).toContain(`class="article-image article-thumbnail" href="${escapeHtml(sourceUrl)}"`);
-    expect(html).toContain('aria-label="View original post: Wind &amp; weather"');
+    expect(html).not.toContain('aria-label="View original post:');
     expect(html).not.toContain('class="post-link"');
     expect(html).not.toContain('target=');
   });
@@ -563,8 +563,40 @@ describe('linked article thumbnails', () => {
     expect(html).toContain('&lt;script&gt;');
     expect(html).toContain('alt="A &amp; B"');
     expect(html).toContain('title="A &amp; B"');
-    expect(html).toContain('aria-label="View original post: News &quot; &amp; &lt;script&gt;bad()&lt;/script&gt;"');
+    expect(html).not.toContain('aria-label="View original post:');
     expectSeparateLinks(html);
+  });
+  it('preserves word boundaries and intentional caption breaks when extracting an image', () => {
+    for (const body of [`word![Photo](${photo})word`, `[word![Photo](${photo})word](https://example.com/context)`, `**word![Photo](${photo})word**`]) {
+      const html = article(body);
+      expect(bodyHtml(html).replace(/<[^>]+>/g, '')).toContain('word word');
+      expect(html).not.toContain('wordword');
+      expectSeparateLinks(html);
+    }
+    const content = bodyHtml(article(`![Photo](${photo})  \nCaption line one.  \nCaption line two.`));
+    expect(content).toContain('<p>Caption line one.<br>\nCaption line two.</p>');
+    expect(content).not.toContain('<p><br>');
+    expect(bodyHtml(article(`word![Photo](${photo}).`))).toContain('<p>word.</p>');
+  });
+  it('preserves authored empty list items and markers after moving list images', () => {
+    const unrelated = bodyHtml(article(`![Photo](${photo})\n\n1. one\n2.\n3. three`));
+    expect(unrelated.match(/<li>/g)).toHaveLength(3);
+    expect(unrelated).toContain('<li></li>');
+    const numbered = bodyHtml(article(`3. ![Photo](${photo})\n4. second\n5. third`));
+    expect(numbered).toContain('<ol start="3">');
+    expect(numbered.match(/<li>/g)).toHaveLength(3);
+    expect(numbered).toMatch(/<li><\/li>\s*<li>second<\/li>\s*<li>third<\/li>/);
+    const emptySibling = bodyHtml(article(`- ![Photo](${photo})\n-`));
+    expect(emptySibling.match(/<li>/g)).toHaveLength(2);
+  });
+  it('uses image descriptions as link names and supplies a safe fallback for empty descriptions', () => {
+    const described = article(`![A *pine* tree](${photo})\n\n![Another tree](${other})`);
+    expect(described).toContain('alt="A pine tree"');
+    expect(described).toContain('alt="Another tree"');
+    expect(described).not.toContain('aria-label="View original post:');
+    const unnamed = article(`![](${photo})`, 'News " & <script>bad()</script>');
+    expect(unnamed).toContain('aria-label="View original post: News &quot; &amp; &lt;script&gt;bad()&lt;/script&gt;"');
+    expectSeparateLinks(unnamed);
   });
   it('rebuilds image layouts without changing source Markdown or the publication snapshot', async () => {
     const input = digest(); input.items[0].body = `Body.\n\n![Photo](${photo})`;

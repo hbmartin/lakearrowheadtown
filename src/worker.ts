@@ -122,7 +122,12 @@ const handler = {
         });
       }
       if (!['GET', 'HEAD'].includes(request.method)) return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: 'GET, HEAD' });
-      const metadata = await metadataResource(request, env.SITE_BUCKET, originFor(request, env));
+      // Existing public content remains readable when the canonical origin is bad.
+      // Publishing and the empty-page fallback still require a valid origin.
+      let origin = '';
+      try { origin = originFor(request, env); }
+      catch (error) { if (!(error instanceof HttpError && error.status === 503)) throw error; }
+      const metadata = await metadataResource(request, env.SITE_BUCKET, origin);
       if (metadata) return metadata;
       if (path === '/' || path === '/index.html') return await publicObject(request, env, 'pages/index.html');
       if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return await publicObject(request, env, path.slice(1), true);

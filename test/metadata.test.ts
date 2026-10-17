@@ -118,6 +118,54 @@ describe('homepage metadata', () => {
 });
 
 describe('indexing and canonical origins', () => {
+  it.each(['not an origin', 'https://lakearrowhead.town/path', 'https://user:pass@lakearrowhead.town'])('keeps stored public resources available and unindexed with invalid SITE_ORIGIN: %s', async configured => {
+    await published();
+    const image = `/images/${'a'.repeat(64)}.png`;
+    await bindings.SITE_BUCKET.put(image.slice(1), new Uint8Array([1, 2, 3]), { httpMetadata: { contentType: 'image/png' } });
+    for (const path of ['/', '/index.html', image, '/favicon.svg', '/favicon.ico', '/site.webmanifest', '/robots.txt', ...Object.values(ASSETS)]) {
+      const response = await fetch(path, {}, SITE.origin, configured);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('X-Robots-Tag')).toBe('noindex');
+      const etag = response.headers.get('etag')!;
+      const bytes = await response.arrayBuffer();
+      const good = await fetch(path);
+      const goodBytes = await good.arrayBuffer();
+      if (path !== '/robots.txt') expect(bytes).toEqual(goodBytes);
+      else expect(new TextDecoder().decode(bytes)).not.toContain('Sitemap:');
+      for (const method of ['GET', 'HEAD']) {
+        const unchanged = await fetch(path, { method, headers: { 'If-None-Match': etag } }, SITE.origin, configured);
+        expect(unchanged.status).toBe(304);
+        expect(unchanged.headers.get('X-Robots-Tag')).toBe('noindex');
+        expect(await unchanged.text()).toBe('');
+      }
+      const head = await fetch(path, { method: 'HEAD' }, SITE.origin, configured);
+      expect(head.status).toBe(200);
+      expect(head.headers.get('etag')).toBe(etag);
+      expect(head.headers.get('X-Robots-Tag')).toBe('noindex');
+      expect(await head.text()).toBe('');
+    }
+    for (const method of ['GET', 'HEAD']) {
+      const sitemap = await fetch('/sitemap.xml', { method }, SITE.origin, configured);
+      expect(sitemap.status).toBe(404);
+      expect(sitemap.headers.get('X-Robots-Tag')).toBe('noindex');
+    }
+  });
+
+  it('retains strict invalid-origin errors for empty-page rendering and authenticated publication', async () => {
+    const configured = 'https://lakearrowhead.town/path';
+    for (const method of ['GET', 'HEAD']) {
+      const response = await fetch('/', { method }, SITE.origin, configured);
+      expect(response.status).toBe(503);
+      expect(response.headers.get('X-Robots-Tag')).toBe('noindex');
+    }
+    for (const path of ['/api/digests', '/api/images', '/api/rebuild']) {
+      const response = await fetch(path, { method: 'POST', headers: { Authorization: 'Bearer test-secret-at-least-thirty-two-characters-long' } }, SITE.origin, configured);
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({ ok: false, error: 'Site origin is not configured correctly' });
+    }
+    expect((await bindings.SITE_BUCKET.list()).objects).toHaveLength(0);
+  });
+
   it.each([
     ['preview', 'https://preview.example.test', ''],
     ['localhost', 'http://localhost:8787', ''],
