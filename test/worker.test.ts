@@ -18,7 +18,7 @@ function digest(headline = 'Wind update', posted_at = new Date().toISOString()):
   return { title: 'Morning Facebook digest — Thu Oct 15', source: 'facebook-groups', items: [{
     group: 'Lake Arrowhead 360 Group', group_url: 'https://facebook.com/groups/2241141482782874/',
     headline, body: '**Strong winds** are expected.\n\n- Secure outdoor furniture.\n- Check for updates.',
-    post_url: 'https://facebook.com/groups/2241141482782874/permalink/4816273571936306/', category: 'alert', posted_at,
+    post_url: `https://facebook.com/groups/2241141482782874/permalink/${encodeURIComponent(headline)}/`, category: 'alert', posted_at,
   }] };
 }
 function fetch(path: string, init: RequestInit = {}, overrides: Partial<Env> = {}, origin = base) {
@@ -49,7 +49,7 @@ async function legacy(date = '2024-01-01', title = 'Legacy digest') {
   return bindings.SITE_BUCKET.put(`digests/${date}.json`, JSON.stringify({ date, ...digest(title) }));
 }
 
-beforeEach(async () => { vi.restoreAllMocks(); await reset(); });
+beforeEach(async () => { vi.restoreAllMocks(); vi.spyOn(console, 'info').mockImplementation(() => {}); await reset(); });
 
 describe('append-only publication', () => {
   it('serves a canonical empty homepage and revalidates its cached ETag', async () => {
@@ -75,22 +75,23 @@ describe('append-only publication', () => {
     }
     expect((await bindings.SITE_BUCKET.list()).objects).toHaveLength(0);
   });
-  it('appends duplicate requests and follow-up corrections instead of replacing', async () => {
+  it('suppresses duplicate requests and appends distinct follow-up stories', async () => {
     const duplicate = digest();
-    for (const input of [duplicate, duplicate, digest('Correction'), { ...digest('Empty batch'), items: [] }]) {
+    for (const [index, input] of [duplicate, duplicate, digest('Correction')].entries()) {
       const response = await post(input);
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ ok: true, url: '/' });
+      expect(await response.json()).toMatchObject({ ok: true, url: '/', duplicate: index === 1 });
     }
+    expect((await post({ ...digest('Empty batch'), items: [] })).status).toBe(400);
     const html = await (await fetch('/')).text();
     expect(html.match(/<section class="digest"/g)).toHaveLength(1);
-    expect(html.match(/<article class="digest-item"/g)).toHaveLength(3);
-    expect(html.match(/>Wind update<\/a><\/h3>/g)).toHaveLength(2);
+    expect(html.match(/<article class="digest-item"/g)).toHaveLength(2);
+    expect(html.match(/>Wind update<\/a><\/h3>/g)).toHaveLength(1);
     expect(html).not.toContain(duplicate.title);
     expect(html).toContain('Correction');
     expect(html).not.toContain('Empty batch');
     expect(html).toContain('Last published');
-    expect((await bindings.SITE_BUCKET.list({ prefix: 'posts/' })).objects).toHaveLength(4);
+    expect((await bindings.SITE_BUCKET.list({ prefix: 'posts/' })).objects).toHaveLength(2);
   });
   it('ignores all client identity/date fields and preserves source timestamps', async () => {
     const input = digest();
@@ -128,7 +129,7 @@ describe('append-only publication', () => {
   });
   it('keeps arbitrary categories and submitted item order for equal timestamps', async () => {
     const input = digest(); input.items[0].category = 'road & weather';
-    input.items.push({ ...input.items[0], headline: 'Second item', category: '' });
+    input.items.push({ ...input.items[0], headline: 'Second item', category: '', post_url: 'https://example.com/second' });
     await post(input);
     const html = await (await fetch('/')).text();
     expect(html).toContain('road &amp; weather');
@@ -146,7 +147,7 @@ describe('append-only publication', () => {
     const before = await currentPublication(bindings.SITE_BUCKET);
     const original = await (await fetch('/')).text();
     const broken = bucketWith({ put: async (key, value, options) => { if (key === 'pages/index.html') throw new Error('injected failure'); return bindings.SITE_BUCKET.put(key, value, options); } });
-    await expect(publishDigest(broken, digest('Uncommitted'), base)).rejects.toThrow('injected');
+    await expect(publishDigest(broken, digest('Uncommitted'), base)).rejects.toMatchObject({ publication_status: 'unknown', stage: 'index_write' });
     expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(before);
     expect(await (await fetch('/')).text()).toBe(original);
     await rebuildHomepage(bindings.SITE_BUCKET, base);
@@ -165,9 +166,9 @@ describe('damaged source omission and recovery', () => {
     const now = new Date('2026-10-16T20:00:00Z');
     const damaged = await publishDigest(bindings.SITE_BUCKET, digest('Damaged historical post', now.toISOString()), base, now, true);
     await publishDigest(bindings.SITE_BUCKET, digest('Healthy historical post', now.toISOString()), base, now, true);
-    const key = postKey(damaged);
+    const key = postKey(damaged.post!);
     const original = await (await bindings.SITE_BUCKET.get(key))!.text();
-    const ref = (await currentPublication(bindings.SITE_BUCKET)).posts.find(post => post.id === damaged.id)!;
+    const ref = (await currentPublication(bindings.SITE_BUCKET)).posts.find(post => post.id === damaged.post!.id)!;
     if (reason === 'missing') await bindings.SITE_BUCKET.delete(key);
     else await bindings.SITE_BUCKET.put(key, reason === 'invalid_json' ? 'broken private payload' : JSON.stringify({ title: 'private invalid digest' }));
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -177,7 +178,7 @@ describe('damaged source omission and recovery', () => {
     expect(snapshot.posts).toHaveLength(2);
     const html = await (await fetch('/')).text();
     expect(html).toContain('Healthy historical post'); expect(html).toContain('New post'); expect(html).not.toContain('Damaged historical post');
-    expect(warning).toHaveBeenCalledExactlyOnceWith('Omitted damaged post', { id: damaged.id, key, reason });
+    expect(warning).toHaveBeenCalledExactlyOnceWith('Omitted damaged post', { id: damaged.post!.id, key, reason });
     expect(JSON.stringify(warning.mock.calls)).not.toMatch(/broken private payload|private invalid digest/);
     const noOmittedReads = bucketWith({ get: async sourceKey => {
       if (sourceKey === key) throw new Error('A rebuild must not read an omitted source');
@@ -197,7 +198,7 @@ describe('damaged source omission and recovery', () => {
   });
   it('expires omitted references by their original receipt date even after source repair', async () => {
     const damaged = await publishDigest(bindings.SITE_BUCKET, digest('Expired omitted post', '2026-10-09T20:00:00Z'), base, new Date('2026-10-09T20:00:00Z'), true);
-    const key = postKey(damaged);
+    const key = postKey(damaged.post!);
     const original = await (await bindings.SITE_BUCKET.get(key))!.text();
     await bindings.SITE_BUCKET.delete(key);
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -216,11 +217,11 @@ describe('damaged source omission and recovery', () => {
     const html = await (await fetch('/')).text();
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const broken = bucketWith({ get: async key => {
-      if (key !== postKey(damaged)) return bindings.SITE_BUCKET.get(key);
+      if (key !== postKey(damaged.post!)) return bindings.SITE_BUCKET.get(key);
       if (stage === 'get') throw new Error('R2 unavailable');
       return { text: async () => { throw new SyntaxError('Body transport failed'); } } as unknown as R2ObjectBody;
     } });
-    await expect(publishDigest(broken, digest('Uncommitted'), base, new Date(), true)).rejects.toThrow(stage === 'get' ? 'R2 unavailable' : 'Body transport failed');
+    await expect(publishDigest(broken, digest('Uncommitted'), base, new Date(), true)).rejects.toMatchObject({ publication_status: 'not_committed', stage: 'source_loading' });
     expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
     expect(await (await fetch('/')).text()).toBe(html); expect(warning).not.toHaveBeenCalled();
   });
@@ -246,7 +247,7 @@ describe('damaged source omission and recovery', () => {
     expect((await jobStatus(job.id)).status).toBe('failed');
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const response = await post(digest('New publication while rebuild paused'));
-    expect(response.status).toBe(200); expect(await response.json()).toEqual({ ok: true, url: '/' });
+    expect(response.status).toBe(200); expect(await response.json()).toMatchObject({ ok: true, url: '/' });
     const snapshot = await currentPublication(bindings.SITE_BUCKET);
     expect(snapshot.omitted_posts).toEqual(original.posts);
     const html = await (await fetch('/')).text();
@@ -331,7 +332,7 @@ describe('server dates, snapshots and rendering', () => {
     expect(recentDates(new Date(now))).toHaveLength(7);
     expect(recentDates(new Date(now))).toEqual(expect.arrayContaining([first, last]));
     const post = await publishDigest(bindings.SITE_BUCKET, digest(), base, new Date(now));
-    expect(post.date).toBe(first);
+    expect(post.post!.date).toBe(first);
   });
   it('keeps seven calendar dates, expires old posts only on publish, and rebuilds the exact snapshot', async () => {
     for (const day of ['09', '10', '16']) await publishDigest(bindings.SITE_BUCKET, digest(`Day ${day}`, `2026-10-${day}T20:00:00Z`), base, new Date(`2026-10-${day}T20:00:00Z`));
@@ -771,7 +772,7 @@ describe('images and public serving', () => {
     const first = await upload(); expect(first.status).toBe(200);
     const result = await first.json<{ url: string }>();
     expect(result.url).toMatch(/^https:\/\/lakearrowhead\.town\/images\/[a-f0-9]{64}\.png$/);
-    expect(await (await upload()).json()).toEqual(result);
+    expect(await (await upload()).json()).toMatchObject({ ok: true, url: result.url });
     expect((await bindings.SITE_BUCKET.list({ prefix: 'images/' })).objects).toHaveLength(1);
     const image = await fetch(new URL(result.url).pathname);
     expect(image.headers.get('Cache-Control')).toContain('immutable');

@@ -6,13 +6,13 @@ export const IMAGE_CACHE = 'public, max-age=31536000, immutable';
 let activeUploads = 0;
 
 export async function withImageUploadSlot<T>(action: () => Promise<T>): Promise<T> {
-  if (activeUploads >= 2) throw new HttpError(503, 'Image uploads are busy', { 'Retry-After': '1' });
+  if (activeUploads >= 2) throw new HttpError(503, 'Image uploads are busy', { 'Retry-After': '1' }, { code: 'uploads_busy' });
   activeUploads++;
   try { return await action(); }
   finally { activeUploads--; }
 }
 
-export async function imageUpload(request: Request): Promise<{ file: File; hash: string; type: string; extension: string }> {
+export async function imageUpload(request: Request, onBytes?: (bytes: number, complete?: boolean) => void): Promise<{ file: File; hash: string; type: string; extension: string }> {
   const contentType = request.headers.get('content-type');
   if (!contentType?.toLowerCase().startsWith('multipart/form-data;')) throw new HttpError(415, 'Expected multipart/form-data');
   const limit = IMAGE_LIMIT + 64 * 1024;
@@ -22,6 +22,7 @@ export async function imageUpload(request: Request): Promise<{ file: File; hash:
   const bounded = request.body?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       size += chunk.byteLength;
+      onBytes?.(size);
       if (size > limit) {
         overflow = new HttpError(413, 'Request is too large');
         throw overflow;
@@ -31,10 +32,11 @@ export async function imageUpload(request: Request): Promise<{ file: File; hash:
   }));
   let form: FormData;
   try { form = await new Response(bounded, { headers: { 'content-type': contentType } }).formData(); }
-  catch { throw overflow ?? new HttpError(400, 'Invalid multipart form'); }
+  catch { throw overflow ?? new HttpError(400, 'Invalid multipart form', {}, { code: 'invalid_multipart' }); }
+  onBytes?.(size, true);
   const entries = [...form.entries()];
   const file = form.get('file');
-  if (entries.length !== 1 || !(file instanceof File)) throw new HttpError(400, 'Expected one file field named file');
+  if (entries.length !== 1 || !(file instanceof File)) throw new HttpError(400, 'Expected one file field named file', {}, { code: 'invalid_file_field', details: { field: 'file', expected_files: 1 } });
   if (file.size > IMAGE_LIMIT) throw new HttpError(413, 'Image exceeds 10 MiB');
   const header = new Uint8Array(await file.slice(0, 32).arrayBuffer());
   const starts = (...values: number[]) => values.every((value, i) => header[i] === value);
@@ -46,7 +48,7 @@ export async function imageUpload(request: Request): Promise<{ file: File; hash:
   else if (header.length >= 13 && ['GIF87a', 'GIF89a'].includes(ascii(0, 6))) { type = 'image/gif'; extension = 'gif'; }
   else if (header.length >= 16 && ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP' && ['VP8 ', 'VP8L', 'VP8X'].includes(ascii(12, 4))) { type = 'image/webp'; extension = 'webp'; }
   else throw new HttpError(415, 'Expected JPEG, PNG, WebP, or GIF image data');
-  if (file.type.toLowerCase() !== type) throw new HttpError(415, 'Image media type does not match its contents');
+  if (file.type.toLowerCase() !== type) throw new HttpError(415, 'Image media type does not match its contents', {}, { code: 'image_type_mismatch', details: { expected: type } });
   const hash = createHash('sha256');
   for await (const chunk of file.stream()) hash.update(chunk);
   return { file, hash: hash.digest('hex'), type, extension };

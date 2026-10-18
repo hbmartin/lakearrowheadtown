@@ -9,7 +9,7 @@ POST /api/rebuild → durable background job → migrate legacy sources → rebu
 GET  /           → read published HTML from R2
 ```
 
-New posts rebuild the homepage without a Git commit, deployment, or CI run. Every submission creates a new post, including duplicate requests. Corrections are follow-up posts.
+New posts rebuild the homepage without a Git commit, deployment, or CI run. New story URLs append to the feed. Repeated source URLs within the seven-day receipt window are skipped; changed wording at the same URL is also skipped.
 
 ## Set up Cloudflare
 
@@ -68,7 +68,7 @@ npm run rebuild:status -- preview JOB_UUID
 node scripts/smoke-preview.mjs --verify-edge
 ```
 
-The smoke check uploads an image, appends three labeled posts (including a duplicate and a follow-up), checks public routes and ETags, and queues a rebuild. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
+The smoke check uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
 
 ### 4. Connect the domain
 
@@ -215,15 +215,35 @@ Prepare [`examples/digest.json`](examples/digest.json) with actual titles, sourc
   --data-binary @examples/digest.json
 ```
 
-Successful publication returns `200 {"ok":true,"url":"/"}` after the source, manifest, and index writes complete.
+Successful publication returns `200` after the source, manifest, and index writes complete. The response extends the original `ok`/`url` fields:
 
-- Every request appends a post. There is no upsert, editing API, deletion API, or idempotency key. A rerun can create duplicates; publish a follow-up to correct a previous post.
+```json
+{
+  "ok": true,
+  "url": "/",
+  "request_id": "request-uuid",
+  "post": { "id": "post-uuid", "date": "2026-10-18", "received_at": "2026-10-18T18:00:00.000Z" },
+  "duplicate": false,
+  "counts": { "submitted": 2, "published": 1, "duplicates": 1 },
+  "items": [
+    { "index": 0, "status": "published", "post_id": "post-uuid", "item_index": 0 },
+    { "index": 1, "status": "duplicate", "post_id": "earlier-post-uuid", "item_index": 2 }
+  ]
+}
+```
+
+`index` is the submitted item position; `item_index` is the position in the identified stored batch. An all-duplicate request returns `post: null`, `duplicate: true`, and zero published stories. It performs no writes and does not change the homepage, publication timestamp, or ETag. Mixed batches set `duplicate: false` and store only their new stories.
+
+- Duplicate identity is the exact validated `post_url` string, including query strings and fragments. No URL normalization, tracking-parameter removal, or fuzzy content matching occurs. Batch labels, source labels, wording, and other item fields do not change that identity.
+- Existing stories received today or during the preceding six Los Angeles calendar dates suppress new copies. Receipt dates, not `posted_at`, govern this window; retries never refresh it. Within a request the first new occurrence wins. Historical duplicate copies remain visible. The earliest receipt supplies duplicate references, with ascending post ID and item position breaking ties.
+- Publishing and duplicate detection share the serialized queue. The committed manifest governs modern source membership; orphan source objects do not suppress retries. Legacy migration and damaged-source recovery retain their existing behavior.
+- There is no editing, deletion, listing, preflight, individual-post page, or idempotency-key endpoint. `url` always points to `/`; post IDs are private diagnostic identifiers, not public permalinks. See the manual cleanup runbook below for corrections at the same source URL.
 - The server assigns a unique ID, receipt timestamp, and Los Angeles date inside the serialized publisher. Any top-level `date`, `id`, or `received_at` sent by the client is ignored. Item `posted_at` values retain their original meaning; exact timestamps and the no-JavaScript display use Los Angeles time.
-- `title`, `source`, `group`, and `headline` are required nonempty strings. `body` and `category` may be empty; `items: []` creates an empty stored post. Categories accept arbitrary strings. Digest titles and receipt times remain private; the homepage displays item headlines.
+- `title`, `source`, `group`, and `headline` are required nonempty strings. `body` and `category` may be empty; submitted `items: []` receives a `400` validation error before writes. Historical empty sources remain readable. Categories accept arbitrary strings. Digest titles and receipt times remain private; the homepage displays item headlines.
 - Item timestamps require real calendar dates and an explicit timezone (`Z` or an offset). Source links must be absolute HTTP(S) URLs without credentials.
 - Markdown is rendered with raw HTML disabled and unsafe link protocols blocked. Plain-text fields are escaped. JSON requests are limited to 1 MiB, including streamed requests.
 
-A publish retains sources received today and during the preceding six Los Angeles dates. The homepage combines their items into one feed, showing only items whose original `posted_at` falls within those same seven calendar dates in Los Angeles. Items appear newest first under one heading per populated day; equal timestamps preserve source and submitted item order, and duplicate submissions remain visible. Older and future-day items and empty digests create no sections. Source timestamps describe already-published material; this feed does not schedule future posts.
+A publish retains sources received today and during the preceding six Los Angeles dates. The homepage combines their items into one feed, showing only items whose original `posted_at` falls within those same seven calendar dates in Los Angeles. Items appear newest first under one heading per populated day; equal timestamps preserve source and submitted item order, and preexisting historical duplicate copies remain visible. Older and future-day items and empty digests create no sections. Source timestamps describe already-published material; this feed does not schedule future posts.
 
 The footer labels the post-date range and last publication time. Feed contents and calendar datelines stay unchanged between publications, even when the covered week is old. There is no scheduled feed refresh. In the browser, post timestamps display relative ages such as “3 hr ago” or “2 days ago”; they update each minute while the page is visible and when returning to the page. Timestamps ahead of the reader’s clock retain future labels such as “in 3 min”. Each age is rendered once for reading and copying, including double-click and drag selection. Full Los Angeles timestamps use native browser tooltips, which screen readers may announce alongside the age; original `datetime` values stay intact. Without JavaScript, absolute timestamps display once. Daily headings and footer dates stay absolute. Template rebuilds retain the exact published selection, date window, and publication timestamp, while applying the current layout.
 
@@ -233,7 +253,7 @@ At widths up to 600px, 16px side gutters, compact header/article spacing, quiet 
 
 If a historical source is missing, contains malformed JSON, or fails digest validation, a new publication omits that post and logs its ID, R2 key, and a fixed reason. Its reference is retained privately as `omitted_posts` in the manifest and reconsidered on later publications until its original receipt date leaves the seven-day window. Successful responses retain the same format. Storage outages and unexpected failures still fail publication instead of omitting content.
 
-R2 has no transaction spanning these objects. Index replacement is the commit point, and a failure can leave private source or manifest objects. After a timeout or `500`, check the homepage before posting again: publication may have completed, and another POST can create a duplicate.
+R2 has no transaction spanning these objects. Index replacement is the commit point, and a failure can leave private source or manifest objects. After a timeout or `500`, retry the unchanged payload within its original seven-calendar-date receipt window. If the index committed, the repeated URLs resolve to their committed identities; otherwise the retry can publish them. After that window, check the saved response, logs, and publication before retrying because suppression has expired.
 
 ## Search, sharing, and browser metadata
 
@@ -320,11 +340,79 @@ Template rebuilds neither read nor reconsider omitted references, even after res
 
 Only `/`, `/index.html`, `/images/<hash>.<extension>`, and the explicit metadata/artwork routes listed above are public. Old daily routes return `404`. Digest sources, publication manifests, bucket listings, artwork source files, and config files are never exposed. There is no archive listing or public administration UI.
 
-HTML supports HEAD and weak ETag revalidation, requires revalidation, permits compression, and bypasses edge caching. Malformed `If-None-Match` conditions are ignored consistently for public GET and HEAD requests. Image GETs use Workers Caching. Protected APIs always return `no-store` JSON. Error statuses include `400`, `401`, `404`, `405`, `409` for invalid job resume, `413`, `415`, and `500`/`503`. The publication uncertainty warning is limited to failed digest publisher calls; other routes use operation-specific errors. Maintenance CLI errors preserve HTTP status even when Cloudflare returns non-JSON content. Logs omit credentials and payloads.
+HTML supports HEAD and weak ETag revalidation, requires revalidation, permits compression, and bypasses edge caching. Malformed `If-None-Match` conditions are ignored consistently for public GET and HEAD requests. Image GETs use Workers Caching. Protected APIs always return `no-store` JSON. Maintenance CLI errors preserve HTTP status even when Cloudflare returns non-JSON content.
+
+## API errors and request provenance
+
+Every application-generated `/api` response has `X-Request-ID`, `X-Worker-Version` (Cloudflare version ID), and `X-API-Version: 2`. JSON API replies also include `request_id`; HEAD responses have no body. These headers identify the code handling the request independently of the stored homepage's age. Cloudflare edge/WAF failures that never reach the Worker may have a different response shape and no application request ID.
+
+```json
+{
+  "ok": false,
+  "error": "Digest validation failed",
+  "code": "validation_failed",
+  "request_id": "request-uuid",
+  "retryable": false,
+  "publication_status": "not_attempted",
+  "details": [{ "path": "items[3].posted_at", "code": "invalid_timestamp", "message": "Expected an ISO timestamp with a real calendar date and explicit timezone." }],
+  "details_truncated": false,
+  "diagnostics": { "stage": "validation", "bytes_received": 5120, "body_complete": true, "body_sha256": "sha256-of-the-exact-received-bytes" }
+}
+```
+
+Validation collects up to 50 field issues and rejects the entire batch before writes; `details_truncated` indicates additional issues. Malformed JSON and invalid UTF-8 have separate codes. Syntax details include zero-based UTF-16 `position` and one-based `line`/`column` when the runtime parser provides a position; they never include input excerpts. Complete authenticated digest bodies are fingerprinted before parsing. Partial or rejected-before-read bodies never receive a complete-body hash. Compare `body_sha256` against `shasum -a 256 payload.json` and use `--data-binary @payload.json` to investigate transmitted-byte differences.
+
+| Status | Codes / meaning | Caller action |
+| --- | --- | --- |
+| 400 | `invalid_utf8`, `invalid_json`, `validation_failed`, `invalid_multipart`, `invalid_file_field` | Correct encoding, syntax, fields, or multipart form. Empty digests report `empty_items` in validation details. |
+| 401 | `unauthorized` | Supply the correct publishing credential. |
+| 404 / 405 | `not_found`, `job_not_found`, `method_not_allowed` | Check the route or the `Allow` header. |
+| 409 | `job_not_failed` | Only failed rebuild jobs can resume. Duplicate digests return 200. |
+| 413 / 415 | `body_too_large`, `unsupported_media_type`, `image_type_mismatch` | Respect the size limit and canonical media type/signature. |
+| 500 | `storage_error`, `render_failed`, `publish_failed`, `body_read_failed`, `internal_error` | Use the request ID, failure stage, retry guidance, and publication status. |
+| 503 | `configuration_error`, `uploads_busy`, `service_unavailable` | Resolve configuration or retry temporary service contention; uploads retain `Retry-After: 1`. |
+
+`retryable` means an unchanged operation may reasonably succeed later; fix 4xx input errors rather than repeating them. Digest failures additionally report `publication_status`: `not_attempted` means the publisher was never invoked; `not_committed` means a failure before index replacement; `unknown` means an index write or RPC acknowledgement may have been lost; `committed` means the replacement is known to have completed. An unknown outcome is not a JSON error. Retry the identical payload only within the receipt-based deduplication window.
+
+## Cloudflare diagnostics
+
+Production and preview explicitly persist invocation logs and traces at sampling rate 1, with source-map uploads and query-string redaction. Application logs contain metadata, request hashes, fixed validation paths, bounded hashed duplicate URLs, and sanitized exception classifications/stack locations. They exclude request bodies, submitted field values, credentials, and raw query strings. No rejected-payload archive, external provider, or alerts are configured.
+
+Structured `request_completed`, `request_error`, `operation_stage`, `publish_result`, `publish_failed`, `source_omitted`, and `rebuild_*` events carry request IDs, executing Worker version, environment, and available post/job IDs. Stage events measure authentication, body reading, parsing, validation, queue wait, source loading, duplicate filtering, rendering, and writes. Rebuild alarms retain the enqueue request ID and job ID, while recording their executing version. Request summaries include total duration, status/code, counts, publication outcome, byte counts, origin response ETags, and complete-body hashes when available.
+
+In the selected Worker's **Observability → Logs**, use the top-level structured fields below with these Query Builder recipes. In **Traces**, open the related invocation by time and Cloudflare invocation/trace metadata; cross-reference application request ID in its logs.
+
+| Investigation | Filters | Group / measure |
+| --- | --- | --- |
+| One caller report | `request_id` equals the response's `X-Request-ID` | Chronological events across HTTP and publisher RPC |
+| Failures by release | `event = request_completed`, `status >= 500` | Count by `error_code`, `worker_version` |
+| Duplicate behavior | `event = publish_result` | Sum `duplicates` and `published`; inspect `duplicate_url_hashes` |
+| API latency | `event = request_completed`, `operation = digest` | p50/p95/max of `duration_ms` |
+| Slow storage or queue | `event = operation_stage` | p95/max duration grouped by `stage` |
+| Rebuild failure | `event = rebuild_failed` | Inspect `job_id`, `request_id`, and `stage`; query those IDs |
+
+As of October 18, 2026, [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/) retain logs for 3 days on Free and 7 days on Paid, subject to account limits; [Workers traces](https://developers.cloudflare.com/workers/observability/traces/) retain 7 days. Full application sampling does not override platform limits, truncation, or [tracing limitations](https://developers.cloudflare.com/workers/observability/traces/known-limitations/). Cloudflare announces observability pricing changes for December 1, 2026; consult current account settings rather than treating these retention/cost details as permanent. There is no separate long-term diagnostic archive.
+
+The stored telemetry REST API requires the `Workers Observability Write` permission, which an existing Wrangler OAuth login may lack even when deployment and live tail work. A `403` from that API does not establish missing telemetry: inspect the existing dashboard session's stored events and linked traces instead. Do not expand credential permissions just to run verification.
+
+If an edge smoke check cannot find the homepage ETag, compare the public response with `request_completed.response_etag` in the same version's logs. [Cloudflare HTML transformation features can remove weak ETags](https://developers.cloudflare.com/cache/reference/etag-headers/). A valid origin tag and working conditional requests do not establish that the public header is preserved. Keep the strict smoke check and resolve that edge behavior before production rollout; do not weaken the check or change account security settings as part of an unrelated deployment.
+
+## Manual whole-batch cleanup
+
+Use this only for an operator-reviewed correction; rollout does not remove any existing production content.
+
+1. Pause every publishing client and wait for in-flight publishes and rebuild jobs to finish. Record the affected post ID from the API reply or correlated logs. For older posts, inspect the current manifest and its sources in the private R2 bucket.
+2. Read `pages/index.html` custom metadata `manifest`, then inspect that exact manifest and find the affected `posts` entry. Use its exact `key`; legacy entries can point to `digests/...`, so do not guess the source path.
+3. Download backups of the source JSON, current index, and manifest. Save a private source backup under `operator-backups/<timestamp>/<post-id>.json`, outside `posts/`, `digests/`, and `publications/`. Preserve all original fields and bytes in the backup. Do not delete the source or edit immutable manifests.
+4. In the dashboard, replace only the selected source object's `items` with `[]`, preserving its other fields. Historical-source validation deliberately accepts this empty batch. The current rendered homepage has not changed yet.
+5. Run `npm run rebuild -- production` (or `preview` for testing), then check `npm run rebuild:status -- production JOB_UUID` until completed. A failed job retains the old homepage: repair the source and resume using the existing command.
+6. Verify the removed batch's stories are absent, other stories remain, and the receipt window/publication timestamp remain unchanged. Resume publishing clients. The cleared source no longer reserves its URLs, unless another eligible batch still contains them.
+
+To undo cleanup, pause publishers again, restore the saved source at the exact original key, and rebuild/verify before resuming. Rebuilds retain the selected snapshot: sources that have already left that snapshot require a deliberate new publication instead. Clearing an omitted source does not itself change visible content; inspect `omitted_posts` separately when diagnosing a missing story.
 
 ```sh
 npx wrangler tail --env preview
 npx wrangler tail --env=''
 ```
 
-Use the Cloudflare dashboard to inspect Worker bindings, variables, secrets, logs, and private R2 objects. During rollout, verify preview smoke checks with `--verify-edge`, confirm the rebuild completed, and inspect all four themes before deploying production. Rolling back code does not roll back R2 content; preserve source objects and manifests. Do not run the previous upsert-based Worker against the migrated bucket.
+Use the Cloudflare dashboard to inspect Worker bindings, variables, secrets, logs, and private R2 objects. During rollout, verify preview smoke checks with `--verify-edge`, confirm the rebuild completed, verify correlated log and trace records, and inspect the homepage before deploying production. Verify production version headers with read-only API requests; do not create diagnostic production posts. Rolling back code does not roll back R2 content; preserve source objects and manifests. Do not run the previous upsert-based Worker against the migrated bucket.

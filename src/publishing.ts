@@ -1,6 +1,7 @@
 import { recentDates, renderPage } from './render';
 import { HttpError, isDate, validateDigest } from './validation';
-import type { ContentBucket, Digest, Migration, PostReference, Publication, StoredPost } from './types';
+import { emit, fingerprint, OperationTrace } from './diagnostics';
+import type { ContentBucket, Digest, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishResult, StoredPost } from './types';
 
 export const HTML_CACHE = 'public, max-age=0, must-revalidate';
 export const initialMigration = (): Migration => ({ processed: 0, complete: false });
@@ -66,37 +67,87 @@ export async function currentPublication(bucket: ContentBucket): Promise<Publica
   return { version: 1, posts: legacy.filter(post => days.includes(post.date)).sort(order), snapshot_date: days[0] ?? null, published_at: anchor?.toISOString() ?? null };
 }
 
-async function writeHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string): Promise<void> {
-  const html = renderPage(posts, { origin, publication });
+async function writeHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, trace = new OperationTrace()): Promise<void> {
+  const html = await trace.run('rendering', () => renderPage(posts, { origin, publication }));
   const manifest = `publications/${crypto.randomUUID()}.json`;
-  await bucket.put(manifest, JSON.stringify(publication), { httpMetadata: { contentType: 'application/json' } });
+  await trace.run('manifest_write', () => bucket.put(manifest, JSON.stringify(publication), { httpMetadata: { contentType: 'application/json' } }));
   // The single index replacement commits both HTML and its manifest reference.
-  await bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest } });
+  trace.publication_status = 'unknown';
+  await trace.run('index_write', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest } }));
+  trace.publication_status = 'committed';
 }
 
-export async function publishDigest(bucket: ContentBucket, digest: Digest, origin: string, now = new Date(), migrationComplete = false): Promise<StoredPost> {
-  const post: StoredPost = { ...digest, id: crypto.randomUUID(), date: recentDates(now)[0], received_at: now.toISOString() };
-  const previous = await currentPublication(bucket);
-  const days = recentDates(now);
-  // Existing references take precedence over duplicate legacy backup objects.
-  const candidates = [...(!migrationComplete ? await legacyReferences(bucket) : []), ...(previous.omitted_posts ?? []), ...previous.posts, reference(post)];
-  const refs = [...new Map(candidates.filter(ref => days.includes(ref.date)).map(ref => [ref.id, ref])).values()].sort(order);
-  await bucket.put(postKey(post), JSON.stringify(post), { httpMetadata: { contentType: 'application/json' } });
-  const posts: StoredPost[] = [];
-  const selected: PostReference[] = [];
-  const omitted: PostReference[] = [];
-  for (const ref of refs) {
-    try {
-      posts.push(ref.id === post.id ? post : await loadPost(bucket, ref));
-      selected.push(ref);
-    } catch (error) {
-      if (!(error instanceof DamagedSource)) throw error;
-      omitted.push(ref);
-      console.warn('Omitted damaged post', { id: ref.id, key: ref.key, reason: error.reason });
-    }
+export class PublicationError extends Error {
+  constructor(public publication_status: PublicationStatus, public stage: string, public cause: unknown) {
+    super('Digest publication failed');
+    this.name = 'PublicationError';
   }
-  await writeHomepage(bucket, { version: 1, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin);
-  return post;
+}
+
+export async function publishDigest(bucket: ContentBucket, digest: Digest, origin: string, now = new Date(), migrationComplete = false, context?: OperationContext): Promise<PublishResult> {
+  const trace = new OperationTrace(context);
+  try {
+    const days = recentDates(now);
+    const posts: StoredPost[] = [];
+    const selected: PostReference[] = [];
+    const omitted: PostReference[] = [];
+    let committedIds = new Set<string>();
+    await trace.run('source_loading', async () => {
+      const previous = await currentPublication(bucket);
+      committedIds = new Set(previous.posts.map(ref => ref.id));
+      // Existing references take precedence over duplicate legacy backup objects.
+      const candidates = [...(!migrationComplete ? await legacyReferences(bucket) : []), ...(previous.omitted_posts ?? []), ...previous.posts];
+      const refs = [...new Map(candidates.filter(ref => days.includes(ref.date)).map(ref => [ref.id, ref])).values()].sort(order);
+      for (const ref of refs) {
+        try {
+          posts.push(await loadPost(bucket, ref));
+          selected.push(ref);
+        } catch (error) {
+          if (!(error instanceof DamagedSource)) throw error;
+          omitted.push(ref);
+          // Keep the established fixed warning for operators and legacy callers.
+          console.warn('Omitted damaged post', { id: ref.id, key: ref.key, reason: error.reason });
+          emit('source_omitted', context, { post_id: ref.id, source_key: ref.key, reason: error.reason }, 'warn');
+        }
+      }
+    });
+    const post: StoredPost = { ...digest, items: [], id: crypto.randomUUID(), date: days[0], received_at: now.toISOString() };
+    const items = await trace.run('duplicate_filtering', () => {
+      const known = new Map<string, { post_id: string; item_index: number }>();
+      // Oldest receipt wins; input item positions break the remaining ties.
+      for (const old of posts.filter(post => committedIds.has(post.id)).sort((a, b) => a.received_at.localeCompare(b.received_at) || a.id.localeCompare(b.id))) {
+        old.items.forEach((item, item_index) => {
+          if (!known.has(item.post_url)) known.set(item.post_url, { post_id: old.id, item_index });
+        });
+      }
+      return digest.items.map((item, index): PublishResult['items'][number] => {
+        const match = known.get(item.post_url);
+        if (match) return { index, status: 'duplicate', ...match };
+        const identity = { post_id: post.id, item_index: post.items.length };
+        post.items.push(item);
+        known.set(item.post_url, identity);
+        return { index, status: 'published', ...identity };
+      });
+    });
+    const counts = { submitted: items.length, published: post.items.length, duplicates: items.length - post.items.length };
+    if (post.items.length) {
+      await trace.run('source_write', () => bucket.put(postKey(post), JSON.stringify(post), { httpMetadata: { contentType: 'application/json' } }));
+      posts.push(post);
+      selected.push(reference(post));
+      selected.sort(order);
+      // Preserve the established newest-receipt ordering of historical stories.
+      posts.sort((a, b) => order(reference(a), reference(b)));
+      await writeHomepage(bucket, { version: 1, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin, trace);
+    }
+    const result: PublishResult = {
+      post: post.items.length ? { id: post.id, date: post.date, received_at: post.received_at } : null,
+      duplicate: items.length > 0 && post.items.length === 0, counts, items,
+    };
+    emit('publish_result', context, { ...counts, post_id: result.post?.id, duplicate: result.duplicate, publication_status: trace.publication_status, duplicate_url_hashes: items.filter(item => item.status === 'duplicate').slice(0, 20).map(item => fingerprint(digest.items[item.index].post_url)) });
+    return result;
+  } catch (error) {
+    throw new PublicationError(trace.publication_status, trace.stage, error);
+  }
 }
 
 export async function migrateBatch(bucket: ContentBucket, migration: Migration): Promise<Migration> {
@@ -113,11 +164,13 @@ export async function migrateBatch(bucket: ContentBucket, migration: Migration):
   return { processed, complete: !page.truncated, ...(page.truncated ? { cursor: page.cursor } : {}) };
 }
 
-export async function rebuildHomepage(bucket: ContentBucket, origin: string): Promise<void> {
-  const publication = await currentPublication(bucket);
+export async function rebuildHomepage(bucket: ContentBucket, origin: string, trace = new OperationTrace()): Promise<void> {
+  const publication = await trace.run('source_loading', () => currentPublication(bucket));
   // Migration finishes before rendering; imported sources now have canonical keys.
   publication.posts = publication.posts.map(ref => ref.id.startsWith('legacy-') ? { ...ref, key: postKey(ref) } : ref);
   const posts: StoredPost[] = [];
-  for (const ref of publication.posts) posts.push(await loadPost(bucket, ref));
-  await writeHomepage(bucket, publication, posts, origin);
+  await trace.run('source_loading', async () => {
+    for (const ref of publication.posts) posts.push(await loadPost(bucket, ref));
+  });
+  await writeHomepage(bucket, publication, posts, origin, trace);
 }

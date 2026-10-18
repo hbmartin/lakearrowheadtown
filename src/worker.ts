@@ -4,8 +4,9 @@ import { hashBytes, IMAGE_CACHE, imageUpload, withImageUploadSlot } from './imag
 import { HTML_CACHE } from './publishing';
 import { renderPage } from './render';
 import { isIndexable, metadataResource } from './public-metadata';
-import type { Env } from './types';
-import { HttpError, readLimited, validateDigest } from './validation';
+import type { Env, OperationContext, PublicationStatus, PublishReply, PublishResult, RebuildJob } from './types';
+import { emit, fingerprint, OperationTrace, safeError } from './diagnostics';
+import { HttpError, parseDigestJson, readLimited, validateDigest } from './validation';
 export { DigestPublisher } from './publisher';
 
 function json(value: unknown, status = 200, headers: HeadersInit = {}): Response {
@@ -13,7 +14,7 @@ function json(value: unknown, status = 200, headers: HeadersInit = {}): Response
 }
 
 async function authenticate(request: Request, secret?: string): Promise<void> {
-  if (!secret || secret.length < 32) throw new HttpError(503, 'Publishing secret is not configured');
+  if (!secret || secret.length < 32) throw new HttpError(503, 'Publishing secret is not configured', {}, { code: 'configuration_error' });
   const token = /^Bearer +([^\s]+)$/i.exec(request.headers.get('authorization') ?? '')?.[1] ?? '';
   const [provided, expected] = await Promise.all([token, secret].map(async value => new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))));
   if (!timingSafeEqual(provided, expected)) throw new HttpError(401, 'Unauthorized');
@@ -24,7 +25,7 @@ function originFor(request: Request, env: Env): string {
     const url = new URL(env.SITE_ORIGIN || new URL(request.url).origin);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Invalid origin');
     return url.origin;
-  } catch { throw new HttpError(503, 'Site origin is not configured correctly'); }
+  } catch { throw new HttpError(503, 'Site origin is not configured correctly', {}, { code: 'configuration_error' }); }
 }
 
 // One cached fallback per serving origin; never hash static HTML on every request.
@@ -71,81 +72,141 @@ async function publicObject(request: Request, env: Env, key: string, image = fal
   return new Response(body, { headers });
 }
 
-const handler = {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    let operation: 'read' | 'digest' | 'image' | 'rebuild' = 'read';
-    let publicationAttempted = false;
-    try {
-      const path = new URL(request.url).pathname;
-      const maintenance = /^\/api\/rebuild(?:\/([a-f0-9-]{36})(\/resume)?)?$/.exec(path);
-      if (maintenance) {
-        operation = 'rebuild';
-        await authenticate(request, env.API_SECRET);
+interface RequestState {
+  context: OperationContext;
+  trace: OperationTrace;
+  error_code?: string;
+  bytes_received?: number;
+  body_sha256?: string;
+  body_complete?: boolean;
+  counts?: PublishResult['counts'];
+  post_id?: string;
+  publication_status?: PublicationStatus;
+}
+
+async function handle(request: Request, env: Env, state: RequestState): Promise<Response> {
+  const { context, trace } = state;
+  const path = new URL(request.url).pathname;
+  const isApi = path === '/api' || path.startsWith('/api/');
+  let publicationAttempted = false;
+  const reply = (value: Record<string, unknown>, status = 200, headers: HeadersInit = {}) => json({ ...value, ...(isApi ? { request_id: context.request_id } : {}) }, status, headers);
+  try {
+    const maintenance = /^\/api\/rebuild(?:\/([a-f0-9-]{36})(\/resume)?)?$/.exec(path);
+    if (maintenance) {
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      const publisher = env.PUBLISHER.getByName('site');
+      if (!maintenance[1] && request.method === 'POST') {
+        const job = await trace.run('enqueue_rebuild', () => publisher.enqueueRebuild(originFor(request, env), context));
+        return reply({ ok: true, job }, 202);
+      }
+      if (maintenance[1] && !maintenance[2] && request.method === 'GET') {
+        const job = await trace.run('rebuild_status', () => publisher.jobStatus(maintenance[1]));
+        if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
+        return reply({ ok: true, job });
+      }
+      if (maintenance[2] && request.method === 'POST') {
+        const job = await trace.run<RebuildJob | 'conflict' | null>('resume_rebuild', async () => await publisher.resumeRebuild(maintenance[1], context));
+        if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
+        if (job === 'conflict') throw new HttpError(409, 'Only failed jobs can resume', {}, { code: 'job_not_failed' });
+        return reply({ ok: true, job }, 202);
+      }
+      throw new HttpError(405, 'Method not allowed', { Allow: maintenance[1] && !maintenance[2] ? 'GET' : 'POST' });
+    }
+    if (path === '/api/digests' || path === '/api/images') {
+      if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      trace.stage = 'configuration';
+      const origin = originFor(request, env);
+      if (path === '/api/digests') {
+        trace.stage = 'content_type';
+        if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json', {}, { details: { expected: 'application/json' } });
+        state.bytes_received = 0;
+        state.body_complete = false;
+        const bytes = await trace.run('body_reading', () => readLimited(request, 1024 * 1024, bytes => { state.bytes_received = bytes; }));
+        state.bytes_received = bytes.byteLength;
+        state.body_complete = true;
+        state.body_sha256 = fingerprint(new Uint8Array(bytes));
+        const input = await trace.run('parsing', () => parseDigestJson(bytes));
+        const digest = await trace.run('validation', () => validateDigest(input, { requireItems: true }));
+        trace.stage = 'publisher_lookup';
         const publisher = env.PUBLISHER.getByName('site');
-        if (!maintenance[1] && request.method === 'POST') {
-          const job = await publisher.enqueueRebuild(originFor(request, env));
-          return json({ ok: true, job }, 202);
+        publicationAttempted = true;
+        state.publication_status = 'unknown';
+        const result = await trace.run<PublishReply>('publisher_rpc', async () => await publisher.publish(digest, origin, context));
+        if (!result.ok) {
+          state.publication_status = result.failure.publication_status;
+          trace.stage = result.failure.stage;
+          throw new HttpError(500, result.failure.error, {}, { code: result.failure.code, details: { stage: result.failure.stage }, retryable: result.failure.retryable, publication_status: result.failure.publication_status });
         }
-        if (maintenance[1] && !maintenance[2] && request.method === 'GET') {
-          const job = await publisher.jobStatus(maintenance[1]);
-          return job ? json({ ok: true, job }) : json({ ok: false, error: 'Job not found' }, 404);
-        }
-        if (maintenance[2] && request.method === 'POST') {
-          const job = await publisher.resumeRebuild(maintenance[1]);
-          if (!job) return json({ ok: false, error: 'Job not found' }, 404);
-          return job === 'conflict' ? json({ ok: false, error: 'Only failed jobs can resume' }, 409) : json({ ok: true, job }, 202);
-        }
-        return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: maintenance[1] && !maintenance[2] ? 'GET' : 'POST' });
+        state.counts = result.result.counts;
+        state.post_id = result.result.post?.id;
+        state.publication_status = result.result.post ? 'committed' : 'not_committed';
+        return reply({ ok: true, url: '/', ...result.result });
       }
-      if (path === '/api/digests' || path === '/api/images') {
-        operation = path === '/api/digests' ? 'digest' : 'image';
-        if (request.method !== 'POST') return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: 'POST' });
-        await authenticate(request, env.API_SECRET);
-        const origin = originFor(request, env);
-        if (path === '/api/digests') {
-          if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json');
-          const bytes = await readLimited(request, 1024 * 1024);
-          let input: unknown;
-          try { input = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)); }
-          catch { throw new HttpError(400, 'Invalid JSON'); }
-          const digest = validateDigest(input);
-          const publisher = env.PUBLISHER.getByName('site');
-          publicationAttempted = true;
-          await publisher.publish(digest, origin);
-          return json({ ok: true, url: '/' });
-        }
-        return await withImageUploadSlot(async () => {
-          const image = await imageUpload(request);
-          const key = `images/${image.hash}.${image.extension}`;
-          await env.SITE_BUCKET.put(key, image.file.stream(), { httpMetadata: { contentType: image.type, cacheControl: IMAGE_CACHE } });
-          return json({ ok: true, url: `${origin}/${key}` });
-        });
-      }
-      if (!['GET', 'HEAD'].includes(request.method)) return json({ ok: false, error: 'Method not allowed' }, 405, { Allow: 'GET, HEAD' });
-      // Existing public content remains readable when the canonical origin is bad.
-      // Publishing and the empty-page fallback still require a valid origin.
-      let origin = '';
-      try { origin = originFor(request, env); }
-      catch (error) { if (!(error instanceof HttpError && error.status === 503)) throw error; }
+      trace.stage = 'upload_admission';
+      return await withImageUploadSlot(async () => {
+        const image = await trace.run('image_validation', () => imageUpload(request, (bytes, complete) => { state.bytes_received = bytes; state.body_complete = complete ?? false; }));
+        const key = `images/${image.hash}.${image.extension}`;
+        await trace.run('image_write', () => env.SITE_BUCKET.put(key, image.file.stream(), { httpMetadata: { contentType: image.type, cacheControl: IMAGE_CACHE } }));
+        return reply({ ok: true, url: `${origin}/${key}` });
+      });
+    }
+    if (!['GET', 'HEAD'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD' });
+    let origin = '';
+    try { origin = originFor(request, env); }
+    catch (error) { if (!(error instanceof HttpError && error.status === 503)) throw error; }
+    return await trace.run('public_read', async () => {
       const metadata = await metadataResource(request, env.SITE_BUCKET, origin);
       if (metadata) return metadata;
-      if (path === '/' || path === '/index.html') return await publicObject(request, env, 'pages/index.html');
-      if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return await publicObject(request, env, path.slice(1), true);
-      return json({ ok: false, error: 'Not found' }, 404);
-    } catch (error) {
-      if (error instanceof HttpError) return json({ ok: false, error: error.message }, error.status, error.headers);
-      console.error('Request failed', error instanceof Error ? error.name : 'Unknown error');
-      const message = publicationAttempted
-        ? 'Unable to publish digest; publication may have completed. Check the homepage before posting again'
-        : { read: 'Unable to load content', digest: 'Unable to process digest', image: 'Unable to upload image', rebuild: 'Unable to complete rebuild request' }[operation];
-      return json({ ok: false, error: message }, 500);
-    }
-  },
-};
+      if (path === '/' || path === '/index.html') return publicObject(request, env, 'pages/index.html');
+      if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return publicObject(request, env, path.slice(1), true);
+      throw new HttpError(404, 'Not found');
+    });
+  } catch (error) {
+    const expected = error instanceof HttpError;
+    const failure = expected ? error : new HttpError(500, publicationAttempted
+      ? 'Unable to publish digest; publication may have completed. Retry the unchanged payload within the seven-day deduplication window.'
+      : { digest: 'Unable to process digest', image: 'Unable to upload image', rebuild: 'Unable to complete rebuild request', read: 'Unable to load content' }[context.operation] ?? 'Unable to complete request', {}, {
+        code: publicationAttempted ? 'publish_failed' : trace.stage === 'body_reading' ? 'body_read_failed' : trace.stage === 'image_write' || trace.stage === 'public_read' ? 'storage_error' : 'internal_error',
+      });
+    state.error_code = failure.code;
+    if (context.operation === 'digest') state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
+    const diagnostics = { stage: trace.stage, ...(state.bytes_received !== undefined ? { bytes_received: state.bytes_received, body_complete: state.body_complete ?? false } : {}), ...(state.body_sha256 ? { body_sha256: state.body_sha256 } : {}) };
+    emit('request_error', context, { error_code: failure.code, status: failure.status, ...diagnostics, publication_status: state.publication_status,
+      ...(Array.isArray(failure.details) ? { issues: failure.details.map(({ path, code }) => ({ path, code })), details_truncated: failure.details_truncated } : {}),
+      ...(!expected ? safeError(error) : {}) }, failure.status >= 500 ? 'error' : 'warn');
+    return reply({ ok: false, error: failure.message, code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
+      diagnostics, ...(context.operation === 'digest' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
+  }
+}
+
+function routeFor(path: string): { route: string; operation: string } {
+  if (path === '/api/digests') return { route: path, operation: 'digest' };
+  if (path === '/api/images') return { route: path, operation: 'image' };
+  if (/^\/api\/rebuild(?:\/[a-f0-9-]{36}(?:\/resume)?)?$/.test(path)) return { route: path === '/api/rebuild' ? path : path.endsWith('/resume') ? '/api/rebuild/:id/resume' : '/api/rebuild/:id', operation: 'rebuild' };
+  if (path.startsWith('/api/') || path === '/api') return { route: '/api/*', operation: 'read' };
+  return { route: path === '/' || path === '/index.html' ? '/' : path.startsWith('/images/') ? '/images/:file' : '/public/*', operation: 'read' };
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const response = await handler.fetch(request, env);
+    const started = performance.now();
+    const path = new URL(request.url).pathname;
+    const route = routeFor(path);
+    const ray = request.headers.get('cf-ray');
+    const context: OperationContext = { request_id: crypto.randomUUID(), worker_version: env.CF_VERSION_METADATA?.id ?? 'local', environment: env.ENVIRONMENT ?? 'local', operation: route.operation,
+      ...(ray && /^[a-f0-9]{16,32}(?:-[A-Z]{3})?$/.test(ray) ? { cf_ray: ray } : {}) };
+    const state: RequestState = { context, trace: new OperationTrace(context) };
+    const response = await handle(request, env, state);
+    if (path === '/api' || path.startsWith('/api/')) {
+      response.headers.set('X-Request-ID', context.request_id);
+      response.headers.set('X-Worker-Version', context.worker_version);
+      response.headers.set('X-API-Version', '2');
+    }
+    const media = request.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
+    emit('request_completed', context, { route: route.route, method: request.method, status: response.status, error_code: state.error_code,
+      duration_ms: performance.now() - started, response_etag: response.headers.get('etag') ?? undefined, content_type: media && ['application/json', 'multipart/form-data', 'text/plain'].includes(media) ? media : 'other',
+      bytes_received: state.bytes_received, body_complete: state.body_complete, body_sha256: state.body_sha256, counts: state.counts, post_id: state.post_id, publication_status: state.publication_status });
     // Stored HTML may have production metadata even when served from workers.dev.
     // Apply the actual serving-origin policy to every response, including 304s.
     let indexable = false;
