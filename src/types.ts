@@ -22,6 +22,34 @@ export interface StoredPost extends Digest {
   received_at: string;
 }
 
+export type PublicationStatus = 'not_attempted' | 'not_committed' | 'committed' | 'unknown';
+
+export interface OperationContext {
+  request_id: string;
+  worker_version: string;
+  environment: string;
+  operation: string;
+  cf_ray?: string;
+  job_id?: string;
+}
+
+export interface PublishResult {
+  post: Pick<StoredPost, 'id' | 'date' | 'received_at'> | null;
+  duplicate: boolean;
+  counts: { submitted: number; published: number; duplicates: number };
+  items: { index: number; status: 'published' | 'duplicate'; post_id: string; item_index: number }[];
+}
+
+export interface PublishFailure {
+  code: string;
+  error: string;
+  stage: string;
+  publication_status: PublicationStatus;
+  retryable: boolean;
+}
+
+export type PublishReply = { ok: true; result: PublishResult } | { ok: false; failure: PublishFailure };
+
 export interface PostReference {
   id: string;
   key: string;
@@ -54,6 +82,9 @@ export interface RebuildJob {
   finished_at?: string;
   error?: string;
   blocked_by?: string;
+  context?: OperationContext;
+  error_code?: string;
+  failed_stage?: string;
 }
 
 export interface Env {
@@ -61,6 +92,8 @@ export interface Env {
   SITE_ORIGIN: string;
   SITE_BUCKET: R2Bucket;
   PUBLISHER: DurableObjectNamespace<DigestPublisher>;
+  CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
+  ENVIRONMENT?: string;
 }
 
 // A narrow storage interface also allows failure injection in publishing tests.

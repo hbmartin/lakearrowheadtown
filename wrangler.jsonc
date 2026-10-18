@@ -8,7 +8,7 @@
   "preview_urls": false,
   "cache": { "enabled": true },
   "routes": [{ "pattern": "lakearrowhead.town", "custom_domain": true }],
-  "vars": { "SITE_ORIGIN": "https://lakearrowhead.town" },
+  "vars": { "SITE_ORIGIN": "https://lakearrowhead.town", "ENVIRONMENT": "production" },
   "r2_buckets": [{ "binding": "SITE_BUCKET", "bucket_name": "lakearrowheadtown-content" }],
   "durable_objects": {
     "bindings": [{ "name": "PUBLISHER", "class_name": "DigestPublisher" }]
@@ -18,12 +18,16 @@
     { "type": "Text", "globs": ["**/*.html", "**/*.svg"], "fallthrough": true },
     { "type": "Data", "globs": ["**/*.png", "**/*.ico"], "fallthrough": true }
   ],
-  "observability": { "enabled": true },
+  "upload_source_maps": true,
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
+  "observability": { "enabled": true, "redact_query_string": true, "logs": { "enabled": true, "persist": true, "invocation_logs": true, "head_sampling_rate": 1 }, "traces": { "enabled": true, "persist": true, "head_sampling_rate": 1 } },
   "env": {
     "preview": {
       "name": "lakearrowheadtown-preview",
+      "version_metadata": { "binding": "CF_VERSION_METADATA" },
+      "observability": { "enabled": true, "redact_query_string": true, "logs": { "enabled": true, "persist": true, "invocation_logs": true, "head_sampling_rate": 1 }, "traces": { "enabled": true, "persist": true, "head_sampling_rate": 1 } },
       "routes": [],
-      "vars": { "SITE_ORIGIN": "" },
+      "vars": { "SITE_ORIGIN": "", "ENVIRONMENT": "preview" },
       "r2_buckets": [{ "binding": "SITE_BUCKET", "bucket_name": "lakearrowheadtown-content-preview" }],
       "durable_objects": {
         "bindings": [{ "name": "PUBLISHER", "class_name": "DigestPublisher" }]

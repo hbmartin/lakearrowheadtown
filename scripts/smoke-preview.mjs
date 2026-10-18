@@ -32,21 +32,35 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const run = `Preview verification ${crypto.randomUUID()}`;
   const input = {
     date: '2099-01-01', title: run, source: 'deployment-smoke-test',
-    items: [{ group: 'Preview verification', group_url: 'https://lakearrowhead.town/', headline: run, body: `This is preview test content.\n\n**Markdown works.**\n\n![Uploaded image](${imageUrl})`, post_url: 'https://lakearrowhead.town/', category: 'announcement', posted_at: new Date().toISOString() }],
+    items: [{ group: 'Preview verification', group_url: 'https://lakearrowhead.town/', headline: run, body: `This is preview test content.\n\n**Markdown works.**\n\n![Uploaded image](${imageUrl})`, post_url: `https://lakearrowhead.town/?smoke=${encodeURIComponent(run)}`, category: 'announcement', posted_at: new Date().toISOString() }],
   };
   let previousTag;
+  let workerVersion;
+  const requestIds = [];
   for (let attempt = 0; attempt < 3; attempt++) {
     input.title = `${run}${attempt === 2 ? ' follow-up correction' : ''}`;
     input.items[0].headline = input.title;
+    if (attempt === 2) input.items[0].post_url += '&followup=1';
     const response = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
     assert.equal(response.status, 200, await response.clone().text());
-    assert.deepEqual(await response.json(), { ok: true, url: '/' });
+    const result = await response.json();
+    assert.equal(result.ok, true); assert.equal(result.url, '/');
+    assert.equal(result.request_id, response.headers.get('X-Request-ID'));
+    requestIds.push(result.request_id);
+    assert.equal(response.headers.get('X-API-Version'), '2');
+    assert(response.headers.get('X-Worker-Version'));
+    workerVersion ??= response.headers.get('X-Worker-Version');
+    assert.equal(response.headers.get('X-Worker-Version'), workerVersion);
+    assert.equal(result.duplicate, attempt === 1);
+    assert.deepEqual(result.counts, { submitted: 1, published: attempt === 1 ? 0 : 1, duplicates: attempt === 1 ? 1 : 0 });
+    assert.equal(result.post === null, attempt === 1);
     const homepage = await fetch(origin, { headers: { 'Accept-Encoding': 'gzip', ...(previousTag ? { 'If-None-Match': previousTag } : {}) } });
-    assert.equal(homepage.status, 200, 'Each append must immediately change the homepage');
+    assert.equal(homepage.status, attempt === 1 ? 304 : 200, 'Duplicates must preserve the homepage and ETag');
+    if (attempt === 1) continue;
     const html = await homepage.text();
     assert(html.includes('<strong>Markdown works.</strong>'));
     assert(html.includes('Last published'));
-    assert.equal(html.split(`rel="noopener noreferrer">${run}`).length - 1, attempt + 1);
+    assert.equal(html.split(`rel="noopener noreferrer">${run}`).length - 1, attempt === 2 ? 2 : 1);
     assert(html.includes('class="article-image article-thumbnail"'));
     assert(!html.includes('class="post-link"'));
     assert(html.indexOf('Posts from') > html.indexOf('</main>'));
@@ -55,12 +69,20 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert(previousTag?.startsWith('W/'), 'HTML must expose a weak ETag');
     if (edge) assert.match(homepage.headers.get('content-encoding') || '', /gzip|br|zstd/, 'Cloudflare must compress HTML');
   }
+  const empty = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ ...input, items: [] }) });
+  assert.equal(empty.status, 400);
+  const invalid = await empty.json();
+  assert.equal(invalid.code, 'validation_failed');
+  assert(invalid.details.some(issue => issue.code === 'empty_items'));
+  assert.equal(invalid.request_id, empty.headers.get('X-Request-ID'));
+  requestIds.push(invalid.request_id);
   assert.equal((await fetch(origin, { headers: { 'If-None-Match': previousTag } })).status, 304);
   assert.equal((await fetch(`${origin}/api/digests`, { method: 'POST', body: '{}' })).status, 401);
   assert.equal((await fetch(`${origin}/digests/2026-10-16`)).status, 404);
   assert.equal((await fetch(`${origin}/posts/`)).status, 404);
   const job = await maintenance('start', 'preview', undefined, { secret, origin, request: fetch });
   (options.log ?? console.log)(`Preview smoke checks passed: ${origin}. Rebuild ${job.id} queued; check its status manually.`);
+  return { origin, job, request_ids: requestIds, worker_version: workerVersion };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

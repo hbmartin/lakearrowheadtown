@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { reset } from 'cloudflare:test';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/worker';
 import { escapeHtml, renderPage } from '../src/render';
 import { currentPublication, publishDigest, rebuildHomepage } from '../src/publishing';
@@ -23,7 +23,7 @@ const listOf = (html: string) => graphOf(html).find(node => node['@type'] === 'I
 const htmlOf = async () => (await fetch('/')).text();
 const published = () => publishDigest(bindings.SITE_BUCKET, input(), SITE.origin, now, true);
 
-beforeEach(async () => { await reset(); });
+beforeEach(async () => { vi.restoreAllMocks(); vi.spyOn(console, 'info').mockImplementation(() => {}); await reset(); });
 
 describe('homepage metadata', () => {
   it('provides one consistent set of complete tags for empty, published and rebuilt pages', async () => {
@@ -94,12 +94,12 @@ describe('homepage metadata', () => {
   it('excludes damaged historical sources and their private references from structured data', async () => {
     const post = await publishDigest(bindings.SITE_BUCKET, input('Damaged headline'), SITE.origin, now, true);
     const snapshot = await currentPublication(bindings.SITE_BUCKET);
-    await bindings.SITE_BUCKET.delete(snapshot.posts.find(ref => ref.id === post.id)!.key);
+    await bindings.SITE_BUCKET.delete(snapshot.posts.find(ref => ref.id === post.post!.id)!.key);
     await publishDigest(bindings.SITE_BUCKET, input('Healthy headline'), SITE.origin, now, true);
     const html = await htmlOf();
     expect(listOf(html).itemListElement.map((item: any) => item.name)).toEqual(['Healthy headline']);
     expect(html).not.toMatch(/Damaged headline|omitted_posts/);
-    expect(html).not.toContain(post.id);
+    expect(html).not.toContain(post.post!.id);
   });
 
   it('round-trips hostile text in JSON-LD without creating HTML or script elements', async () => {
@@ -161,7 +161,7 @@ describe('indexing and canonical origins', () => {
     for (const path of ['/api/digests', '/api/images', '/api/rebuild']) {
       const response = await fetch(path, { method: 'POST', headers: { Authorization: 'Bearer test-secret-at-least-thirty-two-characters-long' } }, SITE.origin, configured);
       expect(response.status).toBe(503);
-      expect(await response.json()).toEqual({ ok: false, error: 'Site origin is not configured correctly' });
+      expect(await response.json()).toMatchObject({ ok: false, error: 'Site origin is not configured correctly', code: 'configuration_error' });
     }
     expect((await bindings.SITE_BUCKET.list()).objects).toHaveLength(0);
   });
