@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { OperationContext, PublicationStatus } from './types';
-import { OperationFailure } from './errors';
+import { DamagedSource, OperationFailure } from './errors';
 
 export function fingerprint(value: string | Uint8Array): string {
   return createHash('sha256').update(value).digest('hex');
@@ -15,7 +15,8 @@ export function safeError(error: unknown): Record<string, unknown> {
     .map(line => /(?:\(|at )([\w./@:-]+):(\d+):(\d+)\)?$/.exec(line))
     .filter(match => match !== null).slice(0, 12)
     .map(match => `${match[1]}:${match[2]}:${match[3]}`);
-  return { error_type: known.includes(error.name) ? error.name : 'Error', stack_frames: frames };
+  return { error_type: known.includes(error.name) ? error.name : 'Error', stack_frames: frames,
+    ...(error instanceof DamagedSource ? { source_key: error.source_key, post_id: error.post_id, reason: error.reason } : {}) };
 }
 
 export function emit(event: string, context: OperationContext | undefined, fields: Record<string, unknown> = {}, level: 'info' | 'warn' | 'error' = 'info'): void {
