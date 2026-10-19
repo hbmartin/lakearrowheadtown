@@ -1,14 +1,19 @@
 import { createHash } from 'node:crypto';
 import { HttpError } from './validation';
 import { boundary, declaredBodyBytes } from './errors';
+import type { OperationTrace } from './diagnostics';
 
 export const IMAGE_LIMIT = 10 * 1024 * 1024;
 export const IMAGE_CACHE = 'public, max-age=31536000, immutable';
 let activeUploads = 0;
 
-export async function withImageUploadSlot<T>(action: () => Promise<T>): Promise<T> {
-  if (activeUploads >= 2) throw new HttpError(503, 'Image uploads are busy', { 'Retry-After': '1' }, { code: 'uploads_busy', retryable: true });
-  activeUploads++;
+export async function withImageUploadSlot<T>(action: () => Promise<T>, trace?: OperationTrace): Promise<T> {
+  const acquire = () => {
+    if (activeUploads >= 2) throw new HttpError(503, 'Image uploads are busy', { 'Retry-After': '1' }, { code: 'uploads_busy', retryable: true });
+    activeUploads++;
+  };
+  if (trace) await trace.run('upload_admission', acquire);
+  else acquire();
   try { return await action(); }
   finally { activeUploads--; }
 }

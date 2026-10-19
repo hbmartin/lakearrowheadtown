@@ -123,24 +123,24 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     const maintenance = /^\/api\/rebuild(?:\/([a-f0-9-]{36})(\/resume)?)?$/.exec(path);
     if (maintenance) {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
-      const origin = !maintenance[1] && request.method === 'POST' ? await trace.run('configuration', () => originFor(request, env)) : undefined;
-      const publisher = await publisherFor(env, trace);
-      if (!maintenance[1] && request.method === 'POST') {
-        const job = await trace.run('enqueue_rebuild', () => boundary('rpc', () => publisher.enqueueRebuild(origin!, context)));
+      const allowedMethod = maintenance[1] && !maintenance[2] ? 'GET' : 'POST';
+      if (request.method !== allowedMethod) throw new HttpError(405, 'Method not allowed', { Allow: allowedMethod });
+      if (!maintenance[1]) {
+        const origin = await trace.run('configuration', () => originFor(request, env));
+        const publisher = await publisherFor(env, trace);
+        const job = await trace.run('enqueue_rebuild', () => boundary('rpc', () => publisher.enqueueRebuild(origin, context)));
         return reply({ ok: true, job }, 202);
       }
-      if (maintenance[1] && !maintenance[2] && request.method === 'GET') {
+      const publisher = await publisherFor(env, trace);
+      if (!maintenance[2]) {
         const job = await trace.run('rebuild_status', () => boundary('rpc', () => publisher.jobStatus(maintenance[1], context)));
         if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
         return reply({ ok: true, job });
       }
-      if (maintenance[2] && request.method === 'POST') {
-        const job = await trace.run<RebuildJob | 'conflict' | null>('resume_rebuild', () => boundary('rpc', async () => await publisher.resumeRebuild(maintenance[1], context)));
-        if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
-        if (job === 'conflict') throw new HttpError(409, 'Only failed jobs can resume', {}, { code: 'job_not_failed' });
-        return reply({ ok: true, job }, 202);
-      }
-      throw new HttpError(405, 'Method not allowed', { Allow: maintenance[1] && !maintenance[2] ? 'GET' : 'POST' });
+      const job = await trace.run<RebuildJob | 'conflict' | null>('resume_rebuild', () => boundary('rpc', async () => await publisher.resumeRebuild(maintenance[1], context)));
+      if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
+      if (job === 'conflict') throw new HttpError(409, 'Only a failed queue head or a stalled queued/running head without an alarm can resume', {}, { code: 'job_not_resumable' });
+      return reply({ ok: true, job }, 202);
     }
     if (path === '/api/digests' || path === '/api/images') {
       if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
@@ -179,12 +179,12 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         state.publication_outcome = result.duplicate ? 'duplicate' : 'published';
         return reply({ ok: true, url: '/', ...result });
       }
-      return await trace.run('upload_slot_held', () => withImageUploadSlot(async () => {
+      return await withImageUploadSlot(() => trace.run('upload_slot_held', async () => {
         const image = await trace.run('image_validation', () => imageUpload(request, (bytes, complete) => { state.bytes_received = bytes; state.body_complete = complete ?? false; }));
         const key = `images/${image.hash}.${image.extension}`;
         await trace.run('image_write', () => boundary('storage', () => env.SITE_BUCKET.put(key, image.file.stream(), { httpMetadata: { contentType: image.type, cacheControl: IMAGE_CACHE } })));
         return reply({ ok: true, url: `${origin}/${key}` });
-      }));
+      }), trace);
     }
     if (!['GET', 'HEAD'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD' });
     let origin = '';
@@ -221,7 +221,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     const diagnostics = { stage, ...(state.bytes_received !== undefined ? { bytes_received: state.bytes_received, body_complete: state.body_complete ?? false } : {}), ...(state.declared_body_bytes !== undefined ? { declared_body_bytes: state.declared_body_bytes } : {}), ...(state.body_sha256 ? { body_sha256: state.body_sha256 } : {}) };
     emit('request_error', context, { error_code: failure.code, status: failure.status, ...diagnostics, publication_status: state.publication_status, publication_outcome: state.publication_outcome,
       ...(Array.isArray(failure.details) ? { issues: failure.details.map(({ path, code }) => ({ path, code })), details_truncated: failure.details_truncated } : {}),
-      ...(!expected ? safeError(error) : {}) }, failure.status >= 500 ? 'error' : 'warn');
+      ...(!expected || failure.status >= 500 ? safeError(error) : {}) }, failure.status >= 500 ? 'error' : 'warn');
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
     return reply({ ok: false, error: failure.message, code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
       diagnostics, ...(context.operation === 'digest' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);

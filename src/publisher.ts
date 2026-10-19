@@ -46,14 +46,14 @@ export class DigestPublisher extends DurableObject<Env> {
     }, context);
   }
 
-  private rebuildRequest<T>(context: OperationContext | undefined, job_id: string, action: (trace: OperationTrace, context?: OperationContext) => Promise<T>): Promise<T> {
+  private rebuildRequest<T>(context: OperationContext | undefined, identity: { job_id: string } | { candidate_job_id: string }, action: (trace: OperationTrace, context?: OperationContext) => Promise<T>): Promise<T> {
     context = this.executingContext(context);
-    if (context) context = { ...context, job_id };
+    if (context) context = { ...context, ...identity };
     return this.serialize(async () => {
       const trace = new OperationTrace(context);
       try { return await action(trace, context); }
       catch (error) {
-        emit('rebuild_failed', context, { stage: trace.failed_stage ?? 'rebuild_request', error_code: asHttpError(error).code, publication_status: trace.publication_status, ...safeError(error) }, 'error');
+        emit('rebuild_request_failed', context, { stage: trace.failed_stage ?? 'rebuild_request', error_code: asHttpError(error).code, ...safeError(error) }, 'error');
         throw error;
       }
     }, context);
@@ -61,9 +61,11 @@ export class DigestPublisher extends DurableObject<Env> {
 
   async enqueueRebuild(origin: string, context?: OperationContext): Promise<RebuildJob> {
     const id = crypto.randomUUID();
-    return this.rebuildRequest(context, id, async (trace, context) => {
+    return this.rebuildRequest(context, { candidate_job_id: id }, async (trace, context) => {
       const migration = await trace.run('rebuild_enqueue_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration'))) ?? initialMigration();
-      const job: RebuildJob = { id, origin, status: 'queued', phase: migration.complete ? 'render' : 'migration', processed: migration.processed, created_at: new Date().toISOString(), ...(context ? { context } : {}) };
+      const jobContext = context ? { ...context, job_id: id } : undefined;
+      if (jobContext) delete jobContext.candidate_job_id;
+      const job: RebuildJob = { id, origin, status: 'queued', phase: migration.complete ? 'render' : 'migration', processed: migration.processed, created_at: new Date().toISOString(), ...(jobContext ? { context: jobContext } : {}) };
       await trace.run('rebuild_enqueue', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
         const ids = await storage.get<string[]>('jobs') ?? [];
         const head = ids.length ? await storage.get<RebuildJob>(`job:${ids[0]}`) : null;
@@ -71,13 +73,13 @@ export class DigestPublisher extends DurableObject<Env> {
         await storage.put('jobs', [...ids, job.id]);
         if (head?.status !== 'failed') await storage.setAlarm(Date.now() + 1000);
       })));
-      emit('rebuild_queued', context, { job_id: job.id });
+      emit('rebuild_queued', jobContext, { job_id: job.id });
       return job;
     });
   }
 
   async jobStatus(id: string, context?: OperationContext): Promise<RebuildJob | null> {
-    return this.rebuildRequest(context, id, trace => trace.run('rebuild_status_read', async () => {
+    return this.rebuildRequest(context, { job_id: id }, trace => trace.run('rebuild_status_read', async () => {
       const job = await boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`));
       if (!job) return null;
       const ids = await boundary('storage', () => this.ctx.storage.get<string[]>('jobs')) ?? [];
@@ -87,10 +89,12 @@ export class DigestPublisher extends DurableObject<Env> {
   }
 
   async resumeRebuild(id: string, context?: OperationContext): Promise<RebuildJob | 'conflict' | null> {
-    return this.rebuildRequest(context, id, async (trace, context) => {
+    return this.rebuildRequest(context, { job_id: id }, async (trace, context) => {
       const job = await trace.run('rebuild_resume_read', () => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`)));
       if (!job) return null;
-      if (job.status !== 'failed') return 'conflict';
+      const head = await this.rebuildHead(trace, context, 'rebuild_resume');
+      if (head.job?.id !== id || !['failed', 'queued', 'running'].includes(job.status)) return 'conflict';
+      if (job.status !== 'failed' && await trace.run('rebuild_resume_alarm_read', () => boundary('storage', () => this.ctx.storage.getAlarm())) !== null) return 'conflict';
       job.status = 'queued';
       delete job.error;
       delete job.finished_at;
@@ -105,6 +109,24 @@ export class DigestPublisher extends DurableObject<Env> {
     });
   }
 
+  private async rebuildHead(trace: OperationTrace, context?: OperationContext, prefix = 'rebuild'): Promise<{ ids: string[]; job: RebuildJob | undefined }> {
+    const ids = await trace.run(`${prefix}_queue_read`, () => boundary('storage', () => this.ctx.storage.get<string[]>('jobs'))) ?? [];
+    let skipped = 0;
+    let job: RebuildJob | undefined;
+    while (skipped < ids.length) {
+      if (context && prefix === 'rebuild') context.job_id = ids[skipped];
+      job = await trace.run(`${prefix}_${prefix === 'rebuild' ? 'job' : 'head'}_read`, () => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${ids[skipped]}`)));
+      if (job) break;
+      emit('rebuild_queue_entry_missing', context, { job_id: ids[skipped], error_code: 'job_record_missing' }, 'error');
+      skipped++;
+    }
+    const remaining = ids.slice(skipped);
+    if (skipped) await trace.run(`${prefix}_queue_repair`, () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
+      await storage.put('jobs', remaining);
+    })));
+    return { ids: remaining, job };
+  }
+
   async alarm(): Promise<void> {
     const bootstrapContext: OperationContext = { request_id: crypto.randomUUID(), worker_version: this.env.CF_VERSION_METADATA?.id ?? 'local', environment: this.env.ENVIRONMENT ?? 'local', operation: 'rebuild' };
     return this.serialize(async () => {
@@ -112,11 +134,9 @@ export class DigestPublisher extends DurableObject<Env> {
       let ids: string[];
       let job: RebuildJob | null | undefined;
       try {
-        ids = await bootstrap.run('rebuild_queue_read', () => boundary('storage', () => this.ctx.storage.get<string[]>('jobs'))) ?? [];
-        if (ids.length) bootstrapContext.job_id = ids[0];
-        job = ids.length ? await bootstrap.run('rebuild_job_read', () => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${ids[0]}`))) : null;
+        ({ ids, job } = await this.rebuildHead(bootstrap, bootstrapContext));
       } catch (error) {
-        emit('rebuild_failed', bootstrapContext, { stage: bootstrap.failed_stage, error_code: asHttpError(error).code, publication_status: bootstrap.publication_status, ...safeError(error) }, 'error');
+        emit('rebuild_alarm_failed', bootstrapContext, { stage: bootstrap.failed_stage, error_code: asHttpError(error).code, ...safeError(error) }, 'error');
         // Without a loaded job, leave queue state untouched for platform redelivery.
         throw error;
       }

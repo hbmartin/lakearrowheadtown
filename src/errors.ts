@@ -32,6 +32,12 @@ export class DamagedSource extends HttpError {
   }
 }
 
+export class DamagedManifest extends HttpError {
+  constructor(readonly manifest_key: string, readonly reason: 'missing' | 'invalid_json' | 'invalid_manifest') {
+    super(500, 'Committed publication manifest is damaged. An operator must restore it before retrying.', {}, { code: 'manifest_damaged', retryable: false });
+  }
+}
+
 const failures = {
   storage: { status: 500, code: 'storage_error', retryable: true, error: 'Storage operation failed. Retry the request.' },
   rendering: { status: 500, code: 'render_failed', retryable: false, error: 'Rendering failed. An operator must repair the cause before retrying.' },

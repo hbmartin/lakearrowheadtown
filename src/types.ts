@@ -31,6 +31,7 @@ export interface OperationContext {
   operation: string;
   cf_ray?: string;
   job_id?: string;
+  candidate_job_id?: string;
 }
 
 export interface PublishResult {
