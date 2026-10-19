@@ -9,6 +9,7 @@ import { matchesEtag, parseIfNoneMatch } from './conditions';
 import { hashBytes, IMAGE_CACHE } from './images';
 import { robotsText, sitemapXml, webManifest } from './metadata';
 import { HTML_CACHE } from './publishing';
+import { boundary } from './errors';
 import { ASSETS, SITE } from './site';
 import type { ContentBucket } from './types';
 
@@ -49,14 +50,14 @@ async function resourceResponse(request: Request, resource: Resource): Promise<R
 }
 
 async function committedPublicationTime(bucket: ContentBucket): Promise<string | undefined> {
-  const index = await bucket.head('pages/index.html');
+  const index = await boundary('storage', () => bucket.head('pages/index.html'));
   const key = index?.customMetadata?.manifest;
   if (!key) return;
-  const manifest = await bucket.get(key);
+  const manifest = await boundary('storage', () => bucket.get(key));
   if (!manifest) return;
   // Transport/storage failures remain errors; malformed or absent metadata simply
   // cannot supply an honest lastmod. Never scan sources or use index upload time.
-  const text = await manifest.text();
+  const text = await boundary('storage', () => manifest.text());
   let value: unknown;
   try { value = JSON.parse(text); }
   catch (error) { if (error instanceof SyntaxError) return; throw error; }

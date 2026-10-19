@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -75,7 +76,20 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   assert.equal(invalid.code, 'validation_failed');
   assert(invalid.details.some(issue => issue.code === 'empty_items'));
   assert.equal(invalid.request_id, empty.headers.get('X-Request-ID'));
+  const emptyBody = JSON.stringify({ ...input, items: [] });
+  assert.equal(invalid.diagnostics.bytes_received, Buffer.byteLength(emptyBody));
+  assert.equal(invalid.diagnostics.body_complete, true);
+  assert.equal(invalid.diagnostics.body_sha256, createHash('sha256').update(emptyBody).digest('hex'));
   requestIds.push(invalid.request_id);
+  const malformedBody = 'position 12 abcdefghijklmnopqrstuvwxyz';
+  const malformed = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: malformedBody });
+  assert.equal(malformed.status, 400);
+  const syntaxError = await malformed.json();
+  assert.equal(syntaxError.code, 'invalid_json');
+  assert.deepEqual(syntaxError.details, {}, 'Quoted input must never supply a syntax position');
+  assert.equal(syntaxError.diagnostics.body_complete, true);
+  assert.equal(syntaxError.diagnostics.body_sha256, createHash('sha256').update(malformedBody).digest('hex'));
+  requestIds.push(syntaxError.request_id);
   assert.equal((await fetch(origin, { headers: { 'If-None-Match': previousTag } })).status, 304);
   assert.equal((await fetch(`${origin}/api/digests`, { method: 'POST', body: '{}' })).status, 401);
   assert.equal((await fetch(`${origin}/digests/2026-10-16`)).status, 404);

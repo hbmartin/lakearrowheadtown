@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { OperationContext, PublicationStatus } from './types';
+import { OperationFailure } from './errors';
 
 export function fingerprint(value: string | Uint8Array): string {
   return createHash('sha256').update(value).digest('hex');
@@ -7,6 +8,7 @@ export function fingerprint(value: string | Uint8Array): string {
 
 // Never log an exception message: parsers and upstream services can echo inputs.
 export function safeError(error: unknown): Record<string, unknown> {
+  if (error instanceof OperationFailure) return { failure_kind: error.kind, ...safeError(error.cause) };
   const known = ['Error', 'TypeError', 'SyntaxError', 'RangeError', 'HttpError', 'PublicationError'];
   if (!(error instanceof Error)) return { error_type: 'UnknownError' };
   const frames = (error.stack ?? '').split('\n').filter(line => /^\s+at /.test(line))
@@ -22,16 +24,21 @@ export function emit(event: string, context: OperationContext | undefined, field
 }
 
 export class OperationTrace {
-  stage = 'initialization';
+  stage: string | undefined;
+  failed_stage: string | undefined;
   publication_status: PublicationStatus = 'not_committed';
   constructor(public context?: OperationContext) {}
 
-  async run<T>(stage: string, action: () => T | Promise<T>): Promise<T> {
+  async run<T>(stage: string, action: () => T | Promise<T>, fields: Record<string, unknown> = {}): Promise<T> {
+    const previous = this.stage;
     this.stage = stage;
     const started = performance.now();
     let outcome = 'ok';
     try { return await action(); }
-    catch (error) { outcome = 'error'; throw error; }
-    finally { emit('operation_stage', this.context, { stage, outcome, duration_ms: performance.now() - started }); }
+    catch (error) { outcome = 'error'; this.failed_stage ??= stage; throw error; }
+    finally {
+      this.stage = previous;
+      emit('operation_stage', this.context, { stage, ...fields, outcome, duration_ms: performance.now() - started });
+    }
   }
 }

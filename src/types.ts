@@ -41,6 +41,7 @@ export interface PublishResult {
 }
 
 export interface PublishFailure {
+  status: number;
   code: string;
   error: string;
   stage: string;
