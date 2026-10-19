@@ -29,6 +29,18 @@ function originFor(request: Request, env: Env): string {
   } catch { throw new HttpError(503, 'Site origin is not configured correctly', {}, { code: 'configuration_error' }); }
 }
 
+async function publisherFor(env: Env, trace: OperationTrace) {
+  return trace.run('publisher_lookup', async () => {
+    const unavailableBinding = () => new HttpError(503, 'Publisher binding is not configured correctly', {}, { code: 'configuration_error', retryable: false });
+    if (!env.PUBLISHER || typeof env.PUBLISHER.getByName !== 'function') {
+      throw unavailableBinding();
+    }
+    const publisher = await boundary('rpc', () => env.PUBLISHER.getByName('site'));
+    if (!publisher || !['object', 'function'].includes(typeof publisher)) throw unavailableBinding();
+    return publisher;
+  });
+}
+
 // One cached fallback per serving origin; never hash static HTML on every request.
 const fallbackPages = new Map<string, Promise<{ html: string; etag: string }>>();
 function fallbackFor(origin: string): Promise<{ html: string; etag: string }> {
@@ -97,14 +109,14 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     const maintenance = /^\/api\/rebuild(?:\/([a-f0-9-]{36})(\/resume)?)?$/.exec(path);
     if (maintenance) {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
-      const publisher = env.PUBLISHER.getByName('site');
+      const origin = !maintenance[1] && request.method === 'POST' ? await trace.run('configuration', () => originFor(request, env)) : undefined;
+      const publisher = await publisherFor(env, trace);
       if (!maintenance[1] && request.method === 'POST') {
-        const origin = originFor(request, env);
-        const job = await trace.run('enqueue_rebuild', () => boundary('rpc', () => publisher.enqueueRebuild(origin, context)));
+        const job = await trace.run('enqueue_rebuild', () => boundary('rpc', () => publisher.enqueueRebuild(origin!, context)));
         return reply({ ok: true, job }, 202);
       }
       if (maintenance[1] && !maintenance[2] && request.method === 'GET') {
-        const job = await trace.run('rebuild_status', () => boundary('rpc', () => publisher.jobStatus(maintenance[1])));
+        const job = await trace.run('rebuild_status', () => boundary('rpc', () => publisher.jobStatus(maintenance[1], context)));
         if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
         return reply({ ok: true, job });
       }
@@ -133,7 +145,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         state.body_sha256 = fingerprint(new Uint8Array(bytes));
         const input = await trace.run('parsing', () => parseDigestJson(bytes));
         const digest = await trace.run('validation', () => validateDigest(input, { requireItems: true }));
-        const publisher = await trace.run('publisher_lookup', () => boundary('rpc', () => env.PUBLISHER.getByName('site')));
+        const publisher = await publisherFor(env, trace);
         publicationAttempted = true;
         state.publication_status = 'unknown';
         const rpc = { transport_outcome: 'error' };
@@ -153,7 +165,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         state.publication_outcome = result.duplicate ? 'duplicate' : 'published';
         return reply({ ok: true, url: '/', ...result });
       }
-      return await trace.run('upload_admission', () => withImageUploadSlot(async () => {
+      return await trace.run('upload_slot_held', () => withImageUploadSlot(async () => {
         const image = await trace.run('image_validation', () => imageUpload(request, (bytes, complete) => { state.bytes_received = bytes; state.body_complete = complete ?? false; }));
         const key = `images/${image.hash}.${image.extension}`;
         await trace.run('image_write', () => boundary('storage', () => env.SITE_BUCKET.put(key, image.file.stream(), { httpMetadata: { contentType: image.type, cacheControl: IMAGE_CACHE } })));

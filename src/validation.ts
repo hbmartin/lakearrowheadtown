@@ -79,11 +79,11 @@ export function parseDigestJson(bytes: ArrayBuffer): unknown {
     const message = error instanceof Error ? error.message : '';
     // V8's location-bearing errors have fixed prefixes and a location suffix.
     // Other formats quote arbitrary input, so never search them for "position".
-    const positionMatch = /^(?:Expected (?:property name or '\}'|double-quoted property name|':' after property name|',' or '\}' after property value|',' or '\]' after array element) in JSON|Unexpected non-whitespace character after JSON|Unterminated string in JSON|Bad (?:control character in string literal|escaped character|Unicode escape) in JSON|No number after minus sign in JSON|Unexpected number in JSON|Exponent part is missing a number in JSON|Unterminated fractional number in JSON) at position (\d+) \(line (\d+) column (\d+)\)$/.exec(message);
+    const positionMatch = /^(?:Expected (?:property name or '\}'|double-quoted property name|':' after property name|',' or '\}' after property value|',' or '\]' after array element) in JSON|Unexpected non-whitespace character after JSON|Unterminated string in JSON|Bad (?:control character in string literal|escaped character|Unicode escape) in JSON|No number after minus sign in JSON|Unexpected (?:number|string) in JSON|Exponent part is missing a number in JSON|Unterminated fractional number in JSON) at position (\d+) \(line (\d+) column (\d+)\)$/.exec(message);
     const position = positionMatch ? Number(positionMatch[1]) : message === 'Unexpected end of JSON input' ? text.length : undefined;
     const details: Record<string, unknown> = {};
     if (position !== undefined && Number.isSafeInteger(position) && position >= 0 && position <= text.length) {
-      const lines = text.slice(0, position).split('\n');
+      const lines = text.slice(0, position).split(/\r\n|\r|\n/);
       const column = lines[lines.length - 1].length + 1;
       if (!positionMatch || (Number(positionMatch[2]) === lines.length && Number(positionMatch[3]) === column)) {
         Object.assign(details, { position, line: lines.length, column, position_unit: 'utf16_code_units' });

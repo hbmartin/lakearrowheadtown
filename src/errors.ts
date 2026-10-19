@@ -26,6 +26,12 @@ export class HttpError extends Error {
   }
 }
 
+export class DamagedSource extends HttpError {
+  constructor(readonly source_key: string, readonly post_id: string, readonly reason: 'missing' | 'invalid_json' | 'invalid_digest') {
+    super(500, 'Published source is damaged. An operator must restore it before retrying.', {}, { code: 'source_damaged', retryable: false });
+  }
+}
+
 const failures = {
   storage: { status: 500, code: 'storage_error', retryable: true, error: 'Storage operation failed. Retry the request.' },
   rendering: { status: 500, code: 'render_failed', retryable: false, error: 'Rendering failed. An operator must repair the cause before retrying.' },
