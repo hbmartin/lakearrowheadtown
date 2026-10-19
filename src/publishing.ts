@@ -1,4 +1,5 @@
 import { recentDates, renderPage } from './render';
+import { renderRss, RSS_TYPE } from './rss';
 import { HttpError, isDate, validateDigest } from './validation';
 import { emit, fingerprint, OperationTrace } from './diagnostics';
 import { boundary, DamagedSource } from './errors';
@@ -66,12 +67,15 @@ export async function currentPublication(bucket: ContentBucket): Promise<Publica
 
 async function writeHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, trace = new OperationTrace()): Promise<void> {
   const html = await trace.run('rendering', () => boundary('rendering', () => renderPage(posts, { origin, publication })));
+  const feed = await trace.run('rss_rendering', () => boundary('rendering', () => renderRss(posts, { origin, publication })));
   const manifest = `publications/${crypto.randomUUID()}.json`;
+  const rss = manifest.replace(/\.json$/, '.rss.xml');
   const serialized = JSON.stringify(publication);
   await trace.run('manifest_write', () => boundary('storage', () => bucket.put(manifest, serialized, { httpMetadata: { contentType: 'application/json' } })));
-  // The single index replacement commits both HTML and its manifest reference.
+  await trace.run('rss_write', () => boundary('storage', () => bucket.put(rss, feed, { httpMetadata: { contentType: RSS_TYPE, cacheControl: HTML_CACHE } })));
+  // The single index replacement commits HTML and both immutable snapshot references.
   trace.publication_status = 'unknown';
-  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest } })));
+  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest, rss } })));
   trace.publication_status = 'committed';
 }
 

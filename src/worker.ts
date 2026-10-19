@@ -3,6 +3,7 @@ import { matchesEtag, parseIfNoneMatch } from './conditions';
 import { hashBytes, IMAGE_CACHE, imageUpload, withImageUploadSlot } from './images';
 import { HTML_CACHE } from './publishing';
 import { renderPage } from './render';
+import { renderRss, RSS_TYPE } from './rss';
 import { isIndexable, metadataResource } from './public-metadata';
 import type { Env, OperationContext, PublicationStatus, PublishResult, RebuildJob } from './types';
 import { emit, fingerprint, OperationTrace, safeError } from './diagnostics';
@@ -41,36 +42,49 @@ async function publisherFor(env: Env, trace: OperationTrace) {
   });
 }
 
-// One cached fallback per serving origin; never hash static HTML on every request.
-const fallbackPages = new Map<string, Promise<{ html: string; etag: string }>>();
-function fallbackFor(origin: string): Promise<{ html: string; etag: string }> {
-  let page = fallbackPages.get(origin);
+// Cache each empty representation per serving origin instead of hashing every request.
+const fallbackPages = new Map<string, Promise<{ body: string; etag: string }>>();
+function fallbackFor(origin: string, rss = false): Promise<{ body: string; etag: string }> {
+  const key = `${origin}${rss ? '/rss.xml' : '/'}`;
+  let page = fallbackPages.get(key);
   if (!page) {
     page = (async () => {
-      const html = renderPage([], { origin });
-      return { html, etag: `W/"${await hashBytes(new TextEncoder().encode(html))}"` };
+      const body = rss ? renderRss([], { origin }) : renderPage([], { origin });
+      return { body, etag: `W/"${await hashBytes(new TextEncoder().encode(body))}"` };
     })();
-    fallbackPages.set(origin, page);
+    fallbackPages.set(key, page);
   }
   return page;
 }
 
-async function publicObject(request: Request, env: Env, key: string, image = false): Promise<Response> {
+async function emptyResponse(request: Request, origin: string, rss = false): Promise<Response> {
+  const { body, etag } = await fallbackFor(origin, rss);
+  const unchanged = matchesEtag(parseIfNoneMatch(request.headers.get('if-none-match')), etag);
+  return new Response(request.method === 'HEAD' || unchanged ? null : body, {
+    status: unchanged ? 304 : 200,
+    headers: { 'Cache-Control': HTML_CACHE, 'Cloudflare-CDN-Cache-Control': 'no-store',
+      'Content-Type': rss ? RSS_TYPE : 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', ETag: etag },
+  });
+}
+
+function rssUnavailable(): HttpError {
+  return new HttpError(503, 'RSS feed is temporarily unavailable. Please try again later.', { 'Retry-After': '60' });
+}
+
+async function publicObject(request: Request, env: Env, key: string, type: 'html' | 'image' | 'rss' = 'html'): Promise<Response> {
+  const image = type === 'image';
   const condition = parseIfNoneMatch(request.headers.get('if-none-match'));
   const object = await boundary('storage', () => request.method === 'HEAD'
     ? env.SITE_BUCKET.head(key)
     : env.SITE_BUCKET.get(key, condition ? { onlyIf: new Headers({ 'If-None-Match': condition.header }) } : undefined));
   const headers = new Headers({ 'Cloudflare-CDN-Cache-Control': image ? IMAGE_CACHE : 'no-store', 'X-Content-Type-Options': 'nosniff' });
   if (!object) {
+    if (type === 'rss') throw rssUnavailable();
     if (key !== 'pages/index.html') throw new HttpError(404, 'Not found');
-    const { html, etag } = await fallbackFor(originFor(request, env));
-    headers.set('Cache-Control', HTML_CACHE);
-    headers.set('Content-Type', 'text/html; charset=utf-8');
-    headers.set('ETag', etag);
-    const unchanged = matchesEtag(condition, etag);
-    return new Response(request.method === 'HEAD' || unchanged ? null : html, { status: unchanged ? 304 : 200, headers });
+    return emptyResponse(request, originFor(request, env));
   }
   object.writeHttpMetadata(headers);
+  if (type === 'rss') headers.set('Content-Type', RSS_TYPE);
   // Serving policy overrides metadata on older stored objects too.
   headers.set('Cache-Control', image ? IMAGE_CACHE : HTML_CACHE);
   const etag = image ? object.httpEtag : `W/"${object.etag}"`;
@@ -179,8 +193,15 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     return await trace.run('public_read', async () => {
       const metadata = await metadataResource(request, env.SITE_BUCKET, origin);
       if (metadata) return metadata;
+      if (path === '/rss.xml') {
+        const index = await boundary('storage', () => env.SITE_BUCKET.head('pages/index.html'));
+        if (!index) return emptyResponse(request, originFor(request, env), true);
+        const key = index.customMetadata?.rss;
+        if (!key || !/^publications\/[a-f0-9-]{36}\.rss\.xml$/.test(key)) throw rssUnavailable();
+        return publicObject(request, env, key, 'rss');
+      }
       if (path === '/' || path === '/index.html') return publicObject(request, env, 'pages/index.html');
-      if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return publicObject(request, env, path.slice(1), true);
+      if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return publicObject(request, env, path.slice(1), 'image');
       throw new HttpError(404, 'Not found');
     });
   } catch (error) {

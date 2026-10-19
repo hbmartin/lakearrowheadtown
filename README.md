@@ -68,7 +68,7 @@ npm run rebuild:status -- preview JOB_UUID
 node scripts/smoke-preview.mjs --verify-edge
 ```
 
-The smoke check uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
+The smoke check uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. It also parses `/rss.xml`, verifies full text/images and discovery links, checks HEAD, and confirms duplicate-only submissions preserve the RSS ETag. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
 
 ### 4. Connect the domain
 
@@ -265,10 +265,11 @@ This intentionally corrects the earlier `500 publish_failed` response for digest
 
 The description and 1200 × 630 share card describe the site consistently, regardless of current headlines. JSON-LD connects the `WebSite`, homepage `CollectionPage`, and an ordered `ItemList` of exactly the visible headlines and original source URLs, including visible duplicates. It does not expose digest titles, stored post IDs, or storage references. `dateModified` uses the saved publication time and is absent before first publication.
 
-Only `https://lakearrowhead.town` is indexable. Preview, localhost, alternate production hostnames, and invalid-origin configurations receive `X-Robots-Tag: noindex`, including HEAD and 304 responses. An invalid `SITE_ORIGIN` still permits stored homepage HTML, uploaded images, bundled artwork/icons, and the manifest to load; robots rules omit sitemap advertising and the sitemap returns 404. Publishing and rendering an empty fallback homepage still require a valid origin and return 503 when it is invalid. Preview HTML also carries a `noindex` meta tag. Production HTML served from an alternate hostname retains the production canonical URL; its response header enforces `noindex` on that hostname. Crawling remains allowed so search engines can read the directive.
+Only `https://lakearrowhead.town` is indexable. Preview, localhost, alternate production hostnames, and invalid-origin configurations receive `X-Robots-Tag: noindex`, including HEAD and 304 responses. An invalid `SITE_ORIGIN` still permits stored homepage HTML and RSS, uploaded images, bundled artwork/icons, and the manifest to load; robots rules omit sitemap advertising and the sitemap returns 404. Publishing and rendering an empty fallback homepage or RSS feed still require a valid origin and return 503 when it is invalid. Preview HTML also carries a `noindex` meta tag. Production HTML served from an alternate hostname retains the production canonical URL; its response header enforces `noindex` on that hostname. Crawling remains allowed so search engines can read the directive.
 
 | Public resource | Behavior |
 | --- | --- |
+| `/rss.xml` | Full-content RSS 2.0 feed matching the homepage's saved seven-day selection and ordering. Includes images, categories, source links, and stable opaque GUIDs. |
 | `/robots.txt` | Allows public content, disallows `/api/`, and advertises the sitemap only on the production origin. |
 | `/sitemap.xml` | Production only; lists the canonical homepage. `lastmod` comes from the manifest referenced by the committed index, never the current clock or a rebuild's R2 upload time. Missing/malformed metadata omits the date; storage outages return an error. |
 | `/site.webmanifest` | English browser-mode manifest with relative root URLs, theme colors, and 192/512px icons. |
@@ -278,7 +279,11 @@ Only `https://lakearrowhead.town` is indexable. Preview, localhost, alternate pr
 | `/assets/apple-touch-icon-v1.png` | 180px Apple touch icon. |
 | `/assets/icon-192-v1.png`, `/assets/icon-512-v1.png` | Square manifest icons. |
 
-These routes support GET, HEAD, and ETag revalidation. Versioned artwork has one-year immutable caching. Robots and manifest responses are cached for one hour; the sitemap revalidates like the homepage and bypasses CDN caching. Artwork is bundled with the Worker and needs no upload to R2. Source artwork and fonts are not public routes.
+These routes support GET, HEAD, and ETag revalidation. Versioned artwork has one-year immutable caching. Robots and manifest responses are cached for one hour; the sitemap and RSS revalidate like the homepage and bypass CDN caching. Artwork is bundled with the Worker and needs no upload to R2. Source artwork and fonts are not public routes.
+
+Subscribe at `https://lakearrowhead.town/rss.xml` or use the footer's **RSS feed** link. Pages also advertise one absolute RSS autodiscovery link. Each RSS description includes the complete safe Markdown-rendered story, its images, and linked group/original-post attribution. Relative body links and images resolve against the publication's site origin. XML-invalid characters become replacement characters; raw HTML and unsafe Markdown link protocols remain disabled. RSS dates use GMT: item `pubDate` comes from `posted_at`, and `lastBuildDate` comes from the saved publication time. Before first publication, RSS is a valid empty channel without `lastBuildDate`.
+
+RSS and HTML share the exact saved seven-day selection, including equal-time ordering and historical duplicate copies. Each stored item has a stable opaque GUID derived from its private post identity and original item position; rebuilds and new publications retain existing GUIDs. RSS is rendered into a private immutable R2 object before the homepage commit stores its reference alongside the manifest reference. A failed feed write or uncommitted homepage replacement cannot expose a newer RSS snapshot. Duplicate-only submissions make no writes. Later source damage does not alter materialized RSS; omission on a new publication follows the same rules as HTML. Private RSS object keys and source IDs are never public routes or feed fields.
 
 Regenerate artwork locally with Node.js 24+ after installing dependencies:
 
@@ -288,7 +293,7 @@ npm run artwork
 
 The generator uses the existing tree path from `favicon.svg`, editable SVG templates in `assets/source/`, and bundled Instrument Serif / DM Sans fonts with their SIL Open Font Licenses. It does not require network access or installed system fonts. The share card uses the site's default cream and forest-green palette. Commit generated PNG/ICO files along with source changes. When replacing released artwork bytes, bump the versioned filenames in the site constants and Worker imports so immutable caches remain correct.
 
-Code deployment alone does not update an existing R2 homepage. Use the normal `deploy:preview` or `deploy` command, which queues a rebuild, and check its job until completed. Then check the rendered homepage, `/robots.txt`, `/sitemap.xml` on production, the manifest, and its linked images. Rebuilds apply metadata changes while retaining the saved feed selection and publication timestamp. Search engines and social platforms may take time to refresh their own cached previews.
+Code deployment alone does not update an existing R2 homepage. Use the normal `deploy:preview` or `deploy` command, which queues a rebuild, and check its job until completed. Until that rebuild or a new publication commits, pre-RSS homepages have no feed reference and `/rss.xml` returns 503 with `Retry-After: 60`; discovery links also appear only after the homepage is rebuilt. A missing referenced RSS object returns the same 503 and requires a rebuild to restore it. Storage outages remain errors rather than producing a false empty feed. Then check the rendered homepage and RSS subscription/discovery links, `/rss.xml`, `/robots.txt`, `/sitemap.xml` on production, the manifest, and its linked images. Rebuilds apply metadata changes while retaining the saved feed selection and publication timestamp. Search engines and social platforms may take time to refresh their own cached previews.
 
 ## Upload images
 
@@ -346,7 +351,7 @@ A damaged-source rebuild records `error_code: "source_damaged"` on its failed jo
 
 Only `/`, `/index.html`, `/images/<hash>.<extension>`, and the explicit metadata/artwork routes listed above are public. Old daily routes return `404`. Digest sources, publication manifests, bucket listings, artwork source files, and config files are never exposed. There is no archive listing or public administration UI.
 
-HTML supports HEAD and weak ETag revalidation, requires revalidation, permits compression, and bypasses edge caching. Malformed `If-None-Match` conditions are ignored consistently for public GET and HEAD requests. Image GETs use Workers Caching. Protected APIs always return `no-store` JSON. Maintenance CLI errors preserve HTTP status even when Cloudflare returns non-JSON content.
+HTML and RSS support HEAD and weak ETag revalidation, require revalidation, permit compression, and bypass edge caching. Malformed `If-None-Match` conditions are ignored consistently for public GET and HEAD requests. Image GETs use Workers Caching. Protected APIs always return `no-store` JSON. Maintenance CLI errors preserve HTTP status even when Cloudflare returns non-JSON content.
 
 ## API errors and request provenance
 

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { SaxesParser } from 'saxes';
 import { readCredential, validateCredential } from './credentials.mjs';
 import { maintenance, maintenanceTarget } from './maintenance.mjs';
 
@@ -36,6 +37,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     items: [{ group: 'Preview verification', group_url: 'https://lakearrowhead.town/', headline: run, body: `This is preview test content.\n\n**Markdown works.**\n\n![Uploaded image](${imageUrl})`, post_url: `https://lakearrowhead.town/?smoke=${encodeURIComponent(run)}`, category: 'announcement', posted_at: new Date().toISOString() }],
   };
   let previousTag;
+  let previousRssTag;
   let workerVersion;
   const requestIds = [];
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -57,6 +59,28 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert.equal(result.post === null, attempt === 1);
     const homepage = await fetch(origin, { headers: { 'Accept-Encoding': 'gzip', ...(previousTag ? { 'If-None-Match': previousTag } : {}) } });
     assert.equal(homepage.status, attempt === 1 ? 304 : 200, 'Duplicates must preserve the homepage and ETag');
+    const rss = await fetch(`${origin}/rss.xml`, { headers: previousRssTag ? { 'If-None-Match': previousRssTag } : {} });
+    assert.equal(rss.status, attempt === 1 ? 304 : 200, 'RSS must change with publications and remain unchanged for duplicates');
+    assert.equal(rss.headers.get('Content-Type'), 'application/rss+xml; charset=utf-8');
+    assert.equal(rss.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate');
+    assert.equal(rss.headers.get('X-Robots-Tag'), 'noindex');
+    if (attempt === 1) assert.equal(await rss.text(), '');
+    else {
+      const xml = await rss.text();
+      const text = [];
+      const parser = new SaxesParser({ xmlns: true });
+      parser.on('text', value => { text.push(value); });
+      parser.write(xml).close();
+      const decoded = text.join('\n');
+      assert(decoded.includes(input.title));
+      assert(decoded.includes('<strong>Markdown works.</strong>'));
+      assert(decoded.includes(`src="${imageUrl}"`));
+      assert(decoded.includes(input.items[0].post_url));
+      previousRssTag = rss.headers.get('etag');
+      assert(previousRssTag?.startsWith('W/'), 'RSS must expose a weak ETag');
+      const rssHead = await fetch(`${origin}/rss.xml`, { method: 'HEAD' });
+      assert.equal(rssHead.status, 200); assert.equal(rssHead.headers.get('etag'), previousRssTag); assert.equal(await rssHead.text(), '');
+    }
     if (attempt === 1) continue;
     const html = await homepage.text();
     assert(html.includes('<strong>Markdown works.</strong>'));
@@ -66,6 +90,9 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert(!html.includes('class="post-link"'));
     assert(html.indexOf('Posts from') > html.indexOf('</main>'));
     assert(!html.includes('href="/digests/'));
+    assert(html.includes('rel="alternate" type="application/rss+xml"'));
+    assert(html.includes(`href="${origin}/rss.xml"`));
+    assert(html.includes('<a href="/rss.xml">RSS feed</a>'));
     previousTag = homepage.headers.get('etag');
     assert(previousTag?.startsWith('W/'), 'HTML must expose a weak ETag');
     if (edge) assert.match(homepage.headers.get('content-encoding') || '', /gzip|br|zstd/, 'Cloudflare must compress HTML');
@@ -91,6 +118,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   assert.equal(syntaxError.diagnostics.body_sha256, createHash('sha256').update(malformedBody).digest('hex'));
   requestIds.push(syntaxError.request_id);
   assert.equal((await fetch(origin, { headers: { 'If-None-Match': previousTag } })).status, 304);
+  assert.equal((await fetch(`${origin}/rss.xml`, { headers: { 'If-None-Match': previousRssTag } })).status, 304);
   assert.equal((await fetch(`${origin}/api/digests`, { method: 'POST', body: '{}' })).status, 401);
   assert.equal((await fetch(`${origin}/digests/2026-10-16`)).status, 404);
   assert.equal((await fetch(`${origin}/posts/`)).status, 404);
