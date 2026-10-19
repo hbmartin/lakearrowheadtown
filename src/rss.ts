@@ -26,7 +26,8 @@ for (const [rule, attribute] of [['link_open', 'href'], ['image', 'src']] as con
 
 // XML 1.0 permits tabs/newlines and valid Unicode scalar values, but not lone surrogates.
 function xml(text: string): string {
-  return escapeHtml(text.replace(/[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\u{10000}-\u{10ffff}]/gu, '\ufffd'));
+  // Normalize explicitly to the LF text that XML consumers receive.
+  return escapeHtml(text.replace(/\r\n?/g, '\n').replace(/[^\u0009\u000a\u0020-\ud7ff\ue000-\ufffd\u{10000}-\u{10ffff}]/gu, '\ufffd'));
 }
 
 export function renderRss(posts: StoredPost[], options: { origin: string; publication?: Publication }): string {

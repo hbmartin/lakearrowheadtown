@@ -143,6 +143,22 @@ describe('RSS rendering', () => {
     const input = digest(); input.items[0].body = '[Malformed](http://[)';
     expect(() => parse(renderRss([stored(input)], { origin: SITE.origin, publication }))).not.toThrow();
   });
+
+  it.each(['\r', '\n', '\r\n'])('normalizes %j line endings in RSS text without changing identities', ending => {
+    const input = digest();
+    input.items[0].headline = `First${ending}Second`;
+    input.items[0].group = `Group${ending}Name`;
+    input.items[0].category = `Category${ending}Name`;
+    input.items[0].body = `First${ending}${ending}Second`;
+    const xml = renderRss([stored(input)], { origin: SITE.origin, publication });
+    const item = items(xml)[0];
+    expect(xml).not.toContain('\r');
+    expect(child(item, 'title').text).toBe('First\nSecond');
+    expect(child(item, 'category').text).toBe('Category\nName');
+    expect(child(item, 'description').text).toContain('Group\nName');
+    expect(child(item, 'description').text).toContain('<p>First</p>\n<p>Second</p>');
+    expect(child(item, 'guid').text).toBe(child(items(renderRss([stored(digest())], { origin: SITE.origin, publication }))[0], 'guid').text);
+  });
 });
 
 describe('RSS publication and serving', () => {

@@ -10,7 +10,7 @@ import { migrateProductionCredential, readCredential, readPublishingCredential, 
 import { deploy } from '../scripts/deploy.mjs';
 import { maintenance, maintenanceTarget } from '../scripts/maintenance.mjs';
 import { provisionSecret } from '../scripts/provision-secret.mjs';
-import { parseSmokeArgs, smoke } from '../scripts/smoke-preview.mjs';
+import { checkRssHeaders, parseSmokeArgs, smoke } from '../scripts/smoke-preview.mjs';
 
 const secret = 'a'.repeat(64);
 const id = '00000000-0000-0000-0000-000000000001';
@@ -276,6 +276,18 @@ test('smoke arguments support a default URL, flag alone, and either argument ord
   assert.deepEqual(parseSmokeArgs(['--verify-edge']), { origin: remote, edge: true });
   for (const args of [[remote, '--verify-edge'], ['--verify-edge', remote]]) assert.deepEqual(parseSmokeArgs(args), { origin: remote, edge: true });
   assert.deepEqual(parseSmokeArgs(['http://localhost:8787']), { origin: 'http://localhost:8787', edge: false });
+});
+test('RSS smoke checks permit 304 without Content-Type but require MIME on GET and HEAD 200s', () => {
+  const headers = { 'Cache-Control': 'public, max-age=0, must-revalidate', 'X-Robots-Tag': 'noindex' };
+  checkRssHeaders(new Response(null, { status: 304, headers }));
+  for (const body of ['<rss/>', null]) {
+    checkRssHeaders(new Response(body, { headers: { ...headers, 'Content-Type': 'application/rss+xml; charset=utf-8' } }));
+    assert.throws(() => checkRssHeaders(new Response(body, { headers: { ...headers, 'Content-Type': 'text/plain' } })));
+    assert.throws(() => checkRssHeaders(new Response(body, { headers })));
+  }
+  for (const status of [200, 304]) {
+    assert.throws(() => checkRssHeaders(new Response(null, { status, headers: { 'Content-Type': 'application/rss+xml; charset=utf-8' } })));
+  }
 });
 test('bad smoke arguments fail before reading credentials or making requests', async () => {
   for (const args of [['--unknown'], ['http://localhost:8787', 'http://localhost:8788'], ['https://evil.example'], ['--verify-edge=false']]) {
