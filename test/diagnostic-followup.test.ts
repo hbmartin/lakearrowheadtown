@@ -69,7 +69,8 @@ describe('rebuild storage diagnostics', () => {
     await inPublisher(publisher, async (instance, state) => {
       const job: RebuildJob = { id, origin, status: 'failed', phase: 'render', processed: 0, created_at: new Date().toISOString() };
       const head = { ...job, id: headId };
-      await state.storage.put({ [`job:${id}`]: job, [`job:${headId}`]: head, jobs: [headId, id] });
+      const ids = operation === 'resumeRebuild' ? [id, headId] : [headId, id];
+      await state.storage.put({ [`job:${id}`]: job, [`job:${headId}`]: head, jobs: ids });
       const get = state.storage.get.bind(state.storage) as (key: any) => Promise<any>;
       const getSpy = vi.spyOn(state.storage, 'get').mockImplementation(async (key: any) => {
         if ((fault === 'enqueue_state' && key === 'migration') || (fault === 'status_job' && key === `job:${id}`)
@@ -83,18 +84,21 @@ describe('rebuild storage diagnostics', () => {
         await expect(instance[operation](...args)).rejects.toMatchObject({ kind: 'storage' });
       } finally { getSpy.mockRestore(); transactionSpy?.mockRestore(); }
       expect(await state.storage.get(`job:${id}`)).toEqual(job);
-      expect(await state.storage.get('jobs')).toEqual([headId, id]);
+      expect(await state.storage.get('jobs')).toEqual(ids);
     });
-    const failure = events.find(event => event.event === 'rebuild_failed');
+    const failure = events.find(event => event.event === 'rebuild_request_failed');
     expect(failure).toMatchObject({ request_id: context.request_id, stage, error_code: 'storage_error', failure_kind: 'storage' });
-    expect(failure.job_id).toBeTruthy();
+    expect(operation === 'enqueueRebuild' ? failure.candidate_job_id : failure.job_id).toBeTruthy();
+    expect(failure.publication_status).toBeUndefined();
+    if (operation === 'enqueueRebuild') expect(failure.job_id).toBeUndefined();
     expect(events).toContainEqual(expect.objectContaining({ event: 'operation_stage', stage, outcome: 'error' }));
     expect(JSON.stringify(events)).not.toMatch(/private storage detail|private transaction detail/);
   });
-  it.each(['jobs', `job:${id}`])('leaves bootstrap state intact and succeeds on platform redelivery after a failed %s read', async failedKey => {
+  it.each(['jobs', `job:${id}`])('keeps state after a scheduled %s read failure and completes on simulated redelivery', async failedKey => {
     const publisher = bindings.PUBLISHER.getByName('site');
-    await inPublisher(publisher, async (instance, state) => {
-      const job: RebuildJob = { id, origin, status: 'queued', phase: 'render', processed: 0, created_at: new Date().toISOString(), context };
+    const job: RebuildJob = { id, origin, status: 'queued', phase: 'render', processed: 0, created_at: new Date().toISOString(), context };
+    let restore!: () => void;
+    await inPublisher(publisher, async (_instance, state) => {
       await state.storage.put({ jobs: [id], [`job:${id}`]: job, migration: { complete: true, processed: 0 } });
       await state.storage.setAlarm(Date.now() + 1000);
       const get = state.storage.get.bind(state.storage) as (key: any) => Promise<any>;
@@ -102,20 +106,27 @@ describe('rebuild storage diagnostics', () => {
         if (key === failedKey) throw new Error('private bootstrap detail');
         return get(key);
       });
-      try { await expect(instance.alarm()).rejects.toMatchObject({ kind: 'storage' }); }
-      finally { spy.mockRestore(); }
+      restore = () => spy.mockRestore();
+    });
+    try { await expect(runDurableObjectAlarm(publisher)).rejects.toMatchObject({ kind: 'storage' }); }
+    finally { restore(); }
+    await inPublisher(publisher, async (_instance, state) => {
       expect(await state.storage.get('jobs')).toEqual([id]);
       expect(await state.storage.get(`job:${id}`)).toEqual(job);
-      expect(await state.storage.getAlarm()).not.toBeNull();
+      // The helper consumed the scheduled alarm. It does not model platform retries.
+      expect(await state.storage.getAlarm()).toBeNull();
       expect(await bindings.SITE_BUCKET.head('pages/index.html')).toBeNull();
+      // Explicitly simulate the platform scheduling another delivery.
+      await state.storage.setAlarm(Date.now() + 1000);
     });
-    const failed = events.find(event => event.event === 'rebuild_failed');
+    const failed = events.find(event => event.event === 'rebuild_alarm_failed');
     expect(failed).toMatchObject({ error_code: 'storage_error', stage: failedKey === 'jobs' ? 'rebuild_queue_read' : 'rebuild_job_read', operation: 'rebuild' });
+    expect(failed.publication_status).toBeUndefined();
     expect(failed.request_id).toMatch(/^[a-f0-9-]{36}$/);
     expect(failed.worker_version).toBeTruthy();
     expect(failed.environment).toBeTruthy();
     if (failedKey !== 'jobs') expect(failed.job_id).toBe(id);
-    await runDurableObjectAlarm(publisher);
+    expect(await runDurableObjectAlarm(publisher)).toBe(true);
     expect(await publisher.jobStatus(id)).toMatchObject({ status: 'completed' });
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_completed', job_id: id, request_id: context.request_id }));
     expect(JSON.stringify(events)).not.toContain('private bootstrap detail');
@@ -139,7 +150,7 @@ describe('rebuild storage diagnostics', () => {
     expect(response.status).toBe(503);
     const result = await response.json<any>();
     expect(result).toMatchObject({ code: 'service_unavailable', retryable: true, diagnostics: { stage: 'rebuild_status' } });
-    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_failed', error_code: 'storage_error', stage: 'rebuild_status_read', job_id: id, request_id: result.request_id }));
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_request_failed', error_code: 'storage_error', stage: 'rebuild_status_read', job_id: id, request_id: result.request_id }));
     expect(JSON.stringify(events)).not.toContain('private storage RPC detail');
   });
   it.each(['missing', 'invalid_json', 'invalid_digest'] as const)('identifies a %s source without logging its contents and resumes after restoration', async reason => {

@@ -56,6 +56,7 @@ export function renderMetadata(origin: string, items: DigestItem[], publishedAt?
   return [
     `<title>${escapeHtml(SITE.title)}</title>`,
     `<link rel="canonical" href="${escapeHtml(url)}">`,
+    `<link rel="alternate" type="application/rss+xml" title="${escapeHtml(SITE.title)}" href="${escapeHtml(origin)}/rss.xml">`,
     ...Object.entries(named).map(([name, content]) => `<meta name="${name}" content="${escapeHtml(content)}">`),
     ...Object.entries(properties).map(([property, content]) => `<meta property="${property}" content="${escapeHtml(content)}">`),
     '<link rel="icon" type="image/svg+xml" sizes="any" href="/favicon.svg">',

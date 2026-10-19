@@ -197,7 +197,7 @@ describe('commit failures and retries', () => {
     try { await publisher.publish(input('https://example.com/failure'), base); }
     catch { rejected = true; }
     expect(rejected).toBe(true);
-    expect(await publisher.publishV2(input('https://example.com/failure'), base)).toMatchObject({ ok: false, failure: { status: 500, code: 'internal_error', retryable: false, publication_status: 'not_committed' } });
+    expect(await publisher.publishV2(input('https://example.com/failure'), base)).toMatchObject({ ok: false, failure: { status: 500, code: 'manifest_damaged', retryable: false, publication_status: 'not_committed' } });
   });
   it.each([undefined, { ok: true }, { ok: false, failure: { status: '500' } }])('rejects invalid RPC replies without falling back to a legacy publish: %j', async reply => {
     const legacy = vi.fn();

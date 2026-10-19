@@ -1,7 +1,8 @@
 import { recentDates, renderPage } from './render';
+import { renderRss, RSS_TYPE } from './rss';
 import { HttpError, isDate, validateDigest } from './validation';
 import { emit, fingerprint, OperationTrace } from './diagnostics';
-import { boundary, DamagedSource } from './errors';
+import { boundary, DamagedManifest, DamagedSource } from './errors';
 import type { ContentBucket, Digest, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishResult, StoredPost } from './types';
 
 export const HTML_CACHE = 'public, max-age=0, must-revalidate';
@@ -54,8 +55,16 @@ export async function currentPublication(bucket: ContentBucket): Promise<Publica
   const key = index?.customMetadata?.manifest;
   if (key) {
     const object = await boundary('storage', () => bucket.get(key));
-    if (!object) throw new Error('Missing publication manifest');
-    return JSON.parse(await boundary('storage', () => object.text())) as Publication;
+    if (!object) throw new DamagedManifest(key, 'missing');
+    const text = await boundary('storage', () => object.text());
+    let publication: unknown;
+    try { publication = JSON.parse(text); }
+    catch (error) {
+      if (error instanceof SyntaxError) throw new DamagedManifest(key, 'invalid_json');
+      throw error;
+    }
+    if (!isPublication(publication)) throw new DamagedManifest(key, 'invalid_manifest');
+    return publication;
   }
   // Bootstrap old deployments using server storage times, never client dates.
   const legacy = await legacyReferences(bucket);
@@ -64,14 +73,31 @@ export async function currentPublication(bucket: ContentBucket): Promise<Publica
   return { version: 1, posts: legacy.filter(post => days.includes(post.date)).sort(order), snapshot_date: days[0] ?? null, published_at: anchor?.toISOString() ?? null };
 }
 
+function isPublication(value: unknown): value is Publication {
+  const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+  const text = (value: unknown): value is string => typeof value === 'string' && !!value.trim();
+  const date = (value: unknown) => typeof value === 'string' && isDate(value);
+  const timestamp = (value: unknown) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    && isDate(value.slice(0, 10)) && Number.isFinite(Date.parse(value));
+  const refs = (value: unknown) => Array.isArray(value) && value.every(ref => record(ref)
+    && text(ref.id) && text(ref.key) && date(ref.date) && timestamp(ref.received_at));
+  return record(value) && value.version === 1 && refs(value.posts)
+    && (value.omitted_posts === undefined || refs(value.omitted_posts))
+    && (value.snapshot_date === null || date(value.snapshot_date))
+    && (value.published_at === null || timestamp(value.published_at));
+}
+
 async function writeHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, trace = new OperationTrace()): Promise<void> {
   const html = await trace.run('rendering', () => boundary('rendering', () => renderPage(posts, { origin, publication })));
+  const feed = await trace.run('rss_rendering', () => boundary('rendering', () => renderRss(posts, { origin, publication })));
   const manifest = `publications/${crypto.randomUUID()}.json`;
+  const rss = manifest.replace(/\.json$/, '.rss.xml');
   const serialized = JSON.stringify(publication);
   await trace.run('manifest_write', () => boundary('storage', () => bucket.put(manifest, serialized, { httpMetadata: { contentType: 'application/json' } })));
-  // The single index replacement commits both HTML and its manifest reference.
+  await trace.run('rss_write', () => boundary('storage', () => bucket.put(rss, feed, { httpMetadata: { contentType: RSS_TYPE, cacheControl: HTML_CACHE } })));
+  // The single index replacement commits HTML and both immutable snapshot references.
   trace.publication_status = 'unknown';
-  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest } })));
+  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest, rss } })));
   trace.publication_status = 'committed';
 }
 
