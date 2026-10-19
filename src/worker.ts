@@ -4,9 +4,10 @@ import { hashBytes, IMAGE_CACHE, imageUpload, withImageUploadSlot } from './imag
 import { HTML_CACHE } from './publishing';
 import { renderPage } from './render';
 import { isIndexable, metadataResource } from './public-metadata';
-import type { Env, OperationContext, PublicationStatus, PublishReply, PublishResult, RebuildJob } from './types';
+import type { Env, OperationContext, PublicationStatus, PublishResult, RebuildJob } from './types';
 import { emit, fingerprint, OperationTrace, safeError } from './diagnostics';
 import { HttpError, parseDigestJson, readLimited, validateDigest } from './validation';
+import { asHttpError, boundary, declaredBodyBytes, isPublishReply, OperationFailure, publicationFailure } from './errors';
 export { DigestPublisher } from './publisher';
 
 function json(value: unknown, status = 200, headers: HeadersInit = {}): Response {
@@ -44,12 +45,12 @@ function fallbackFor(origin: string): Promise<{ html: string; etag: string }> {
 
 async function publicObject(request: Request, env: Env, key: string, image = false): Promise<Response> {
   const condition = parseIfNoneMatch(request.headers.get('if-none-match'));
-  const object = request.method === 'HEAD'
-    ? await env.SITE_BUCKET.head(key)
-    : await env.SITE_BUCKET.get(key, condition ? { onlyIf: new Headers({ 'If-None-Match': condition.header }) } : undefined);
+  const object = await boundary('storage', () => request.method === 'HEAD'
+    ? env.SITE_BUCKET.head(key)
+    : env.SITE_BUCKET.get(key, condition ? { onlyIf: new Headers({ 'If-None-Match': condition.header }) } : undefined));
   const headers = new Headers({ 'Cloudflare-CDN-Cache-Control': image ? IMAGE_CACHE : 'no-store', 'X-Content-Type-Options': 'nosniff' });
   if (!object) {
-    if (key !== 'pages/index.html') return json({ ok: false, error: 'Not found' }, 404);
+    if (key !== 'pages/index.html') throw new HttpError(404, 'Not found');
     const { html, etag } = await fallbackFor(originFor(request, env));
     headers.set('Cache-Control', HTML_CACHE);
     headers.set('Content-Type', 'text/html; charset=utf-8');
@@ -77,11 +78,13 @@ interface RequestState {
   trace: OperationTrace;
   error_code?: string;
   bytes_received?: number;
+  declared_body_bytes?: number;
   body_sha256?: string;
   body_complete?: boolean;
   counts?: PublishResult['counts'];
   post_id?: string;
   publication_status?: PublicationStatus;
+  publication_outcome?: 'published' | 'duplicate' | 'failed';
 }
 
 async function handle(request: Request, env: Env, state: RequestState): Promise<Response> {
@@ -96,16 +99,17 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       const publisher = env.PUBLISHER.getByName('site');
       if (!maintenance[1] && request.method === 'POST') {
-        const job = await trace.run('enqueue_rebuild', () => publisher.enqueueRebuild(originFor(request, env), context));
+        const origin = originFor(request, env);
+        const job = await trace.run('enqueue_rebuild', () => boundary('rpc', () => publisher.enqueueRebuild(origin, context)));
         return reply({ ok: true, job }, 202);
       }
       if (maintenance[1] && !maintenance[2] && request.method === 'GET') {
-        const job = await trace.run('rebuild_status', () => publisher.jobStatus(maintenance[1]));
+        const job = await trace.run('rebuild_status', () => boundary('rpc', () => publisher.jobStatus(maintenance[1])));
         if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
         return reply({ ok: true, job });
       }
       if (maintenance[2] && request.method === 'POST') {
-        const job = await trace.run<RebuildJob | 'conflict' | null>('resume_rebuild', async () => await publisher.resumeRebuild(maintenance[1], context));
+        const job = await trace.run<RebuildJob | 'conflict' | null>('resume_rebuild', () => boundary('rpc', async () => await publisher.resumeRebuild(maintenance[1], context)));
         if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
         if (job === 'conflict') throw new HttpError(409, 'Only failed jobs can resume', {}, { code: 'job_not_failed' });
         return reply({ ok: true, job }, 202);
@@ -115,41 +119,46 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     if (path === '/api/digests' || path === '/api/images') {
       if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
-      trace.stage = 'configuration';
-      const origin = originFor(request, env);
+      state.bytes_received = 0;
+      state.body_complete = false;
+      state.declared_body_bytes = declaredBodyBytes(request);
+      const origin = await trace.run('configuration', () => originFor(request, env));
       if (path === '/api/digests') {
-        trace.stage = 'content_type';
-        if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json', {}, { details: { expected: 'application/json' } });
-        state.bytes_received = 0;
-        state.body_complete = false;
+        await trace.run('content_type', () => {
+          if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json', {}, { details: { expected: 'application/json' } });
+        });
         const bytes = await trace.run('body_reading', () => readLimited(request, 1024 * 1024, bytes => { state.bytes_received = bytes; }));
         state.bytes_received = bytes.byteLength;
         state.body_complete = true;
         state.body_sha256 = fingerprint(new Uint8Array(bytes));
         const input = await trace.run('parsing', () => parseDigestJson(bytes));
         const digest = await trace.run('validation', () => validateDigest(input, { requireItems: true }));
-        trace.stage = 'publisher_lookup';
-        const publisher = env.PUBLISHER.getByName('site');
+        const publisher = await trace.run('publisher_lookup', () => boundary('rpc', () => env.PUBLISHER.getByName('site')));
         publicationAttempted = true;
         state.publication_status = 'unknown';
-        const result = await trace.run<PublishReply>('publisher_rpc', async () => await publisher.publish(digest, origin, context));
-        if (!result.ok) {
-          state.publication_status = result.failure.publication_status;
-          trace.stage = result.failure.stage;
-          throw new HttpError(500, result.failure.error, {}, { code: result.failure.code, details: { stage: result.failure.stage }, retryable: result.failure.retryable, publication_status: result.failure.publication_status });
-        }
-        state.counts = result.result.counts;
-        state.post_id = result.result.post?.id;
-        state.publication_status = result.result.post ? 'committed' : 'not_committed';
-        return reply({ ok: true, url: '/', ...result.result });
+        const rpc = { transport_outcome: 'error' };
+        const result = await trace.run('publisher_rpc', async () => {
+          const received: unknown = await boundary('rpc', async () => await publisher.publishV2(digest, origin, context));
+          rpc.transport_outcome = 'ok';
+          if (!isPublishReply(received)) throw new OperationFailure('rpc', new Error('Invalid publisher reply'));
+          if (!received.ok) {
+            const f = received.failure;
+            throw new HttpError(f.status, f.error, {}, { code: f.code, details: { stage: f.stage }, retryable: f.retryable, publication_status: f.publication_status });
+          }
+          return received.result;
+        }, rpc);
+        state.counts = result.counts;
+        state.post_id = result.post?.id;
+        state.publication_status = result.post ? 'committed' : undefined;
+        state.publication_outcome = result.duplicate ? 'duplicate' : 'published';
+        return reply({ ok: true, url: '/', ...result });
       }
-      trace.stage = 'upload_admission';
-      return await withImageUploadSlot(async () => {
+      return await trace.run('upload_admission', () => withImageUploadSlot(async () => {
         const image = await trace.run('image_validation', () => imageUpload(request, (bytes, complete) => { state.bytes_received = bytes; state.body_complete = complete ?? false; }));
         const key = `images/${image.hash}.${image.extension}`;
-        await trace.run('image_write', () => env.SITE_BUCKET.put(key, image.file.stream(), { httpMetadata: { contentType: image.type, cacheControl: IMAGE_CACHE } }));
+        await trace.run('image_write', () => boundary('storage', () => env.SITE_BUCKET.put(key, image.file.stream(), { httpMetadata: { contentType: image.type, cacheControl: IMAGE_CACHE } })));
         return reply({ ok: true, url: `${origin}/${key}` });
-      });
+      }));
     }
     if (!['GET', 'HEAD'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD' });
     let origin = '';
@@ -164,17 +173,23 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     });
   } catch (error) {
     const expected = error instanceof HttpError;
-    const failure = expected ? error : new HttpError(500, publicationAttempted
-      ? 'Unable to publish digest; publication may have completed. Retry the unchanged payload within the seven-day deduplication window.'
-      : { digest: 'Unable to process digest', image: 'Unable to upload image', rebuild: 'Unable to complete rebuild request', read: 'Unable to load content' }[context.operation] ?? 'Unable to complete request', {}, {
-        code: publicationAttempted ? 'publish_failed' : trace.stage === 'body_reading' ? 'body_read_failed' : trace.stage === 'image_write' || trace.stage === 'public_read' ? 'storage_error' : 'internal_error',
-      });
+    let failure = asHttpError(error);
+    const detailStage = !Array.isArray(failure.details) && typeof failure.details.stage === 'string' ? failure.details.stage : undefined;
+    const stage = detailStage ?? trace.failed_stage ?? trace.stage ?? 'request_processing';
+    if (context.operation === 'digest') {
+      state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
+      state.publication_outcome = 'failed';
+      if (publicationAttempted) {
+        const f = publicationFailure(error, stage, state.publication_status);
+        failure = new HttpError(f.status, f.error, failure.headers, { code: f.code, details: failure.details, retryable: f.retryable, publication_status: f.publication_status });
+      }
+    }
     state.error_code = failure.code;
-    if (context.operation === 'digest') state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
-    const diagnostics = { stage: trace.stage, ...(state.bytes_received !== undefined ? { bytes_received: state.bytes_received, body_complete: state.body_complete ?? false } : {}), ...(state.body_sha256 ? { body_sha256: state.body_sha256 } : {}) };
-    emit('request_error', context, { error_code: failure.code, status: failure.status, ...diagnostics, publication_status: state.publication_status,
+    const diagnostics = { stage, ...(state.bytes_received !== undefined ? { bytes_received: state.bytes_received, body_complete: state.body_complete ?? false } : {}), ...(state.declared_body_bytes !== undefined ? { declared_body_bytes: state.declared_body_bytes } : {}), ...(state.body_sha256 ? { body_sha256: state.body_sha256 } : {}) };
+    emit('request_error', context, { error_code: failure.code, status: failure.status, ...diagnostics, publication_status: state.publication_status, publication_outcome: state.publication_outcome,
       ...(Array.isArray(failure.details) ? { issues: failure.details.map(({ path, code }) => ({ path, code })), details_truncated: failure.details_truncated } : {}),
       ...(!expected ? safeError(error) : {}) }, failure.status >= 500 ? 'error' : 'warn');
+    if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
     return reply({ ok: false, error: failure.message, code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
       diagnostics, ...(context.operation === 'digest' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
   }
@@ -206,7 +221,7 @@ export default {
     const media = request.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
     emit('request_completed', context, { route: route.route, method: request.method, status: response.status, error_code: state.error_code,
       duration_ms: performance.now() - started, response_etag: response.headers.get('etag') ?? undefined, content_type: media && ['application/json', 'multipart/form-data', 'text/plain'].includes(media) ? media : 'other',
-      bytes_received: state.bytes_received, body_complete: state.body_complete, body_sha256: state.body_sha256, counts: state.counts, post_id: state.post_id, publication_status: state.publication_status });
+      bytes_received: state.bytes_received, declared_body_bytes: state.declared_body_bytes, body_complete: state.body_complete, body_sha256: state.body_sha256, counts: state.counts, post_id: state.post_id, publication_status: state.publication_status, publication_outcome: state.publication_outcome });
     // Stored HTML may have production metadata even when served from workers.dev.
     // Apply the actual serving-origin policy to every response, including 304s.
     let indexable = false;

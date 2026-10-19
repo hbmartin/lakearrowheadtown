@@ -154,9 +154,9 @@ describe('append-only publication', () => {
     expect(await (await fetch('/')).text()).not.toContain('Uncommitted');
   });
   it('returns an honest failure message without promising safe retries', async () => {
-    const PUBLISHER = { getByName: () => ({ publish: () => { throw new Error('private storage detail'); } }) } as unknown as Env['PUBLISHER'];
+    const PUBLISHER = { getByName: () => ({ publishV2: () => { throw new Error('private storage detail'); } }) } as unknown as Env['PUBLISHER'];
     const response = await fetch('/api/digests', { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(digest()) }, { PUBLISHER });
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(503);
     expect(await response.text()).not.toMatch(/retry safely|private storage detail/);
   });
 });
@@ -263,7 +263,7 @@ describe('request failure context', () => {
   it('reserves the publication uncertainty warning for an attempted publisher call', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const failed = () => { throw new Error('private storage detail'); };
-    const PUBLISHER = { getByName: () => ({ publish: failed, enqueueRebuild: failed, jobStatus: failed, resumeRebuild: failed }) } as unknown as Env['PUBLISHER'];
+    const PUBLISHER = { getByName: () => ({ publishV2: failed, enqueueRebuild: failed, jobStatus: failed, resumeRebuild: failed }) } as unknown as Env['PUBLISHER'];
     const SITE_BUCKET = { get: failed, head: failed, put: failed } as unknown as R2Bucket;
     const id = '00000000-0000-0000-0000-000000000000';
     const responses = [
@@ -274,12 +274,12 @@ describe('request failure context', () => {
       await fetch(`/api/rebuild/${id}/resume`, { method: 'POST', headers: auth }, { PUBLISHER }),
       await fetch('/api/digests', { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(digest()) }, { PUBLISHER: { getByName: failed } as unknown as Env['PUBLISHER'] }),
     ];
-    for (const response of responses) {
-      expect(response.status).toBe(500);
-      expect(await response.text()).not.toMatch(/publication may have completed|homepage before posting|private storage detail/);
+    for (const [index, response] of responses.entries()) {
+      expect(response.status).toBe(index < 4 ? 500 : 503);
+      expect(await response.text()).not.toMatch(/may have completed|homepage before posting|private storage detail/);
     }
     const response = await fetch('/api/digests', { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(digest()) }, { PUBLISHER });
-    expect(response.status).toBe(500); expect(await response.text()).toContain('publication may have completed');
+    expect(response.status).toBe(503); expect(await response.text()).toContain('may have completed');
   });
 });
 
@@ -722,7 +722,7 @@ describe('migration and durable rebuild jobs', () => {
     await legacy('2024-01-01'); await legacy('2024-01-02');
     let copied = 0;
     const broken = bucketWith({ put: async (key, value, options) => { if (++copied === 2) throw new Error('interrupted'); return bindings.SITE_BUCKET.put(key, value, options); } });
-    await expect(migrateBatch(broken, initialMigration())).rejects.toThrow('interrupted');
+    await expect(migrateBatch(broken, initialMigration())).rejects.toMatchObject({ kind: 'storage', cause: { message: 'interrupted' } });
     expect((await bindings.SITE_BUCKET.list({ prefix: 'posts/' })).objects).toHaveLength(1);
     expect((await migrateBatch(bindings.SITE_BUCKET, initialMigration())).complete).toBe(true);
     expect((await bindings.SITE_BUCKET.list({ prefix: 'posts/' })).objects).toHaveLength(2);

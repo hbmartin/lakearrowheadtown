@@ -1,6 +1,7 @@
 import { recentDates, renderPage } from './render';
 import { HttpError, isDate, validateDigest } from './validation';
 import { emit, fingerprint, OperationTrace } from './diagnostics';
+import { boundary } from './errors';
 import type { ContentBucket, Digest, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishResult, StoredPost } from './types';
 
 export const HTML_CACHE = 'public, max-age=0, must-revalidate';
@@ -18,7 +19,7 @@ async function legacyReferences(bucket: ContentBucket): Promise<PostReference[]>
   const references: PostReference[] = [];
   let cursor: string | undefined;
   do {
-    const page = await bucket.list({ prefix: 'digests/', cursor });
+    const page = await boundary('storage', () => bucket.list({ prefix: 'digests/', cursor }));
     for (const object of page.objects) {
       const ref = legacyReference(object);
       if (ref) references.push(ref);
@@ -33,10 +34,10 @@ class DamagedSource extends Error {
 }
 
 export async function loadPost(bucket: ContentBucket, ref: PostReference): Promise<StoredPost> {
-  const source = await bucket.get(ref.key);
+  const source = await boundary('storage', () => bucket.get(ref.key));
   if (!source) throw new DamagedSource('missing');
   // Keep body transport errors outside the parse/validation catches.
-  const text = await source.text();
+  const text = await boundary('storage', () => source.text());
   let input: unknown;
   try { input = JSON.parse(text); }
   catch (error) {
@@ -53,12 +54,12 @@ export async function loadPost(bucket: ContentBucket, ref: PostReference): Promi
 }
 
 export async function currentPublication(bucket: ContentBucket): Promise<Publication> {
-  const index = await bucket.head('pages/index.html');
+  const index = await boundary('storage', () => bucket.head('pages/index.html'));
   const key = index?.customMetadata?.manifest;
   if (key) {
-    const object = await bucket.get(key);
+    const object = await boundary('storage', () => bucket.get(key));
     if (!object) throw new Error('Missing publication manifest');
-    return object.json<Publication>();
+    return JSON.parse(await boundary('storage', () => object.text())) as Publication;
   }
   // Bootstrap old deployments using server storage times, never client dates.
   const legacy = await legacyReferences(bucket);
@@ -68,12 +69,13 @@ export async function currentPublication(bucket: ContentBucket): Promise<Publica
 }
 
 async function writeHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, trace = new OperationTrace()): Promise<void> {
-  const html = await trace.run('rendering', () => renderPage(posts, { origin, publication }));
+  const html = await trace.run('rendering', () => boundary('rendering', () => renderPage(posts, { origin, publication })));
   const manifest = `publications/${crypto.randomUUID()}.json`;
-  await trace.run('manifest_write', () => bucket.put(manifest, JSON.stringify(publication), { httpMetadata: { contentType: 'application/json' } }));
+  const serialized = JSON.stringify(publication);
+  await trace.run('manifest_write', () => boundary('storage', () => bucket.put(manifest, serialized, { httpMetadata: { contentType: 'application/json' } })));
   // The single index replacement commits both HTML and its manifest reference.
   trace.publication_status = 'unknown';
-  await trace.run('index_write', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest } }));
+  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest } })));
   trace.publication_status = 'committed';
 }
 
@@ -91,10 +93,8 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
     const posts: StoredPost[] = [];
     const selected: PostReference[] = [];
     const omitted: PostReference[] = [];
-    let committedIds = new Set<string>();
     await trace.run('source_loading', async () => {
       const previous = await currentPublication(bucket);
-      committedIds = new Set(previous.posts.map(ref => ref.id));
       // Existing references take precedence over duplicate legacy backup objects.
       const candidates = [...(!migrationComplete ? await legacyReferences(bucket) : []), ...(previous.omitted_posts ?? []), ...previous.posts];
       const refs = [...new Map(candidates.filter(ref => days.includes(ref.date)).map(ref => [ref.id, ref])).values()].sort(order);
@@ -115,7 +115,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
     const items = await trace.run('duplicate_filtering', () => {
       const known = new Map<string, { post_id: string; item_index: number }>();
       // Oldest receipt wins; input item positions break the remaining ties.
-      for (const old of posts.filter(post => committedIds.has(post.id)).sort((a, b) => a.received_at.localeCompare(b.received_at) || a.id.localeCompare(b.id))) {
+      for (const old of [...posts].sort((a, b) => a.received_at.localeCompare(b.received_at) || a.id.localeCompare(b.id))) {
         old.items.forEach((item, item_index) => {
           if (!known.has(item.post_url)) known.set(item.post_url, { post_id: old.id, item_index });
         });
@@ -131,7 +131,8 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
     });
     const counts = { submitted: items.length, published: post.items.length, duplicates: items.length - post.items.length };
     if (post.items.length) {
-      await trace.run('source_write', () => bucket.put(postKey(post), JSON.stringify(post), { httpMetadata: { contentType: 'application/json' } }));
+      const serialized = JSON.stringify(post);
+      await trace.run('source_write', () => boundary('storage', () => bucket.put(postKey(post), serialized, { httpMetadata: { contentType: 'application/json' } })));
       posts.push(post);
       selected.push(reference(post));
       selected.sort(order);
@@ -143,22 +144,23 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
       post: post.items.length ? { id: post.id, date: post.date, received_at: post.received_at } : null,
       duplicate: items.length > 0 && post.items.length === 0, counts, items,
     };
-    emit('publish_result', context, { ...counts, post_id: result.post?.id, duplicate: result.duplicate, publication_status: trace.publication_status, duplicate_url_hashes: items.filter(item => item.status === 'duplicate').slice(0, 20).map(item => fingerprint(digest.items[item.index].post_url)) });
+    emit('publish_result', context, { ...counts, post_id: result.post?.id, duplicate: result.duplicate, publication_outcome: result.duplicate ? 'duplicate' : 'published', ...(result.duplicate ? {} : { publication_status: trace.publication_status }), duplicate_url_hashes: items.filter(item => item.status === 'duplicate').slice(0, 20).map(item => fingerprint(digest.items[item.index].post_url)) });
     return result;
   } catch (error) {
-    throw new PublicationError(trace.publication_status, trace.stage, error);
+    throw new PublicationError(trace.publication_status, trace.failed_stage ?? trace.stage ?? 'publication_processing', error);
   }
 }
 
 export async function migrateBatch(bucket: ContentBucket, migration: Migration): Promise<Migration> {
   if (migration.complete) return migration;
-  const page = await bucket.list({ prefix: 'digests/', cursor: migration.cursor, limit: 25 });
+  const page = await boundary('storage', () => bucket.list({ prefix: 'digests/', cursor: migration.cursor, limit: 25 }));
   let processed = migration.processed;
   for (const object of page.objects) {
     const ref = legacyReference(object);
     if (!ref) continue;
     const post = await loadPost(bucket, ref);
-    await bucket.put(postKey(post), JSON.stringify(post), { onlyIf: { etagDoesNotMatch: '*' }, httpMetadata: { contentType: 'application/json' } });
+    const serialized = JSON.stringify(post);
+    await boundary('storage', () => bucket.put(postKey(post), serialized, { onlyIf: { etagDoesNotMatch: '*' }, httpMetadata: { contentType: 'application/json' } }));
     processed++;
   }
   return { processed, complete: !page.truncated, ...(page.truncated ? { cursor: page.cursor } : {}) };

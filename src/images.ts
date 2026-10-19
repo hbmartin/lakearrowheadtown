@@ -1,25 +1,39 @@
 import { createHash } from 'node:crypto';
 import { HttpError } from './validation';
+import { boundary, declaredBodyBytes } from './errors';
 
 export const IMAGE_LIMIT = 10 * 1024 * 1024;
 export const IMAGE_CACHE = 'public, max-age=31536000, immutable';
 let activeUploads = 0;
 
 export async function withImageUploadSlot<T>(action: () => Promise<T>): Promise<T> {
-  if (activeUploads >= 2) throw new HttpError(503, 'Image uploads are busy', { 'Retry-After': '1' }, { code: 'uploads_busy' });
+  if (activeUploads >= 2) throw new HttpError(503, 'Image uploads are busy', { 'Retry-After': '1' }, { code: 'uploads_busy', retryable: true });
   activeUploads++;
   try { return await action(); }
   finally { activeUploads--; }
 }
 
 export async function imageUpload(request: Request, onBytes?: (bytes: number, complete?: boolean) => void): Promise<{ file: File; hash: string; type: string; extension: string }> {
+  onBytes?.(0, request.body === null);
   const contentType = request.headers.get('content-type');
   if (!contentType?.toLowerCase().startsWith('multipart/form-data;')) throw new HttpError(415, 'Expected multipart/form-data');
   const limit = IMAGE_LIMIT + 64 * 1024;
-  if (Number(request.headers.get('content-length')) > limit) throw new HttpError(413, 'Request is too large');
+  if ((declaredBodyBytes(request) ?? 0) > limit) throw new HttpError(413, 'Request is too large');
   let size = 0;
   let overflow: HttpError | undefined;
-  const bounded = request.body?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+  let transportFailure: unknown;
+  const reader = request.body?.getReader();
+  const counted = reader ? new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await boundary('body', () => reader.read());
+        if (done) { onBytes?.(size, true); controller.close(); reader.releaseLock(); }
+        else controller.enqueue(value);
+      } catch (error) { transportFailure = error; controller.error(error); reader.releaseLock(); }
+    },
+    async cancel(reason) { try { await reader.cancel(reason); } finally { reader.releaseLock(); } },
+  }, { highWaterMark: 0 }) : null;
+  const bounded = counted?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       size += chunk.byteLength;
       onBytes?.(size);
@@ -32,8 +46,7 @@ export async function imageUpload(request: Request, onBytes?: (bytes: number, co
   }));
   let form: FormData;
   try { form = await new Response(bounded, { headers: { 'content-type': contentType } }).formData(); }
-  catch { throw overflow ?? new HttpError(400, 'Invalid multipart form', {}, { code: 'invalid_multipart' }); }
-  onBytes?.(size, true);
+  catch { throw overflow ?? transportFailure ?? new HttpError(400, 'Invalid multipart form', {}, { code: 'invalid_multipart' }); }
   const entries = [...form.entries()];
   const file = form.get('file');
   if (entries.length !== 1 || !(file instanceof File)) throw new HttpError(400, 'Expected one file field named file', {}, { code: 'invalid_file_field', details: { field: 'file', expected_files: 1 } });
