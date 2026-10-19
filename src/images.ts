@@ -14,11 +14,12 @@ export async function withImageUploadSlot<T>(action: () => Promise<T>): Promise<
 }
 
 export async function imageUpload(request: Request, onBytes?: (bytes: number, complete?: boolean) => void): Promise<{ file: File; hash: string; type: string; extension: string }> {
-  onBytes?.(0, request.body === null);
+  onBytes?.(0, false);
   const contentType = request.headers.get('content-type');
   if (!contentType?.toLowerCase().startsWith('multipart/form-data;')) throw new HttpError(415, 'Expected multipart/form-data');
   const limit = IMAGE_LIMIT + 64 * 1024;
   if ((declaredBodyBytes(request) ?? 0) > limit) throw new HttpError(413, 'Request is too large');
+  if (request.body === null) onBytes?.(0, true);
   let size = 0;
   let overflow: HttpError | undefined;
   let transportFailure: unknown;

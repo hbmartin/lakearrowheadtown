@@ -304,11 +304,13 @@ describe('actionable diagnostics', () => {
   });
   it.each(['/api/digests', '/api/images'])('distinguishes declared size from bytes read on early rejection at %s', async path => {
     const length = path.endsWith('images') ? IMAGE_LIMIT + 65537 : 1048577;
-    const response = await request(path, { method: 'POST', headers: { ...headers, 'Content-Type': path.endsWith('images') ? 'multipart/form-data; boundary=test' : 'application/json', 'Content-Length': String(length) }, body: 'small' });
-    expect(response.status).toBe(413);
-    const result = await response.json<any>();
-    expect(result.diagnostics).toMatchObject({ declared_body_bytes: length, bytes_received: 0, body_complete: false });
-    expect(result.diagnostics.body_sha256).toBeUndefined();
+    for (const body of ['small', undefined]) {
+      const response = await request(path, { method: 'POST', headers: { ...headers, 'Content-Type': path.endsWith('images') ? 'multipart/form-data; boundary=test' : 'application/json', 'Content-Length': String(length) }, body });
+      expect(response.status).toBe(413);
+      const result = await response.json<any>();
+      expect(result.diagnostics).toMatchObject({ declared_body_bytes: length, bytes_received: 0, body_complete: false });
+      expect(result.diagnostics.body_sha256).toBeUndefined();
+    }
   });
   it('records EOF for a fully read but malformed multipart body', async () => {
     const body = '--test\r\nContent-Disposition: form-data; name="file"; filename="x"\r\n\r\npayload';
