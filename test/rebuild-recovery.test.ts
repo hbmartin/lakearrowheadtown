@@ -158,7 +158,8 @@ describe('missing queue entries and storage faults', () => {
       expect(await state.storage.get('jobs')).toEqual([missing, id]);
       expect(await state.storage.get(`job:${id}`)).toMatchObject({ status: 'queued' });
     });
-    expect(events).toContainEqual(expect.objectContaining({ event: action === 'alarm' ? 'rebuild_alarm_failed' : 'rebuild_request_failed', error_code: 'storage_error', stage: action === 'alarm' ? 'rebuild_queue_repair' : 'rebuild_resume_queue_repair' }));
+    expect(events).toContainEqual(expect.objectContaining({ event: action === 'alarm' ? 'rebuild_alarm_failed' : 'rebuild_request_failed', error_code: 'storage_error', stage: action === 'alarm' ? 'rebuild_queue_repair' : 'rebuild_resume_write' }));
+    expect(events).toContainEqual(expect.objectContaining({ event: 'operation_stage', stage: action === 'alarm' ? 'rebuild_queue_repair' : 'rebuild_resume_queue_repair', outcome: 'error' }));
     expect(await bindings.SITE_BUCKET.head('pages/index.html')).toBeNull();
   });
   it.each(['jobs', `job:${missing}`, 'alarm'] as const)('does not treat a failed %s lookup as a missing record', async failed => {
@@ -172,9 +173,206 @@ describe('missing queue entries and storage faults', () => {
       try { await expect(instance.resumeRebuild(id, context)).rejects.toMatchObject({ kind: 'storage' }); }
       finally { spy.mockRestore(); alarmSpy?.mockRestore(); }
       expect(await state.storage.get(`job:${id}`)).toMatchObject({ status: 'queued' });
-      if (failed !== 'alarm') expect(await state.storage.get('jobs')).toEqual([missing, id]);
+      expect(await state.storage.get('jobs')).toEqual([missing, id]);
     });
     if (failed !== 'alarm') expect(events.some(event => event.event === 'rebuild_queue_entry_missing')).toBe(false);
+  });
+});
+
+async function durableSnapshot() {
+  return inPublisher(publisher(), async (_instance, state) => ({ records: await state.storage.list(), alarm: await state.storage.getAlarm() }));
+}
+
+describe('consistent queue inspection and atomic resume', () => {
+  it('reports and preserves the effective failed head across status, enqueue, resume, and alarm', async () => {
+    await seed('failed', [missing, 'second-missing', id, other]);
+    await inPublisher(publisher(), async (_instance, state) => { await state.storage.put(`job:${other}`, job('queued', other)); });
+    const before = await durableSnapshot();
+    expect(await publisher().jobStatus(other, context)).toMatchObject({ status: 'queued', blocked_by: id });
+    expect(await durableSnapshot()).toEqual(before);
+    const queued = await publisher().enqueueRebuild(origin, context);
+    await inPublisher(publisher(), async (_instance, state) => {
+      expect(await state.storage.get('jobs')).toEqual([missing, 'second-missing', id, other, queued.id]);
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+    expect(await publisher().jobStatus(queued.id)).toMatchObject({ blocked_by: id });
+    const rejected = await durableSnapshot();
+    expect((await resume(other)).status).toBe(409);
+    expect(await durableSnapshot()).toEqual(rejected);
+    await inPublisher(publisher(), async (_instance, state) => { await state.storage.setAlarm(Date.now() + 1000); });
+    await runDurableObjectAlarm(publisher());
+    await inPublisher(publisher(), async (_instance, state) => {
+      expect(await state.storage.get('jobs')).toEqual([id, other, queued.id]);
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+    expect(await publisher().jobStatus(other)).toMatchObject({ blocked_by: id });
+  });
+
+  it('enqueues and runs a new head when every old reference is missing', async () => {
+    await inPublisher(publisher(), async (_instance, state) => { await state.storage.put('jobs', [missing, other]); });
+    const queued = await publisher().enqueueRebuild(origin, context);
+    expect(await publisher().jobStatus(queued.id)).not.toHaveProperty('blocked_by');
+    await inPublisher(publisher(), async (_instance, state) => { expect(await state.storage.get('jobs')).toEqual([missing, other, queued.id]); });
+    await runDurableObjectAlarm(publisher());
+    expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'completed' });
+  });
+
+  it.each([
+    ['completed', 'head', false], ['queued', 'head', true], ['running', 'head', true],
+    ['queued', 'blocked', false], ['running', 'blocked', false], ['failed', 'blocked', false], ['completed', 'blocked', true],
+  ] as const)('rejects a %s %s (alarm: %s) without any durable mutation', async (status, position, alarm) => {
+    await seed(status, [missing, ...(position === 'blocked' ? [other] : []), id], alarm);
+    if (position === 'blocked') await inPublisher(publisher(), async (_instance, state) => { await state.storage.put(`job:${other}`, job('failed', other)); });
+    const before = await durableSnapshot();
+    const response = await resume();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: 'job_not_resumable' });
+    expect(await durableSnapshot()).toEqual(before);
+    expect(events.some(event => event.stage === 'rebuild_resume_queue_repair')).toBe(false);
+  });
+
+  it('does not repair the queue or change its alarm when the requested job is missing', async () => {
+    await seed('failed', [missing, id], true);
+    const before = await durableSnapshot();
+    expect((await resume(other)).status).toBe(404);
+    expect(await durableSnapshot()).toEqual(before);
+  });
+
+  it('commits queue repair, queued state, and alarm in one transaction', async () => {
+    await seed('failed', [missing, 'second-missing', id, other]);
+    await inPublisher(publisher(), async (instance, state) => {
+      const transaction = vi.spyOn(state.storage, 'transaction');
+      try { expect(await instance.resumeRebuild(id, context)).toMatchObject({ status: 'queued' }); }
+      finally { expect(transaction).toHaveBeenCalledTimes(1); transaction.mockRestore(); }
+      expect(await state.storage.get('jobs')).toEqual([id, other]);
+      expect(await state.storage.get(`job:${id}`)).toMatchObject({ status: 'queued' });
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+    expect(events).toContainEqual(expect.objectContaining({ stage: 'rebuild_resume_queue_repair', outcome: 'ok' }));
+  });
+
+  it('rolls back queue, job, and alarm together when accepted recovery cannot commit', async () => {
+    await seed('failed', [missing, id]);
+    const before = await durableSnapshot();
+    await inPublisher(publisher(), async (instance, state) => {
+      const transaction = state.storage.transaction.bind(state.storage);
+      const spy = vi.spyOn(state.storage, 'transaction').mockImplementation((callback: any) => transaction(async storage => {
+        await callback(storage);
+        throw new Error('private commit failure');
+      }));
+      try { await expect(instance.resumeRebuild(id, context)).rejects.toMatchObject({ kind: 'storage' }); }
+      finally { spy.mockRestore(); }
+    });
+    expect(await durableSnapshot()).toEqual(before);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_queue_entry_missing', job_id: missing }));
+    expect(events).toContainEqual(expect.objectContaining({ stage: 'rebuild_resume_queue_repair', outcome: 'error' }));
+    expect(JSON.stringify(events)).not.toContain('private commit failure');
+  });
+
+  it.each(['status', 'enqueue', 'resume', 'alarm'] as const)('does not skip an unreadable effective head during %s', async operation => {
+    await seed('failed', [missing, id, other]);
+    await inPublisher(publisher(), async (_instance, state) => { await state.storage.put(`job:${other}`, job('queued', other)); });
+    const before = await durableSnapshot();
+    await inPublisher(publisher(), async (instance, state) => {
+      const get = state.storage.get.bind(state.storage) as (key: any) => Promise<any>;
+      const spy = vi.spyOn(state.storage, 'get').mockImplementation((key: any) => {
+        if (key === `job:${id}`) throw new Error('private head read failure');
+        return get(key);
+      });
+      const transaction = state.storage.transaction.bind(state.storage);
+      const transactionSpy = operation === 'enqueue' ? vi.spyOn(state.storage, 'transaction').mockImplementation((callback: any) => transaction(storage => callback(new Proxy(storage, {
+        get(target, property) {
+          if (property === 'get') return (key: string) => {
+            if (key === `job:${id}`) throw new Error('private head read failure');
+            return target.get(key);
+          };
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      })))) : undefined;
+      try {
+        const action = operation === 'status' ? () => instance.jobStatus(other, context)
+          : operation === 'enqueue' ? () => instance.enqueueRebuild(origin, context)
+          : operation === 'resume' ? () => instance.resumeRebuild(other, context) : () => instance.alarm();
+        await expect(action()).rejects.toMatchObject({ kind: 'storage' });
+      } finally { spy.mockRestore(); transactionSpy?.mockRestore(); }
+    });
+    expect(await durableSnapshot()).toEqual(before);
+    expect(events.some(event => event.event === 'rebuild_queue_entry_missing' && event.job_id === id)).toBe(false);
+    expect(JSON.stringify(events)).not.toContain('private head read failure');
+  });
+});
+
+describe('execution failure versus failure-state persistence', () => {
+  it('retains attempt logs through explicitly simulated retry exhaustion and then resumes manually', async () => {
+    await seed('queued');
+    let restore!: () => void;
+    await inPublisher(publisher(), async (_instance, state) => {
+      const start = vi.spyOn(state.storage, 'put').mockRejectedValue(new Error('private start failure'));
+      const record = vi.spyOn(state.storage, 'transaction').mockRejectedValue(new Error('private record failure'));
+      restore = () => { start.mockRestore(); record.mockRestore(); };
+    });
+    try {
+      for (let attempt = 0; attempt <= 6; attempt++) {
+        // Each helper delivery consumes its alarm; schedule the modeled redelivery explicitly.
+        await inPublisher(publisher(), async (_instance, state) => { await state.storage.setAlarm(Date.now() + 1000); });
+        await expect(runDurableObjectAlarm(publisher())).rejects.toMatchObject({ kind: 'storage' });
+      }
+    } finally { restore(); }
+    expect(events.filter(event => event.event === 'rebuild_failed')).toHaveLength(7);
+    expect(events.filter(event => event.event === 'rebuild_failure_record_failed')).toHaveLength(7);
+    expect(events.some(event => event.event === 'rebuild_alarm_failed')).toBe(false);
+    expect(await runDurableObjectAlarm(publisher())).toBe(false);
+    expect(await publisher().jobStatus(id)).toMatchObject({ status: 'queued' });
+    expect((await resume()).status).toBe(202);
+    await runDurableObjectAlarm(publisher());
+    expect(await publisher().jobStatus(id)).toMatchObject({ status: 'completed' });
+    expect(JSON.stringify(events)).not.toMatch(/private start failure|private record failure/);
+  });
+
+  it.each(['rebuild_start', 'source_loading', 'rebuild_finalize'] as const)('logs both failures and recovers after %s plus failed state persistence', async stage => {
+    await seed('queued', [id], true);
+    const manifest = 'publications/private-damaged.json';
+    if (stage === 'source_loading') {
+      await bindings.SITE_BUCKET.put(manifest, 'private malformed manifest');
+      await bindings.SITE_BUCKET.put('pages/index.html', 'old homepage', { customMetadata: { manifest } });
+    }
+    let restore!: () => void;
+    await inPublisher(publisher(), async (_instance, state) => {
+      const transaction = state.storage.transaction.bind(state.storage);
+      let calls = 0;
+      const persistenceCall = stage === 'rebuild_start' ? 1 : stage === 'source_loading' ? 2 : 3;
+      const transactionSpy = vi.spyOn(state.storage, 'transaction').mockImplementation((callback: any) => {
+        calls++;
+        if (calls === persistenceCall || (stage === 'rebuild_finalize' && calls === 2)) throw new Error('private transaction error');
+        return transaction(callback);
+      });
+      const putSpy = stage === 'rebuild_start' ? vi.spyOn(state.storage, 'put').mockRejectedValue(new Error('private start error')) : undefined;
+      restore = () => { transactionSpy.mockRestore(); putSpy?.mockRestore(); };
+    });
+    try { await expect(runDurableObjectAlarm(publisher())).rejects.toMatchObject({ kind: 'storage' }); }
+    finally { restore(); }
+    const certainty = stage === 'rebuild_finalize' ? 'committed' : 'not_committed';
+    const originalCode = stage === 'source_loading' ? 'manifest_damaged' : 'storage_error';
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_failed', job_id: id, request_id: context.request_id, stage, error_code: originalCode, publication_status: certainty }));
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_failure_record_failed', job_id: id, request_id: context.request_id,
+      worker_version: expect.any(String), environment: expect.any(String), stage: 'rebuild_failure_record', error_code: 'storage_error', failure_kind: 'storage',
+      original_failed_stage: stage, original_error_code: originalCode, publication_status: certainty }));
+    expect(events).toContainEqual(expect.objectContaining({ stage: 'rebuild_failure_record', outcome: 'error' }));
+    expect(events.some(event => event.event === 'rebuild_alarm_failed')).toBe(false);
+    expect(await publisher().jobStatus(id)).toMatchObject({ status: stage === 'rebuild_start' ? 'queued' : 'running' });
+    expect(await runDurableObjectAlarm(publisher())).toBe(false);
+    expect(JSON.stringify(events)).not.toMatch(/private transaction error|private start error|private malformed manifest/);
+    if (stage === 'source_loading') {
+      // Explicitly simulate platform redelivery: the helper does not schedule retries.
+      await inPublisher(publisher(), async (_instance, state) => { await state.storage.setAlarm(Date.now() + 1000); });
+      await runDurableObjectAlarm(publisher());
+      expect(await publisher().jobStatus(id)).toMatchObject({ status: 'failed', error_code: 'manifest_damaged' });
+      await bindings.SITE_BUCKET.put(manifest, JSON.stringify({ version: 1, posts: [], snapshot_date: null, published_at: null }));
+    }
+    expect((await resume()).status).toBe(202);
+    await runDurableObjectAlarm(publisher());
+    expect(await publisher().jobStatus(id)).toMatchObject({ status: 'completed' });
   });
 });
 

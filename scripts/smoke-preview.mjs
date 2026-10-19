@@ -7,6 +7,12 @@ import { SaxesParser } from 'saxes';
 import { readCredential, validateCredential } from './credentials.mjs';
 import { maintenance, maintenanceTarget } from './maintenance.mjs';
 
+export function checkRssHeaders(response) {
+  if (response.status !== 304) assert.equal(response.headers.get('Content-Type'), 'application/rss+xml; charset=utf-8');
+  assert.equal(response.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate');
+  assert.equal(response.headers.get('X-Robots-Tag'), 'noindex');
+}
+
 export function parseSmokeArgs(args = process.argv.slice(2)) {
   const { values, positionals } = parseArgs({ args, options: { 'verify-edge': { type: 'boolean' } }, allowPositionals: true, strict: true });
   if (positionals.length > 1) throw new Error('Expected at most one preview URL');
@@ -61,10 +67,11 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert.equal(homepage.status, attempt === 1 ? 304 : 200, 'Duplicates must preserve the homepage and ETag');
     const rss = await fetch(`${origin}/rss.xml`, { headers: previousRssTag ? { 'If-None-Match': previousRssTag } : {} });
     assert.equal(rss.status, attempt === 1 ? 304 : 200, 'RSS must change with publications and remain unchanged for duplicates');
-    assert.equal(rss.headers.get('Content-Type'), 'application/rss+xml; charset=utf-8');
-    assert.equal(rss.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate');
-    assert.equal(rss.headers.get('X-Robots-Tag'), 'noindex');
-    if (attempt === 1) assert.equal(await rss.text(), '');
+    checkRssHeaders(rss);
+    if (attempt === 1) {
+      assert.equal(rss.headers.get('etag'), previousRssTag);
+      assert.equal(await rss.text(), '');
+    }
     else {
       const xml = await rss.text();
       const text = [];
@@ -80,6 +87,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
       assert(previousRssTag?.startsWith('W/'), 'RSS must expose a weak ETag');
       const rssHead = await fetch(`${origin}/rss.xml`, { method: 'HEAD' });
       assert.equal(rssHead.status, 200); assert.equal(rssHead.headers.get('etag'), previousRssTag); assert.equal(await rssHead.text(), '');
+      checkRssHeaders(rssHead);
     }
     if (attempt === 1) continue;
     const html = await homepage.text();
