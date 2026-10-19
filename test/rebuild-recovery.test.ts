@@ -12,6 +12,7 @@ const headers = { Authorization: 'Bearer test-secret-at-least-thirty-two-charact
 const id = '00000000-0000-0000-0000-000000000001';
 const other = '00000000-0000-0000-0000-000000000002';
 const missing = '00000000-0000-0000-0000-000000000003';
+const completed = '00000000-0000-0000-0000-000000000004';
 const context: OperationContext = { request_id: 'recovery-test', worker_version: 'test', environment: 'preview', operation: 'rebuild' };
 const publisher = () => bindings.PUBLISHER.getByName('site');
 const request = (path: string, init: RequestInit = {}, overrides: Partial<Env> = {}) => worker.fetch(new Request(origin + path, init), { ...bindings, CF_VERSION_METADATA: { id: 'test-release' }, ENVIRONMENT: 'preview', ...overrides });
@@ -28,7 +29,7 @@ async function seed(status: RebuildJob['status'], ids = [id], alarm = false) {
 let events: any[];
 beforeEach(async () => {
   vi.restoreAllMocks(); await reset(); events = [];
-  for (const level of ['info', 'warn', 'error'] as const) vi.spyOn(console, level).mockImplementation(value => { events.push(value); });
+  for (const level of ['info', 'warn', 'error'] as const) vi.spyOn(console, level).mockImplementation(value => { events.push({ ...value, level }); });
 });
 
 describe('manual rebuild recovery', () => {
@@ -183,16 +184,23 @@ async function durableSnapshot() {
   return inPublisher(publisher(), async (_instance, state) => ({ records: await state.storage.list(), alarm: await state.storage.getAlarm() }));
 }
 
+async function seedCompleted() {
+  const saved = { ...job('completed', completed), started_at: '2026-10-18T12:00:00.000Z', finished_at: '2026-10-18T12:01:00.000Z' };
+  await inPublisher(publisher(), async (_instance, state) => { await state.storage.put(`job:${completed}`, saved); });
+  return saved;
+}
+
 describe('consistent queue inspection and atomic resume', () => {
   it('reports and preserves the effective failed head across status, enqueue, resume, and alarm', async () => {
-    await seed('failed', [missing, 'second-missing', id, other]);
+    await seed('failed', [missing, completed, 'second-missing', id, other]);
+    const saved = await seedCompleted();
     await inPublisher(publisher(), async (_instance, state) => { await state.storage.put(`job:${other}`, job('queued', other)); });
     const before = await durableSnapshot();
     expect(await publisher().jobStatus(other, context)).toMatchObject({ status: 'queued', blocked_by: id });
     expect(await durableSnapshot()).toEqual(before);
     const queued = await publisher().enqueueRebuild(origin, context);
     await inPublisher(publisher(), async (_instance, state) => {
-      expect(await state.storage.get('jobs')).toEqual([missing, 'second-missing', id, other, queued.id]);
+      expect(await state.storage.get('jobs')).toEqual([missing, completed, 'second-missing', id, other, queued.id]);
       expect(await state.storage.getAlarm()).toBeNull();
     });
     expect(await publisher().jobStatus(queued.id)).toMatchObject({ blocked_by: id });
@@ -206,6 +214,9 @@ describe('consistent queue inspection and atomic resume', () => {
       expect(await state.storage.getAlarm()).toBeNull();
     });
     expect(await publisher().jobStatus(other)).toMatchObject({ blocked_by: id });
+    expect(await publisher().jobStatus(completed)).toEqual(saved);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_queue_entry_completed', job_id: completed }));
+    expect(events.some(event => event.event === 'rebuild_completed')).toBe(false);
   });
 
   it('enqueues and runs a new head when every old reference is missing', async () => {
@@ -221,7 +232,8 @@ describe('consistent queue inspection and atomic resume', () => {
     ['completed', 'head', false], ['queued', 'head', true], ['running', 'head', true],
     ['queued', 'blocked', false], ['running', 'blocked', false], ['failed', 'blocked', false], ['completed', 'blocked', true],
   ] as const)('rejects a %s %s (alarm: %s) without any durable mutation', async (status, position, alarm) => {
-    await seed(status, [missing, ...(position === 'blocked' ? [other] : []), id], alarm);
+    await seed(status, [missing, completed, ...(position === 'blocked' ? [other] : []), id], alarm);
+    await seedCompleted();
     if (position === 'blocked') await inPublisher(publisher(), async (_instance, state) => { await state.storage.put(`job:${other}`, job('failed', other)); });
     const before = await durableSnapshot();
     const response = await resume();
@@ -229,17 +241,21 @@ describe('consistent queue inspection and atomic resume', () => {
     expect(await response.json()).toMatchObject({ code: 'job_not_resumable' });
     expect(await durableSnapshot()).toEqual(before);
     expect(events.some(event => event.stage === 'rebuild_resume_queue_repair')).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_queue_entry_missing', job_id: missing }));
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_queue_entry_completed', job_id: completed }));
   });
 
   it('does not repair the queue or change its alarm when the requested job is missing', async () => {
-    await seed('failed', [missing, id], true);
+    await seed('failed', [missing, completed, id], true);
+    await seedCompleted();
     const before = await durableSnapshot();
     expect((await resume(other)).status).toBe(404);
     expect(await durableSnapshot()).toEqual(before);
   });
 
   it('commits queue repair, queued state, and alarm in one transaction', async () => {
-    await seed('failed', [missing, 'second-missing', id, other]);
+    await seed('failed', [missing, completed, 'second-missing', id, other]);
+    const saved = await seedCompleted();
     await inPublisher(publisher(), async (instance, state) => {
       const transaction = vi.spyOn(state.storage, 'transaction');
       try { expect(await instance.resumeRebuild(id, context)).toMatchObject({ status: 'queued' }); }
@@ -247,12 +263,17 @@ describe('consistent queue inspection and atomic resume', () => {
       expect(await state.storage.get('jobs')).toEqual([id, other]);
       expect(await state.storage.get(`job:${id}`)).toMatchObject({ status: 'queued' });
       expect(await state.storage.getAlarm()).not.toBeNull();
+      expect(await state.storage.get(`job:${completed}`)).toEqual(saved);
     });
     expect(events).toContainEqual(expect.objectContaining({ stage: 'rebuild_resume_queue_repair', outcome: 'ok' }));
+    expect(events).toContainEqual(expect.objectContaining({ stage: 'rebuild_resume_write', outcome: 'ok' }));
+    expect(events.filter(event => event.stage === 'rebuild_resume_head_read').map(event => event.queue_entry_id)).toEqual([missing, completed, 'second-missing', id]);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_queue_entry_completed', job_id: completed, level: 'info' }));
   });
 
   it('rolls back queue, job, and alarm together when accepted recovery cannot commit', async () => {
-    await seed('failed', [missing, id]);
+    await seed('failed', [missing, completed, id]);
+    await seedCompleted();
     const before = await durableSnapshot();
     await inPublisher(publisher(), async (instance, state) => {
       const transaction = state.storage.transaction.bind(state.storage);
@@ -266,11 +287,14 @@ describe('consistent queue inspection and atomic resume', () => {
     expect(await durableSnapshot()).toEqual(before);
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_queue_entry_missing', job_id: missing }));
     expect(events).toContainEqual(expect.objectContaining({ stage: 'rebuild_resume_queue_repair', outcome: 'error' }));
+    expect(events).toContainEqual(expect.objectContaining({ stage: 'rebuild_resume_write', outcome: 'error' }));
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_request_failed', stage: 'rebuild_resume_write', error_code: 'storage_error' }));
     expect(JSON.stringify(events)).not.toContain('private commit failure');
   });
 
   it.each(['status', 'enqueue', 'resume', 'alarm'] as const)('does not skip an unreadable effective head during %s', async operation => {
-    await seed('failed', [missing, id, other]);
+    await seed('failed', [missing, completed, id, other]);
+    await seedCompleted();
     await inPublisher(publisher(), async (_instance, state) => { await state.storage.put(`job:${other}`, job('queued', other)); });
     const before = await durableSnapshot();
     await inPublisher(publisher(), async (instance, state) => {
@@ -300,6 +324,111 @@ describe('consistent queue inspection and atomic resume', () => {
     expect(await durableSnapshot()).toEqual(before);
     expect(events.some(event => event.event === 'rebuild_queue_entry_missing' && event.job_id === id)).toBe(false);
     expect(JSON.stringify(events)).not.toContain('private head read failure');
+  });
+});
+
+describe('stale completed references and confirmed alarm identity', () => {
+  it.each([{ ids: [completed] }, { ids: [missing, completed, 'second-missing', other] }])('clears stale queue $ids without changing publications or completed records', async ({ ids }) => {
+    expect((await submit()).status).toBe(200);
+    const snapshot = async () => Promise.all((await bindings.SITE_BUCKET.list()).objects.map(async object => {
+      const stored = (await bindings.SITE_BUCKET.get(object.key))!;
+      return { key: object.key, body: await stored.text(), etag: stored.etag, httpEtag: stored.httpEtag, uploaded: stored.uploaded, customMetadata: stored.customMetadata, httpMetadata: stored.httpMetadata };
+    }));
+    const before = await snapshot();
+    const saved = await seedCompleted();
+    const second = { ...saved, id: other };
+    await inPublisher(publisher(), async (_instance, state) => {
+      await state.storage.put({ jobs: ids, [`job:${other}`]: second });
+      await state.storage.setAlarm(Date.now() + 1000);
+    });
+    expect(await runDurableObjectAlarm(publisher())).toBe(true);
+    expect(await snapshot()).toEqual(before);
+    await inPublisher(publisher(), async (_instance, state) => {
+      expect(await state.storage.get('jobs')).toEqual([]);
+      expect(await state.storage.get(`job:${completed}`)).toEqual(saved);
+      expect(await state.storage.get(`job:${other}`)).toEqual(second);
+    });
+    expect(await runDurableObjectAlarm(publisher())).toBe(false);
+    expect(events.some(event => event.event === 'rebuild_completed' || event.stage === 'rebuild_start')).toBe(false);
+    const lookups = events.filter(event => event.stage === 'rebuild_job_read');
+    expect(lookups.map(event => event.queue_entry_id)).toEqual(ids);
+    expect(lookups.every(event => event.job_id === undefined)).toBe(true);
+  });
+
+  it('enqueues after an entirely stale queue and runs only the new job', async () => {
+    const saved = await seedCompleted();
+    await inPublisher(publisher(), async (_instance, state) => { await state.storage.put('jobs', [missing, completed]); });
+    const queued = await publisher().enqueueRebuild(origin, context);
+    await inPublisher(publisher(), async (_instance, state) => { expect(await state.storage.get('jobs')).toEqual([missing, completed, queued.id]); });
+    await runDurableObjectAlarm(publisher());
+    expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'completed' });
+    expect(await publisher().jobStatus(completed)).toEqual(saved);
+    expect(events.filter(event => event.event === 'rebuild_completed').map(event => event.job_id)).toEqual([queued.id]);
+  });
+
+  it('serializes resume and scheduled delivery past completed entries without duplicate execution', async () => {
+    await seed('queued', [missing, completed, id], true);
+    const saved = await seedCompleted();
+    const [ran, response] = await Promise.all([runDurableObjectAlarm(publisher()), resume()]);
+    expect(ran).toBe(true); expect([202, 409]).toContain(response.status);
+    await runDurableObjectAlarm(publisher());
+    expect(await publisher().jobStatus(id)).toMatchObject({ status: 'completed' });
+    expect(await publisher().jobStatus(completed)).toEqual(saved);
+    expect(events.filter(event => event.event === 'rebuild_completed').map(event => event.job_id)).toEqual([id]);
+  });
+
+  it.each([false, true])('attributes failed queue repair only to a confirmed head (head present: %s)', async confirmed => {
+    await seed('failed', [missing, completed, ...(confirmed ? [id] : [])], true);
+    const saved = await seedCompleted();
+    const before = (await durableSnapshot()).records;
+    let restore!: () => void;
+    await inPublisher(publisher(), async (_instance, state) => {
+      const spy = vi.spyOn(state.storage, 'transaction').mockRejectedValue(new Error('private queue repair failure'));
+      restore = () => spy.mockRestore();
+    });
+    try {
+      await expect(runDurableObjectAlarm(publisher())).rejects.toMatchObject({ kind: 'storage' });
+    } finally { restore(); }
+    expect((await durableSnapshot()).records).toEqual(before);
+    const failure = events.find(event => event.event === 'rebuild_alarm_failed');
+    expect(failure).toMatchObject({ stage: 'rebuild_queue_repair', error_code: 'storage_error', environment: 'preview' });
+    expect(failure.request_id).toBeTruthy(); expect(failure.worker_version).toBeTruthy();
+    if (confirmed) expect(failure.job_id).toBe(id);
+    else expect(failure).not.toHaveProperty('job_id');
+    expect(failure).not.toHaveProperty('publication_status');
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_queue_entry_missing', job_id: missing, request_id: failure.request_id }));
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_queue_entry_completed', job_id: completed, request_id: failure.request_id }));
+    expect(JSON.stringify(events)).not.toContain('private queue repair failure');
+    // Explicitly schedule redelivery after restoring storage; the helper does not retry.
+    await inPublisher(publisher(), async (_instance, state) => { await state.storage.setAlarm(Date.now() + 1000); });
+    await runDurableObjectAlarm(publisher());
+    await inPublisher(publisher(), async (_instance, state) => { expect(await state.storage.get('jobs')).toEqual(confirmed ? [id] : []); });
+    expect(await publisher().jobStatus(completed)).toEqual(saved);
+    expect(events.some(event => event.event === 'rebuild_completed')).toBe(false);
+  });
+
+  it.each([missing, completed, id])('logs the probed reference without claiming a confirmed job when reading %s fails', async unreadable => {
+    await seed('queued', [missing, completed, id], true);
+    await seedCompleted();
+    const before = (await durableSnapshot()).records;
+    let restore!: () => void;
+    await inPublisher(publisher(), async (_instance, state) => {
+      const get = state.storage.get.bind(state.storage) as (key: any) => Promise<any>;
+      const spy = vi.spyOn(state.storage, 'get').mockImplementation((key: any) => {
+        if (key === `job:${unreadable}`) throw new Error('private lookup failure');
+        return get(key);
+      });
+      restore = () => spy.mockRestore();
+    });
+    try { await expect(runDurableObjectAlarm(publisher())).rejects.toMatchObject({ kind: 'storage' }); }
+    finally { restore(); }
+    expect((await durableSnapshot()).records).toEqual(before);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'operation_stage', stage: 'rebuild_job_read', queue_entry_id: unreadable, outcome: 'error' }));
+    const failure = events.find(event => event.event === 'rebuild_alarm_failed');
+    expect(failure).toMatchObject({ stage: 'rebuild_job_read', error_code: 'storage_error' });
+    expect(failure).not.toHaveProperty('job_id');
+    expect(events.some(event => ['rebuild_queue_entry_missing', 'rebuild_queue_entry_completed'].includes(event.event) && event.job_id === unreadable)).toBe(false);
+    expect(JSON.stringify(events)).not.toContain('private lookup failure');
   });
 });
 

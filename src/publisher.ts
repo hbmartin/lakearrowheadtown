@@ -4,13 +4,14 @@ import { emit, OperationTrace, safeError } from './diagnostics';
 import { asHttpError, boundary, publicationFailure } from './errors';
 import type { Digest, Env, Migration, OperationContext, PublishReply, RebuildJob } from './types';
 
-// Inspection is read-only. Each caller decides whether and when to prune missing references.
+// Inspection is read-only. Callers choose when to prune missing/completed references.
 async function queueHead(ids: string[], read: (id: string) => Promise<RebuildJob | undefined>) {
   let skipped = 0;
   let job: RebuildJob | undefined;
   while (skipped < ids.length) {
     job = await read(ids[skipped]);
-    if (job) break;
+    if (job && job.status !== 'completed') break;
+    job = undefined;
     skipped++;
   }
   return { ids: ids.slice(skipped), job, skipped };
@@ -113,6 +114,7 @@ export class DigestPublisher extends DurableObject<Env> {
       delete job.error_code;
       delete job.failed_stage;
       if (context) job.context = context;
+      // The repair timing encloses this write; failures retain the inner write stage.
       const write = () => trace.run('rebuild_resume_write', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
         if (head.skipped) await storage.put('jobs', head.ids);
         await storage.put(`job:${id}`, job);
@@ -127,9 +129,9 @@ export class DigestPublisher extends DurableObject<Env> {
   private async rebuildHead(trace: OperationTrace, context?: OperationContext, prefix = 'rebuild') {
     const ids = await trace.run(`${prefix}_queue_read`, () => boundary('storage', () => this.ctx.storage.get<string[]>('jobs'))) ?? [];
     return queueHead(ids, async id => {
-      if (context && prefix === 'rebuild') context.job_id = id;
-      const job = await trace.run(`${prefix}_${prefix === 'rebuild' ? 'job' : 'head'}_read`, () => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`)));
+      const job = await trace.run(`${prefix}_${prefix === 'rebuild' ? 'job' : 'head'}_read`, () => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`)), { queue_entry_id: id });
       if (!job) emit('rebuild_queue_entry_missing', context, { job_id: id, error_code: 'job_record_missing' }, 'error');
+      else if (job.status === 'completed') emit('rebuild_queue_entry_completed', context, { job_id: id });
       return job;
     });
   }
@@ -143,6 +145,7 @@ export class DigestPublisher extends DurableObject<Env> {
       try {
         const head = await this.rebuildHead(bootstrap, bootstrapContext);
         ({ ids, job } = head);
+        if (job) bootstrapContext.job_id = job.id;
         if (head.skipped) await bootstrap.run('rebuild_queue_repair', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
           await storage.put('jobs', ids);
         })));

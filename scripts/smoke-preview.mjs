@@ -8,7 +8,8 @@ import { readCredential, validateCredential } from './credentials.mjs';
 import { maintenance, maintenanceTarget } from './maintenance.mjs';
 
 export function checkRssHeaders(response) {
-  if (response.status !== 304) assert.equal(response.headers.get('Content-Type'), 'application/rss+xml; charset=utf-8');
+  const contentType = response.headers.get('Content-Type');
+  if (response.status !== 304 || contentType !== null) assert.equal(contentType, 'application/rss+xml; charset=utf-8');
   assert.equal(response.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate');
   assert.equal(response.headers.get('X-Robots-Tag'), 'noindex');
 }
