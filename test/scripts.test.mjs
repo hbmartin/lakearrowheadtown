@@ -277,9 +277,13 @@ test('smoke arguments support a default URL, flag alone, and either argument ord
   for (const args of [[remote, '--verify-edge'], ['--verify-edge', remote]]) assert.deepEqual(parseSmokeArgs(args), { origin: remote, edge: true });
   assert.deepEqual(parseSmokeArgs(['http://localhost:8787']), { origin: 'http://localhost:8787', edge: false });
 });
-test('RSS smoke checks permit 304 without Content-Type but require MIME on GET and HEAD 200s', () => {
+test('RSS smoke checks validate present 304 MIME and require MIME on GET and HEAD 200s', () => {
   const headers = { 'Cache-Control': 'public, max-age=0, must-revalidate', 'X-Robots-Tag': 'noindex' };
   checkRssHeaders(new Response(null, { status: 304, headers }));
+  checkRssHeaders(new Response(null, { status: 304, headers: { ...headers, 'Content-Type': 'application/rss+xml; charset=utf-8' } }));
+  for (const contentType of ['text/plain', 'text/html', '']) {
+    assert.throws(() => checkRssHeaders(new Response(null, { status: 304, headers: { ...headers, 'Content-Type': contentType } })));
+  }
   for (const body of ['<rss/>', null]) {
     checkRssHeaders(new Response(body, { headers: { ...headers, 'Content-Type': 'application/rss+xml; charset=utf-8' } }));
     assert.throws(() => checkRssHeaders(new Response(body, { headers: { ...headers, 'Content-Type': 'text/plain' } })));

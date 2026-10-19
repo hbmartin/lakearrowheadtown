@@ -125,7 +125,8 @@ describe('rebuild storage diagnostics', () => {
     expect(failed.request_id).toMatch(/^[a-f0-9-]{36}$/);
     expect(failed.worker_version).toBeTruthy();
     expect(failed.environment).toBeTruthy();
-    if (failedKey !== 'jobs') expect(failed.job_id).toBe(id);
+    expect(failed).not.toHaveProperty('job_id');
+    if (failedKey !== 'jobs') expect(events).toContainEqual(expect.objectContaining({ event: 'operation_stage', stage: 'rebuild_job_read', queue_entry_id: id, outcome: 'error' }));
     expect(await runDurableObjectAlarm(publisher)).toBe(true);
     expect(await publisher.jobStatus(id)).toMatchObject({ status: 'completed' });
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_completed', job_id: id, request_id: context.request_id }));
