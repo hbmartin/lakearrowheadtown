@@ -265,6 +265,30 @@
     .empty-state { max-width: 45ch; color: var(--muted); line-height: 1.75; }
     body > footer { padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.8125rem; }
 
+    .back-to-top {
+      position: fixed;
+      z-index: 5;
+      left: calc(1rem + env(safe-area-inset-left, 0px));
+      bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+      display: grid;
+      place-items: center;
+      width: 48px;
+      height: 48px;
+      padding: 0;
+      border: 0;
+      border-radius: 50%;
+      background: var(--surface);
+      color: var(--primary);
+      box-shadow: var(--shadow);
+    }
+    .back-to-top:hover { background: var(--surface-hover); }
+    .back-to-top-ring { position: absolute; inset: 0; pointer-events: none; }
+    .scroll-track { stroke: var(--control-border); }
+    .scroll-progress { stroke: currentColor; }
+    @media print {
+      .back-to-top { display: none; }
+    }
+
     .theme-picker {
       position: relative;
       z-index: 10;
@@ -334,12 +358,14 @@
       background: var(--swatch);
     }
     @media (prefers-reduced-motion: no-preference) {
-      body, .theme-trigger, .theme-panel, .theme-option {
+      body, .back-to-top, .theme-trigger, .theme-panel, .theme-option {
         transition: background-color 180ms ease, color 180ms ease, border-color 180ms ease;
       }
     }
     @media (forced-colors: active) {
       .site-dot { forced-color-adjust: none; background: LinkText; }
+      .scroll-track { stroke: ButtonText; }
+      .scroll-progress { stroke: Highlight; }
       .theme-option:has(input:checked) { border-color: Highlight; }
       .theme-swatches { forced-color-adjust: none; }
     }
@@ -428,6 +454,58 @@
     <p>Community news from around the mountain. <a href="/rss.xml">RSS feed</a></p>
     <!-- snapshot-meta -->
   </footer>
+  <button class="back-to-top" id="back-to-top" type="button" aria-label="Back to top" title="Back to top" hidden>
+    <svg class="back-to-top-ring" width="48" height="48" viewBox="0 0 48 48" fill="none" stroke-width="3" aria-hidden="true" focusable="false">
+      <circle class="scroll-track" cx="24" cy="24" r="22"/>
+      <circle class="scroll-progress" cx="24" cy="24" r="22" pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" transform="rotate(-90 24 24)"/>
+    </svg>
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+      <path d="m6 12 6-6 6 6M12 6v12"/>
+    </svg>
+  </button>
+  <script id="scroll-to-top">
+    (() => {
+      const button = document.getElementById('back-to-top');
+      const ring = button.querySelector('.scroll-progress');
+      const page = document.scrollingElement || document.documentElement;
+      let framePending = false;
+
+      function updateProgress() {
+        framePending = false;
+        const distance = Math.max(0, page.scrollHeight - page.clientHeight);
+        const offset = Math.min(distance, Math.max(0, page.scrollTop));
+        const progress = distance > 0 ? offset / distance : 0;
+        ring.style.strokeDashoffset = String(100 * (1 - progress));
+        const hidden = offset === 0;
+        if (hidden && document.activeElement === button) {
+          document.querySelector('.site-title').focus({ preventScroll: true });
+        }
+        button.hidden = hidden;
+      }
+
+      function scheduleUpdate() {
+        if (framePending) return;
+        framePending = true;
+        requestAnimationFrame(updateProgress);
+      }
+
+      button.addEventListener('click', () => {
+        window.scrollTo({
+          top: 0,
+          behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth',
+        });
+      });
+      window.addEventListener('scroll', scheduleUpdate, { passive: true });
+      window.addEventListener('resize', scheduleUpdate);
+      window.addEventListener('pageshow', scheduleUpdate);
+      window.addEventListener('load', scheduleUpdate, true);
+      if ('ResizeObserver' in window) {
+        const observer = new ResizeObserver(scheduleUpdate);
+        observer.observe(document.body);
+      }
+      updateProgress();
+    })();
+  </script>
   <script id="theme-picker">
     (() => {
       const picker = document.querySelector('.theme-picker');
