@@ -35,7 +35,7 @@ describe('homepage metadata', () => {
     for (const html of pages) {
       const head = html.split('</head>')[0];
       expect(head.match(/<title>/g)).toHaveLength(1);
-      expect(head).toContain(`<title>${SITE.title}</title>`);
+      expect(head).toContain(`<title>${escapeHtml(SITE.title)}</title>`);
       const names = [...head.matchAll(/<meta name="([^"]+)"/g)].map(match => match[1]);
       const properties = [...head.matchAll(/<meta property="([^"]+)"/g)].map(match => match[1]);
       expect(new Set(names).size).toBe(names.length);
@@ -234,7 +234,8 @@ describe('crawler resources and artwork', () => {
     expect(response.headers.get('Cloudflare-CDN-Cache-Control')).toBe('no-store');
     const sitemap = await response.text();
     expect(sitemap).toContain(`<lastmod>${now.toISOString()}</lastmod>`);
-    expect(sitemap.match(/<loc>/g)).toHaveLength(1);
+    expect(sitemap.match(/<loc>/g)).toHaveLength(6);
+    expect(sitemap).toContain('<loc>https://lakearrowhead.town/2026/10/17/</loc>');
     expect(sitemap).not.toMatch(/2099|orphan|publications|posts|index\.html/);
     await rebuildHomepage(bindings.SITE_BUCKET, SITE.origin);
     expect(await (await fetch('/sitemap.xml')).text()).toBe(sitemap);

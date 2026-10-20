@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { dimensions, type ImageMetadata } from './image-metadata';
 import { HttpError } from './validation';
 import { boundary, declaredBodyBytes } from './errors';
 import type { OperationTrace } from './diagnostics';
@@ -18,7 +19,7 @@ export async function withImageUploadSlot<T>(action: () => Promise<T>, trace?: O
   finally { activeUploads--; }
 }
 
-export async function imageUpload(request: Request, onBytes?: (bytes: number, complete?: boolean) => void): Promise<{ file: File; hash: string; type: string; extension: string }> {
+export async function imageUpload(request: Request, onBytes?: (bytes: number, complete?: boolean) => void): Promise<{ file: File; hash: string; type: string; extension: string; metadata: ImageMetadata }> {
   onBytes?.(0, false);
   const contentType = request.headers.get('content-type');
   if (!contentType?.toLowerCase().startsWith('multipart/form-data;')) throw new HttpError(415, 'Expected multipart/form-data');
@@ -68,9 +69,12 @@ export async function imageUpload(request: Request, onBytes?: (bytes: number, co
   else if (header.length >= 16 && ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP' && ['VP8 ', 'VP8L', 'VP8X'].includes(ascii(12, 4))) { type = 'image/webp'; extension = 'webp'; }
   else throw new HttpError(415, 'Expected JPEG, PNG, WebP, or GIF image data');
   if (file.type.toLowerCase() !== type) throw new HttpError(415, 'Image media type does not match its contents', {}, { code: 'image_type_mismatch', details: { expected: type } });
+  let metadata: ImageMetadata;
+  try { metadata = dimensions(new Uint8Array(await file.arrayBuffer())); }
+  catch { throw new HttpError(415, 'Image dimensions could not be read'); }
   const hash = createHash('sha256');
   for await (const chunk of file.stream()) hash.update(chunk);
-  return { file, hash: hash.digest('hex'), type, extension };
+  return { file, hash: hash.digest('hex'), type, extension, metadata };
 }
 
 export async function hashBytes(bytes: ArrayBuffer | ArrayBufferView): Promise<string> {

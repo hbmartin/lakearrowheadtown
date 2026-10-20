@@ -100,6 +100,7 @@ export interface Publication {
   omitted_posts?: PostReference[];
   snapshot_date: string | null;
   published_at: string | null;
+  archives?: string;
 }
 
 export interface Migration {
@@ -137,6 +138,6 @@ export interface Env {
 export interface ContentBucket {
   get(key: string): Promise<R2ObjectBody | null>;
   head(key: string): Promise<R2Object | null>;
-  put(key: string, value: string, options?: R2PutOptions): Promise<R2Object | null>;
+  put(key: string, value: string | ArrayBuffer | ArrayBufferView, options?: R2PutOptions): Promise<R2Object | null>;
   list(options?: R2ListOptions): Promise<R2Objects>;
 }

@@ -1,3 +1,5 @@
+import { metadataKey } from './image-metadata';
+import { pageResource } from './pages';
 import { timingSafeEqual } from 'node:crypto';
 import { matchesEtag, parseIfNoneMatch } from './conditions';
 import { hashBytes, IMAGE_CACHE, imageUpload, withImageUploadSlot } from './images';
@@ -211,7 +213,8 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         const image = await trace.run('image_validation', () => imageUpload(request, (bytes, complete) => { state.bytes_received = bytes; state.body_complete = complete ?? false; }));
         const key = `images/${image.hash}.${image.extension}`;
         await trace.run('image_write', () => boundary('storage', () => env.SITE_BUCKET.put(key, image.file.stream(), { httpMetadata: { contentType: image.type, cacheControl: IMAGE_CACHE } })));
-        return reply({ ok: true, url: `${origin}/${key}` });
+        await trace.run('image_metadata_write', () => boundary('storage', () => env.SITE_BUCKET.put(metadataKey(image.hash), JSON.stringify(image.metadata), { httpMetadata: { contentType: 'application/json' } })));
+        return reply({ ok: true, url: `${origin}/${key}`, width: image.metadata.width, height: image.metadata.height });
       }), trace);
     }
     if (!['GET', 'HEAD'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD' });
@@ -221,6 +224,8 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     return await trace.run('public_read', async () => {
       const metadata = await metadataResource(request, env.SITE_BUCKET, origin);
       if (metadata) return metadata;
+      const page = await pageResource(request, env.SITE_BUCKET, origin);
+      if (page) return page;
       if (path === '/rss.xml') {
         const index = await boundary('storage', () => env.SITE_BUCKET.head('pages/index.html'));
         if (!index) return emptyResponse(request, originFor(request, env), true);
@@ -229,6 +234,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         return publicObject(request, env, key, 'rss');
       }
       if (path === '/' || path === '/index.html') return publicObject(request, env, 'pages/index.html');
+      if (/^\/assets\/daily\/[a-f0-9]{64}\.png$/.test(path)) return publicObject(request, env, path.slice(1), 'image');
       if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return publicObject(request, env, path.slice(1), 'image');
       throw new HttpError(404, 'Not found');
     });

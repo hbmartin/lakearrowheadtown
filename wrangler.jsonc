@@ -16,7 +16,7 @@
   "exports": { "DigestPublisher": { "type": "durable-object", "storage": "sqlite" } },
   "rules": [
     { "type": "Text", "globs": ["**/*.html", "**/*.svg"], "fallthrough": true },
-    { "type": "Data", "globs": ["**/*.png", "**/*.ico"], "fallthrough": true }
+    { "type": "Data", "globs": ["**/*.png", "**/*.ico", "**/*.ttf", "**/*.woff2"], "fallthrough": true }
   ],
   "upload_source_maps": true,
   "version_metadata": { "binding": "CF_VERSION_METADATA" },

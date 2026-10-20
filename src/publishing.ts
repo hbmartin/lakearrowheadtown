@@ -1,3 +1,5 @@
+import { prepareArchives } from './archives';
+import { resolveImages } from './image-metadata';
 import { recentDates, renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
 import { HttpError, isDate, isTimestamp, validateDigest, validateStoredItems } from './validation';
@@ -87,14 +89,29 @@ function isPublication(value: unknown): value is Publication {
     && (ref.last_received_at === undefined || isTimestamp(ref.last_received_at)));
   return record(value) && (value.version === 1 || value.version === 2) && refs(value.posts)
     && (value.omitted_posts === undefined || refs(value.omitted_posts))
+    && (value.archives === undefined || (typeof value.archives === 'string' && /^archive-catalogs\/[a-f0-9]{64}\.json$/.test(value.archives)))
     && (value.snapshot_date === null || date(value.snapshot_date))
     && (value.published_at === null || isTimestamp(value.published_at));
 }
 
 async function writeHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, trace = new OperationTrace()): Promise<void> {
   publication = { ...publication, version: 2 };
-  const html = await trace.run('rendering', () => boundary('rendering', () => renderPage(posts, { origin, publication })));
-  const feed = await trace.run('rss_rendering', () => boundary('rendering', () => renderRss(posts, { origin, publication })));
+  const previous = await trace.run('archive_loading', () => currentPublication(bucket));
+  let archives = previous.archives;
+  // A first new publication must also retain the previous saved visible week,
+  // even if that snapshot is now older than the incoming history window.
+  if (!archives && previous.snapshot_date && previous.published_at !== publication.published_at) {
+    const seed: StoredPost[] = [];
+    for (const ref of previous.posts) {
+      try { seed.push(await loadPost(bucket, ref)); }
+      catch (error) { if (!(error instanceof DamagedSource)) throw error; }
+    }
+    archives = await prepareArchives(bucket, seed, previous, origin, undefined, trace);
+  }
+  publication.archives = await prepareArchives(bucket, posts, publication, origin, archives, trace);
+  const images = await trace.run('image_metadata', () => resolveImages(bucket, posts.flatMap(post => post.items), origin));
+  const html = await trace.run('rendering', () => boundary('rendering', () => renderPage(posts, { origin, publication, images })));
+  const feed = await trace.run('rss_rendering', () => boundary('rendering', () => renderRss(posts, { origin, publication, images })));
   const manifest = `publications/${crypto.randomUUID()}.json`;
   const rss = manifest.replace(/\.json$/, '.rss.xml');
   const serialized = JSON.stringify(publication);

@@ -424,8 +424,8 @@ describe('server dates, snapshots and rendering', () => {
   });
   it('keeps the site name and footer dates while styling the masthead and including the theme picker', () => {
     const html = snapshotPage([]);
-    expect(html).toContain('<title>News from Lake Arrowhead . Town</title>');
-    expect(html).toContain('<meta property="og:title" content="News from Lake Arrowhead . Town">');
+    expect(html).toContain('<title>Lake Arrowhead News, Alerts &amp; Events | Lake Arrowhead . Town</title>');
+    expect(html).toContain('<meta property="og:title" content="Lake Arrowhead . Town — Community news &amp; local updates">');
     expect(html).toContain('<a class="site-title" href="/" aria-label="Lake Arrowhead . Town">Lake Arrowhead <span class="site-title-tail"><span class="site-dot" aria-hidden="true">.</span> Town</span></a>');
     const header = html.match(/<header>([\s\S]*?)<\/header>/)![1];
     expect(header).toContain('class="theme-picker"');
@@ -452,7 +452,7 @@ describe('server dates, snapshots and rendering', () => {
     const html = renderPage([input], { origin: base });
     expect(html).not.toMatch(/<script>evil|<script>alert|href="javascript:|<img src=x/);
     expect(html).toContain('&lt;script&gt;'); expect(html).toContain('$&amp;');
-    expect(html).toContain('<img src="https://lakearrowhead.town/images/photo.png" alt="photo">');
+    expect(html).toContain('<img src="https://lakearrowhead.town/images/photo.png" alt="photo" loading="eager" decoding="async">');
   });
   it('validates real source dates and offset timestamps', () => {
     const input = digest(); input.items[0].posted_at = '2024-03-01T00:00:00.123+14:00';
@@ -782,10 +782,10 @@ describe('images and public serving', () => {
     expect(await (await fetch('/')).text()).toContain(`<img src="${result.url}"`);
   });
   it.each([
-    ['image/jpeg', [255, 216, 255, 224]],
+    ['image/jpeg', [255, 216, 255, 224, 0, 2, 255, 192, 0, 17, 8, 0, 2, 0, 3, 3, 1, 17, 0, 2, 17, 0, 3, 17, 0]],
     ['image/gif', [...new TextEncoder().encode('GIF89a'), 1, 0, 1, 0, 0, 0, 0]],
-    ['image/webp', [...new TextEncoder().encode('RIFF'), 20, 0, 0, 0, ...new TextEncoder().encode('WEBPVP8 ')]],
-  ])('accepts the supported %s signature', async (type, values) => { expect((await upload(new Uint8Array(values), type)).status).toBe(200); });
+    ['image/webp', [...new TextEncoder().encode('RIFF'), 22, 0, 0, 0, ...new TextEncoder().encode('WEBPVP8X'), 10, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 1, 0, 0]],
+  ])('accepts the supported %s header with readable dimensions', async (type, values) => { expect((await upload(new Uint8Array(values), type)).status).toBe(200); });
   it.each(['image/jpg', 'image/pjpeg', 'application/octet-stream', '', 'image/jpeg'])('retains strict matching for %s', async type => {
     expect((await upload(png, type)).status).toBe(415);
     expect((await bindings.SITE_BUCKET.list()).objects).toHaveLength(0);

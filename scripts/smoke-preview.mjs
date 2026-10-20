@@ -30,7 +30,8 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   form.append('file', new File([png], 'preview.png', { type: 'image/png' }));
   const imageResponse = await fetch(`${origin}/api/images`, { method: 'POST', headers, body: form });
   assert.equal(imageResponse.status, 200, await imageResponse.clone().text());
-  const { url: imageUrl } = await imageResponse.json();
+  const { url: imageUrl, width, height } = await imageResponse.json();
+  assert.equal(width, 1); assert.equal(height, 1);
   assert.equal(new URL(imageUrl).origin, origin);
   for (let attempt = 0; attempt < 2; attempt++) {
     const image = await fetch(imageUrl);
@@ -177,6 +178,39 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   assert.equal((await fetch(`${origin}/api/digests`, { method: 'POST', body: '{}' })).status, 401);
   assert.equal((await fetch(`${origin}/digests/2026-10-16`)).status, 404);
   assert.equal((await fetch(`${origin}/posts/`)).status, 404);
+  const seoHtml = await (await fetch(origin)).text();
+  assert(seoHtml.includes('Lake Arrowhead News, Alerts &amp; Events | Lake Arrowhead . Town'));
+  assert(seoHtml.includes('"alternateName":["Lake Arrowhead Town","lakearrowhead.town"]'));
+  assert(seoHtml.includes('href="/archive/"'));
+  const images = [...seoHtml.matchAll(/<img\b[^>]*>/g)].map(match => match[0]);
+  assert.equal(images.filter(tag => tag.includes('loading="eager"')).length, 1);
+  assert(images.every(tag => tag.includes('decoding="async"')));
+  assert(images.some(tag => tag.includes(imageUrl) && tag.includes('width="1" height="1"')));
+  const dailyPath = seoHtml.match(/<h2 id="day-[^"]+"><a href="(\/\d{4}\/\d{2}\/\d{2}\/)"/)[1];
+  const daily = await fetch(origin + dailyPath);
+  assert.equal(daily.status, 200);
+  const dailyHtml = await daily.text();
+  assert(dailyHtml.includes(`<link rel="canonical" href="${origin}${dailyPath}">`));
+  assert.match(dailyHtml, /<title>Lake Arrowhead news — /);
+  const cardUrl = dailyHtml.match(/<meta property="og:image" content="([^"]+)"/)[1];
+  assert.equal(new URL(cardUrl).origin, origin);
+  const card = await fetch(cardUrl);
+  assert.equal(card.status, 200); assert.equal(card.headers.get('content-type'), 'image/png');
+  const cardBytes = Buffer.from(await card.arrayBuffer());
+  assert.equal(cardBytes.readUInt32BE(16), 1200); assert.equal(cardBytes.readUInt32BE(20), 630);
+  const archive = await fetch(`${origin}/archive/`);
+  assert.equal(archive.status, 200); assert((await archive.text()).includes(dailyPath));
+  for (const path of ['/road-conditions/', '/power-outages/', '/emergency-resources/']) {
+    const page = await fetch(origin + path);
+    assert.equal(page.status, 200); assert.equal(page.headers.get('X-Robots-Tag'), 'noindex');
+    assert((await page.text()).includes(`<link rel="canonical" href="${origin}${path}">`));
+  }
+  const font = await fetch(`${origin}/assets/fonts/dm-sans-v1.woff2`);
+  assert.equal(font.status, 200); assert.equal(font.headers.get('content-type'), 'font/woff2');
+  const feed = await (await fetch(`${origin}/rss.xml`)).text();
+  new SaxesParser({ xmlns: true }).write(feed).close();
+  assert(feed.includes('<ttl>15</ttl>')); assert(feed.includes('<image>')); assert(feed.includes('<dc:creator>'));
+  assert(feed.includes('<media:content '));
   const job = await maintenance('start', 'preview', undefined, { secret, origin, request: fetch });
   (options.log ?? console.log)(`Preview smoke checks passed: ${origin}. Rebuild ${job.id} queued; check its status manually.`);
   return { origin, job, request_ids: requestIds, worker_version: workerVersion };
