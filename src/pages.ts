@@ -1,6 +1,5 @@
-import { archivePath, archiveUnavailable, loadArchiveDay, loadCatalog } from './archives';
-import { boundary, DamagedManifest } from './errors';
-import { loadPublication } from './publishing';
+import { archivePath, loadArchiveDay, loadCatalog } from './archives';
+import { committedSnapshot } from './committed';
 import { dateLabel } from './dates';
 import { escapeHtml } from './html';
 import { renderArchivePage, renderContentPage } from './render';
@@ -22,14 +21,8 @@ export async function pageResource(request: Request, bucket: ContentBucket, orig
   const date = match?.slice(1).join('-');
   if (date && !isDate(date)) return;
   // Keep private sources and uncommitted catalogues out of all public reads.
-  const index = await boundary('storage', () => bucket.head('pages/index.html'));
-  const key = index?.customMetadata?.manifest;
-  let archives = index?.customMetadata?.archives;
-  if (archives === undefined && key) {
-    try { archives = (await loadPublication(bucket, key)).archives; }
-    catch (error) { if (error instanceof DamagedManifest) throw archiveUnavailable(); throw error; }
-  }
-  const catalog = await loadCatalog(bucket, archives);
+  const snapshot = await committedSnapshot(bucket);
+  const catalog = await loadCatalog(bucket, await snapshot.archives());
   if (date) {
     const ref = catalog.days[date];
     if (!ref) return;

@@ -241,12 +241,29 @@ describe('crawler resources and artwork', () => {
     expect(await (await fetch('/sitemap.xml')).text()).toBe(sitemap);
   });
 
-  it.each([null, 'not JSON', '{}', '{"published_at":null}', '{"published_at":"2026-02-30T00:00:00.000Z"}', '{"published_at":"</lastmod>"}'])('omits unavailable or invalid sitemap dates: %s', async value => {
+  it.each([null, 'not JSON', '{}', '{"published_at":null}', '{"published_at":"2026-02-30T00:00:00.000Z"}', '{"published_at":"</lastmod>"}'])('rejects unusable archive fallback manifests: %s', async value => {
     await bindings.SITE_BUCKET.put('pages/index.html', 'legacy HTML', { customMetadata: { manifest: 'publications/missing.json' } });
     if (value !== null) await bindings.SITE_BUCKET.put('publications/missing.json', value);
     const response = await fetch('/sitemap.xml');
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('60');
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+  });
+
+  it.each([null, '2026-02-30T00:00:00.000Z', '</lastmod>', undefined])('omits only lastmod when a publication timestamp is invalid: %s', async published_at => {
+    await published();
+    const index = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
+    const publication = await currentPublication(bindings.SITE_BUCKET);
+    await bindings.SITE_BUCKET.put(index.customMetadata!.manifest, JSON.stringify({ ...publication, published_at }));
+    const { archives: _archives, ...metadata } = index.customMetadata!;
+    await bindings.SITE_BUCKET.put('pages/index.html', await index.text(), { customMetadata: metadata });
+    const response = await fetch('/sitemap.xml');
     expect(response.status).toBe(200);
-    expect(await response.text()).not.toContain('lastmod');
+    const xml = await response.text();
+    expect(xml).toContain('/2026/10/17/');
+    // Archive content lastmod remains meaningful even if the homepage's is unavailable.
+    expect(xml.split('</url>')[0]).not.toContain('<lastmod>');
+    expect((await fetch('/archive/')).status).toBe(200);
   });
 
   it('does not hide a sitemap storage outage as an empty successful response', async () => {

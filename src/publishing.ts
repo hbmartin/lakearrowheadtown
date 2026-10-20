@@ -1,12 +1,14 @@
-import { prepareArchives } from './archives';
+import { createCardCache, prepareArchives } from './archives';
+import { committedSnapshot, isLegacyId } from './committed';
+export { loadPublication } from './committed';
 import { createImageResolver } from './image-metadata';
 import { recentDates, renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
-import { HttpError, isDate, isTimestamp, validateStoredDigest } from './validation';
+import { HttpError, isDate, validateStoredDigest } from './validation';
 import { lastReceivedAt, localDate } from './feed';
 import { duplicateMessage, reviewStory } from './suggestions';
 import { emit, fingerprint, OperationTrace } from './diagnostics';
-import { boundary, DamagedManifest, DamagedSource } from './errors';
+import { boundary, DamagedSource } from './errors';
 import type { AppendResult, ContentBucket, Digest, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishResult, StoredPost, StoryIdentity, StoryUpdate } from './types';
 
 export const HTML_CACHE = 'public, max-age=0, must-revalidate';
@@ -55,48 +57,37 @@ export async function loadPost(bucket: ContentBucket, ref: PostReference): Promi
   return { ...digest, id: ref.id, date: ref.date, received_at: ref.received_at };
 }
 
-export async function currentPublication(bucket: ContentBucket): Promise<Publication> {
-  const index = await boundary('storage', () => bucket.head('pages/index.html'));
-  const key = index?.customMetadata?.manifest;
-  if (key) return loadPublication(bucket, key);
+export async function currentPublication(bucket: ContentBucket, discover = () => legacyReferences(bucket), pinned?: Awaited<ReturnType<typeof committedSnapshot>>): Promise<Publication> {
+  const snapshot = pinned ?? await committedSnapshot(bucket);
+  const publication = await snapshot.publication();
+  if (publication) return publication;
   // Bootstrap old deployments using server storage times, never client dates.
-  const legacy = await legacyReferences(bucket);
-  const anchor = index?.uploaded ?? (legacy.length ? new Date([...legacy].sort(order)[0].received_at) : null);
+  const legacy = await discover();
+  const anchor = snapshot.index?.uploaded ?? (legacy.length ? new Date([...legacy].sort(order)[0].received_at) : null);
   const days = anchor ? recentDates(anchor) : [];
-  return { version: 1, posts: legacy.filter(post => days.includes(post.date)).sort(order), snapshot_date: days[0] ?? null, published_at: anchor?.toISOString() ?? null };
+  const archives = await snapshot.archives();
+  return { version: 1, posts: legacy.filter(post => days.includes(post.date)).sort(order), snapshot_date: days[0] ?? null,
+    published_at: anchor?.toISOString() ?? null, ...(archives === undefined ? {} : { archives }) };
 }
 
-export async function loadPublication(bucket: ContentBucket, key: string): Promise<Publication> {
-  const object = await boundary('storage', () => bucket.get(key));
-  if (!object) throw new DamagedManifest(key, 'missing');
-  const text = await boundary('storage', () => object.text());
-  let publication: unknown;
-  try { publication = JSON.parse(text); }
-  catch (error) {
-    if (error instanceof SyntaxError) throw new DamagedManifest(key, 'invalid_json');
-    throw error;
+function legacyReceipts(previous: Publication, additional: PostReference[] = []): Record<string, string> {
+  const receipts = { ...previous.legacy_receipts };
+  for (const ref of [...previous.posts, ...(previous.omitted_posts ?? []), ...additional]) {
+    if (isLegacyId(ref.id) && !Object.hasOwn(receipts, ref.id)) receipts[ref.id] = ref.received_at;
   }
-  if (!isPublication(publication)) throw new DamagedManifest(key, 'invalid_manifest');
-  return publication;
+  return receipts;
 }
 
-function isPublication(value: unknown): value is Publication {
-  const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
-  const text = (value: unknown): value is string => typeof value === 'string' && !!value.trim();
-  const date = (value: unknown) => typeof value === 'string' && isDate(value);
-  const refs = (value: unknown) => Array.isArray(value) && value.every(ref => record(ref)
-    && text(ref.id) && text(ref.key) && date(ref.date) && isTimestamp(ref.received_at)
-    && (ref.last_received_at === undefined || isTimestamp(ref.last_received_at)));
-  return record(value) && (value.version === 1 || value.version === 2) && refs(value.posts)
-    && (value.omitted_posts === undefined || refs(value.omitted_posts))
-    && (value.archives === undefined || (typeof value.archives === 'string' && /^archive-catalogs\/[a-f0-9]{64}\.json$/.test(value.archives)))
-    && (value.snapshot_date === null || date(value.snapshot_date))
-    && (value.published_at === null || isTimestamp(value.published_at));
-}
-
-async function writeHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, previous: Publication, trace = new OperationTrace()): Promise<void> {
+async function writeHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, previous: Publication,
+  trace = new OperationTrace(), options: { migrationComplete?: boolean; allCards?: boolean } = {}): Promise<void> {
   publication = { ...publication, version: 2 };
+  delete publication.legacy_receipts;
+  if (!options.migrationComplete) {
+    const receipts = legacyReceipts(previous, [...publication.posts, ...(publication.omitted_posts ?? [])]);
+    if (Object.keys(receipts).length) publication.legacy_receipts = receipts;
+  }
   const resolve = createImageResolver(bucket, origin);
+  const cards = createCardCache(bucket);
   let archives = previous.archives;
   // A first new publication must also retain the previous saved visible week,
   // even if that snapshot is now older than the incoming history window.
@@ -106,9 +97,9 @@ async function writeHomepage(bucket: ContentBucket, publication: Publication, po
       try { seed.push(await loadPost(bucket, ref)); }
       catch (error) { if (!(error instanceof DamagedSource)) throw error; }
     }
-    archives = await prepareArchives(bucket, seed, previous, origin, undefined, trace, resolve);
+    archives = await prepareArchives(bucket, seed, previous, origin, undefined, trace, resolve, { cards });
   }
-  publication.archives = await prepareArchives(bucket, posts, publication, origin, archives, trace, resolve);
+  publication.archives = await prepareArchives(bucket, posts, publication, origin, archives, trace, resolve, { cards, allCards: options.allCards });
   const images = await trace.run('image_metadata', () => resolve(posts.flatMap(post => post.items)));
   const html = await trace.run('rendering', () => boundary('rendering', () => renderPage(posts, { origin, publication, images })));
   const feed = await trace.run('rss_rendering', () => boundary('rendering', () => renderRss(posts, { origin, publication, images })));
@@ -128,12 +119,16 @@ async function retainedSources(bucket: ContentBucket, now: Date, migrationComple
   const selected: PostReference[] = [];
   const omitted: PostReference[] = [];
   const days = recentDates(now, 30);
+  let discovery: Promise<PostReference[]> | undefined;
+  const discover = () => discovery ??= migrationComplete ? Promise.resolve([]) : legacyReferences(bucket);
   const previous = await trace.run('source_loading', async () => {
-    const previous = await currentPublication(bucket);
+    const previous = await currentPublication(bucket, discover);
     // Preserve the established legacy migration window; never backfill old raw sources.
-    const legacy = !migrationComplete ? (await legacyReferences(bucket)).filter(ref => recentDates(now).includes(ref.date)) : [];
+    const receipts = legacyReceipts(previous);
+    const legacy = (await discover()).filter(ref => recentDates(now).includes(ref.date) && !Object.hasOwn(receipts, ref.id));
     const candidates = [...legacy, ...(previous.omitted_posts ?? []), ...previous.posts];
-    const refs = [...new Map(candidates.filter(ref => days.includes(localDate(new Date(ref.last_received_at ?? ref.received_at)))).map(ref => [ref.id, ref])).values()].sort(order);
+    const refs = [...new Map(candidates.map(ref => [ref.id, ref])).values()]
+      .filter(ref => days.includes(localDate(new Date(ref.last_received_at ?? ref.received_at)))).sort(order);
     for (const ref of refs) {
       try {
         posts.push(await loadPost(bucket, ref));
@@ -197,7 +192,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
       selected.sort(order);
       // Preserve the established newest-receipt ordering of historical stories.
       posts.sort((a, b) => order(reference(a), reference(b)));
-      await writeHomepage(bucket, { version: 2, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin, previous, trace);
+      await writeHomepage(bucket, { version: 2, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete });
     }
     const result: PublishResult = {
       post: post.items.length ? { id: post.id, date: post.date, received_at: post.received_at } : null,
@@ -232,7 +227,7 @@ export async function appendUpdate(bucket: ContentBucket, postId: string, itemIn
     await trace.run('source_write', () => boundary('storage', () => bucket.put(key, JSON.stringify(post), { httpMetadata: { contentType: 'application/json' } })));
     const refs = selected.map(ref => ref.id === post.id ? { ...reference(post), key } : ref).sort(order);
     posts.sort((a, b) => order(reference(a), reference(b)));
-    await writeHomepage(bucket, { version: 2, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace);
+    await writeHomepage(bucket, { version: 2, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete });
     emit('append_result', context, { post_id: post.id, item_index: itemIndex, update_index: updateIndex, publication_outcome: 'published', publication_status: trace.publication_status });
     return { status: 'appended', post_id: post.id, item_index: itemIndex, update_index: updateIndex, message: 'The source was added to this story and the publication was updated.' };
   } catch (error) {
@@ -255,13 +250,13 @@ export async function migrateBatch(bucket: ContentBucket, migration: Migration):
   return { processed, complete: !page.truncated, ...(page.truncated ? { cursor: page.cursor } : {}) };
 }
 
-export async function rebuildHomepage(bucket: ContentBucket, origin: string, trace = new OperationTrace()): Promise<void> {
-  const previous = await trace.run('source_loading', () => currentPublication(bucket));
+export async function rebuildHomepage(bucket: ContentBucket, origin: string, trace = new OperationTrace(), migrationComplete = false, previous?: Publication): Promise<void> {
+  previous ??= await trace.run('source_loading', () => currentPublication(bucket, migrationComplete ? async () => [] : undefined));
   // Migration finishes before rendering; imported sources now have canonical keys.
   const publication = { ...previous, posts: previous.posts.map(ref => ref.key.startsWith('digests/') ? { ...ref, key: postKey(ref) } : ref) };
   const posts: StoredPost[] = [];
   await trace.run('source_loading', async () => {
     for (const ref of publication.posts) posts.push(await loadPost(bucket, ref));
   });
-  await writeHomepage(bucket, publication, posts, origin, previous, trace);
+  await writeHomepage(bucket, publication, posts, origin, previous, trace, { migrationComplete, allCards: true });
 }

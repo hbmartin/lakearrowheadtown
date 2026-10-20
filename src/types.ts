@@ -101,6 +101,7 @@ export interface Publication {
   snapshot_date: string | null;
   published_at: string | null;
   archives?: string;
+  legacy_receipts?: Record<string, string>;
 }
 
 export interface Migration {

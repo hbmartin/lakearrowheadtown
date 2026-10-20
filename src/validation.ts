@@ -112,8 +112,6 @@ export function validateStoredDigest(value: unknown): Digest & { items: StoredIt
   }) };
 }
 
-export const validateStoredItems = (value: unknown): StoredItem[] => validateStoredDigest(value).items;
-
 export function parseDigestJson(bytes: ArrayBuffer): unknown {
   let text: string;
   try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes); }

@@ -25,7 +25,7 @@ const themeDecorations = substituteSite(decorations, true);
 export function withThemeHead(template: string, options: { decorations?: boolean } = {}): string {
   const position = template.indexOf(marker);
   const head = /<head\b[^>]*>/i.exec(template);
-  const end = template.indexOf('</head>');
+  const end = /<\/head\s*>/i.exec(template)?.index ?? -1;
   if (position < 0 || position !== template.lastIndexOf(marker) || !head
     || position < head.index + head[0].length || end < position) {
     throw new Error('Expected exactly one theme-head marker inside <head>');

@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
-import { appendUpdate, initialMigration, migrateBatch, PublicationError, publishDigest, rebuildHomepage } from './publishing';
+import { appendUpdate, currentPublication, initialMigration, migrateBatch, PublicationError, publishDigest, rebuildHomepage } from './publishing';
 import { emit, OperationTrace, safeError } from './diagnostics';
+import { committedSnapshot } from './committed';
 import { asHttpError, boundary, publicationFailure } from './errors';
 import { readPosts, type PostsReply } from './posts';
 import type { AppendReply, Digest, Env, Migration, OperationContext, PublishFailure, PublishReply, RebuildJob, StoryUpdate } from './types';
@@ -200,19 +201,34 @@ export class DigestPublisher extends DurableObject<Env> {
         job.status = 'running';
         job.started_at ??= new Date().toISOString();
         await trace.run('rebuild_start', () => boundary('storage', () => this.ctx.storage.put(`job:${job.id}`, job)));
-        const migration = await trace.run('migration', async () => migrateBatch(this.env.SITE_BUCKET, await boundary('storage', () => this.ctx.storage.get<Migration>('migration')) ?? initialMigration()));
+        let migrationBefore = initialMigration();
+        const migration = await trace.run('migration', async () => {
+          migrationBefore = await boundary('storage', () => this.ctx.storage.get<Migration>('migration')) ?? initialMigration();
+          return migrateBatch(this.env.SITE_BUCKET, migrationBefore);
+        });
+        // Capture any legacy bootstrap selection before confirming migration
+        // completion; later operations must not discover raw sources again.
+        let bootstrap = false;
+        const previous = migration.complete && !migrationBefore.complete ? await trace.run('source_loading', async () => {
+          const snapshot = await committedSnapshot(this.env.SITE_BUCKET);
+          bootstrap = !snapshot.index?.customMetadata?.manifest;
+          return currentPublication(this.env.SITE_BUCKET, undefined, snapshot);
+        }) : undefined;
         job.processed = migration.processed;
         job.phase = migration.complete ? 'render' : 'migration';
         await trace.run('rebuild_checkpoint', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
-          await storage.put('migration', migration);
+          // Without a committed manifest a failed initial render must be able
+          // to repeat discovery. Replaying the final import batch is idempotent.
+          await storage.put('migration', bootstrap ? migrationBefore : migration);
           await storage.put(`job:${job.id}`, job);
           if (!migration.complete) await storage.setAlarm(Date.now() + 1000);
         })));
         if (!migration.complete) return;
-        await rebuildHomepage(this.env.SITE_BUCKET, job.origin, trace);
+        await rebuildHomepage(this.env.SITE_BUCKET, job.origin, trace, migration.complete, previous);
         job.status = 'completed';
         job.finished_at = new Date().toISOString();
         await trace.run('rebuild_finalize', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
+          if (bootstrap) await storage.put('migration', migration);
           await storage.put(`job:${job.id}`, job);
           await storage.put('jobs', ids.slice(1));
           if (ids.length > 1) await storage.setAlarm(Date.now() + 1000);

@@ -22,8 +22,9 @@ const bucket = (overrides: Partial<ContentBucket> = {}): ContentBucket => ({
   put: (key, body, options) => bindings.SITE_BUCKET.put(key, body, options), list: options => bindings.SITE_BUCKET.list(options), ...overrides,
 });
 function observed() {
-  const reads = new Map<string, number>(); const writes: string[] = [];
-  return { reads, writes, store: bucket({ get: key => { reads.set(key, (reads.get(key) ?? 0) + 1); return bindings.SITE_BUCKET.get(key); },
+  const reads = new Map<string, number>(); const heads = new Map<string, number>(); const writes: string[] = [];
+  return { reads, heads, writes, store: bucket({ head: key => { heads.set(key, (heads.get(key) ?? 0) + 1); return bindings.SITE_BUCKET.head(key); },
+    get: key => { reads.set(key, (reads.get(key) ?? 0) + 1); return bindings.SITE_BUCKET.get(key); },
     put: (key, body, options) => { writes.push(key); return bindings.SITE_BUCKET.put(key, body, options); } }) };
 }
 const catalog = async () => loadCatalog(bindings.SITE_BUCKET, (await currentPublication(bindings.SITE_BUCKET)).archives);
@@ -69,6 +70,8 @@ it('uses one image cache across activity days and the homepage, including unsucc
   await publishDigest(seeding.store, digest('After seed'), origin, new Date(now.getTime() + 3600000), true);
   expect(seeding.reads.get(metadataKey('a'.repeat(64)))).toBe(1);
   expect(seeding.reads.get(paths[0])).toBe(1);
+  // Seed writes update the card cache before the new view checks the same date.
+  expect([...seeding.heads.keys()].filter(key => key.startsWith('assets/daily/'))).toEqual([]);
 });
 
 it('limits image work to two concurrent resolutions and shares in-flight lookups', async () => {
