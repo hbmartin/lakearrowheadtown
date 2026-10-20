@@ -9,6 +9,7 @@ import type { Env, OperationContext, PublicationStatus, PublishResult, RebuildJo
 import { emit, fingerprint, OperationTrace, safeError } from './diagnostics';
 import { HttpError, parseDigestJson, readLimited, validateDigest } from './validation';
 import { asHttpError, boundary, declaredBodyBytes, isPublishReply, OperationFailure, publicationFailure } from './errors';
+import notFoundPage from './not-found.html';
 export { DigestPublisher } from './publisher';
 
 function json(value: unknown, status = 200, headers: HeadersInit = {}): Response {
@@ -222,6 +223,10 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     emit('request_error', context, { error_code: failure.code, status: failure.status, ...diagnostics, publication_status: state.publication_status, publication_outcome: state.publication_outcome,
       ...(Array.isArray(failure.details) ? { issues: failure.details.map(({ path, code }) => ({ path, code })), details_truncated: failure.details_truncated } : {}),
       ...(!expected || failure.status >= 500 ? safeError(error) : {}) }, failure.status >= 500 ? 'error' : 'warn');
+    if (!isApi && failure.status === 404) return new Response(notFoundPage, { status: 404, headers: {
+      ...failure.headers, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store',
+      'Cloudflare-CDN-Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Robots-Tag': 'noindex',
+    } });
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
     return reply({ ok: false, error: failure.message, code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
       diagnostics, ...(context.operation === 'digest' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
