@@ -2,7 +2,8 @@
 export const SITE = {
   origin: 'https://lakearrowhead.town',
   name: 'Lake Arrowhead . Town',
-  title: 'News from Lake Arrowhead . Town',
+  title: 'Lake Arrowhead News, Alerts & Events | Lake Arrowhead . Town',
+  socialTitle: 'Lake Arrowhead . Town — Community news & local updates',
   description: 'Community news and local updates from around Lake Arrowhead, California, gathered in one place with links to the original sources.',
   subtitle: 'Community news & local updates',
   language: 'en-US',

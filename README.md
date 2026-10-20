@@ -4,12 +4,14 @@ A Cloudflare Worker publishes an append-only community news feed and hosts uploa
 
 ```text
 POST /api/digests → authenticate and validate → serialized publisher → R2 post + manifest + index
+GET  /api/posts   → authenticate → committed snapshot → recent stories and updates
+POST /api/posts/:post_id/items/:item_index/updates → serialized publisher → source revision + snapshot
 POST /api/images  → authenticate and validate → R2 image → public image URL
 POST /api/rebuild → durable background job → migrate legacy sources → rebuild the same snapshot
 GET  /           → read published HTML from R2
 ```
 
-New posts rebuild the homepage without a Git commit, deployment, or CI run. New story URLs append to the feed. Repeated source URLs within the seven-day receipt window are skipped; changed wording at the same URL is also skipped.
+New posts rebuild the homepage without a Git commit, deployment, or CI run. New story URLs append to the feed. Exact source URLs on stories retained in the 30-day history are skipped, including URLs attached as updates; changed wording at the same URL is also skipped.
 
 ## Set up Cloudflare
 
@@ -68,7 +70,7 @@ npm run rebuild:status -- preview JOB_UUID
 node scripts/smoke-preview.mjs --verify-edge
 ```
 
-The smoke check uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. It also parses `/rss.xml`, verifies full text/images and discovery links, checks HEAD, and confirms duplicate-only submissions preserve the RSS ETag. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
+The smoke check reads recent stories, appends a source update and retries it, uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. It also checks daily archives and their PNG cards, local resource pages, WOFF2 serving, image dimensions/loading, and structured metadata. It parses `/rss.xml`, verifies full text/images, creator/media extensions and discovery links, checks HEAD, and confirms duplicate-only submissions preserve the RSS ETag. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
 
 ### 4. Connect the domain
 
@@ -235,31 +237,103 @@ Successful publication returns `200` after the source, manifest, and index write
 `index` is the submitted item position; `item_index` is the position in the identified stored batch. An all-duplicate request returns `post: null`, `duplicate: true`, and zero published stories. It performs no writes and does not change the homepage, publication timestamp, or ETag. Mixed batches set `duplicate: false` and store only their new stories.
 
 - Duplicate identity is the exact validated `post_url` string, including query strings and fragments. No URL normalization, tracking-parameter removal, or fuzzy content matching occurs. Batch labels, source labels, wording, and other item fields do not change that identity.
-- Existing stories received today or during the preceding six Los Angeles calendar dates suppress new copies. Receipt dates, not `posted_at`, govern this window; retries never refresh it. Hidden items also count: correcting an out-of-window `posted_at` at the same URL remains a duplicate. Within a request the first new occurrence wins. Historical duplicate copies remain visible. The earliest receipt supplies duplicate references, with ascending post ID and item position breaking ties.
+- Stories retained in the 30-day history suppress new copies of their original and appended URLs. Receipt dates, not `posted_at`, govern this window; retries never refresh it. A genuine appended source extends only its story's retention. Hidden items also count: correcting an out-of-window `posted_at` at the same URL remains a duplicate. Within a request the first new occurrence wins. Historical duplicate copies remain visible. The earliest source receipt supplies duplicate references, with ascending post ID, item position, and update position breaking ties.
 - Publishing and duplicate detection share the serialized queue. The committed manifest governs modern source membership, including eligible repaired `omitted_posts`; orphan source objects do not suppress retries. Eligible legacy sources also participate during migration. A repaired or legacy historical copy wins over an incoming copy. If the request is entirely duplicate, it still makes no writes: its returned historical identity may remain omitted from the homepage until a later publication containing new content.
-- There is no editing, deletion, listing, preflight, individual-post page, or idempotency-key endpoint. `url` always points to `/`; post IDs are private diagnostic identifiers, not public permalinks. See the manual cleanup runbook below for corrections at the same source URL.
-- Omit top-level `date`, `id`, and `received_at`: none is required, and submitted values are ignored. The server assigns a unique ID, UTC ISO `received_at`, and `YYYY-MM-DD` date in `America/Los_Angeles` inside the serialized publisher. For example, receipt at `2026-10-19T01:00:00Z` gives date `2026-10-18`. Item `posted_at` remains the original source timestamp, not the receipt timestamp. Deduplication follows seven Los Angeles calendar dates, including DST boundaries, rather than a rolling 168 hours.
+- There is no editing, deletion, preflight, individual-post page, or idempotency-key endpoint. `url` always points to `/`; post IDs identify targets for authenticated reads and appends, not public permalinks. See the manual cleanup runbook below for corrections at the same source URL.
+- Omit top-level `date`, `id`, and `received_at`: none is required, and submitted values are ignored. The server assigns a unique ID, UTC ISO `received_at`, and `YYYY-MM-DD` date in `America/Los_Angeles` inside the serialized publisher. For example, receipt at `2026-10-19T01:00:00Z` gives date `2026-10-18`. Item `posted_at` remains the original source timestamp, not the receipt timestamp. Deduplication follows 30 Los Angeles calendar dates, including DST boundaries, rather than a rolling 720 hours.
 - `title`, `source`, `group`, and `headline` are required nonempty strings. `body` and `category` may be empty; submitted `items: []` receives a `400` validation error before writes. Historical empty sources remain readable. Categories accept arbitrary strings. Digest titles and receipt times remain private; the homepage displays item headlines.
 - Item timestamps require real calendar dates and an explicit timezone (`Z` or an offset). Source links must be absolute HTTP(S) URLs without credentials.
 - Markdown is rendered with raw HTML disabled and unsafe link protocols blocked. Plain-text fields are escaped. JSON requests are limited to 1 MiB, including streamed requests.
 
-A publish retains sources received today and during the preceding six Los Angeles dates. The homepage combines their items into one feed, showing only items whose original `posted_at` falls within those same seven calendar dates in Los Angeles. Items appear newest first under one heading per populated day; equal timestamps preserve source and submitted item order, and preexisting historical duplicate copies remain visible. Older and future-day items and empty digests create no sections. Source timestamps describe already-published material; this feed does not schedule future posts.
+A publish retains each story for 30 Los Angeles dates after its latest genuine server-received addition. The homepage shows stories whose original post or any update has a source `posted_at` within the published seven-day window. Cards appear newest first under the day of their newest in-window source activity; a future-day source never hides another eligible source. Original timestamps remain visible, and updates appear beneath the original body, oldest source timestamp first, with attribution and source links. Equal activity timestamps preserve source and item order, and historical duplicate copies remain visible. Empty digests create no sections. Source timestamps describe already-published material; this feed does not schedule future posts.
 
 The footer labels the post-date range and last publication time. Feed contents and calendar datelines stay unchanged between publications, even when the covered week is old. There is no scheduled feed refresh. In the browser, post timestamps display relative ages such as “3 hr ago” or “2 days ago”; they update each minute while the page is visible and when returning to the page. Timestamps ahead of the reader’s clock retain future labels such as “in 3 min”. Each age is rendered once for reading and copying, including double-click and drag selection. Full Los Angeles timestamps use native browser tooltips, which screen readers may announce alongside the age; original `datetime` values stay intact. Without JavaScript, absolute timestamps display once. Daily headings and footer dates stay absolute. Template rebuilds retain the exact published selection, date window, and publication timestamp, while applying the current layout.
 
-The masthead reads “Lake Arrowhead . Town” with a centered accent dot; the browser page title remains “News from Lake Arrowhead . Town”. Its type uses `clamp(1.5rem, 6.3vw, 3.5rem)` and can wrap on narrow screens. The palette icon shares the masthead row inside a 44px circle with a solid theme-surface background and a control-colour border. It has no button shadow and scrolls with the header. It opens a five-theme picker and remembers the selected theme in a cookie. Arrow keys apply and save themes while keeping the picker open; clicking a theme or pressing Space/Enter selects it, closes the picker, and returns focus to the button. Escape keeps the selected theme and closes; Tab continues normal navigation, and outside clicks or leaving the window dismiss the panel. An open panel stays attached to the masthead when it scrolls away; resizing fits it to the viewport without moving the page. Night Sky adds a navy dark theme with pale text and static stars; it is selected manually, and device dark-mode preference does not change the default Deep Lake & Lodge theme. Themes use subtle woodgrain, dock boards, mist contours, paper, and star textures that follow the document, strongest at the masthead and page edges. Background colour washes retain their existing strength.
+The masthead reads “Lake Arrowhead . Town” with a centered accent dot; the browser page title is “Lake Arrowhead News, Alerts & Events | Lake Arrowhead . Town”. Its type uses `clamp(1.5rem, 6.3vw, 3.5rem)` and can wrap on narrow screens. The palette icon shares the masthead row inside a 44px circle with a solid theme-surface background and a control-colour border. It has no button shadow and scrolls with the header. It opens a five-theme picker and remembers the selected theme in a cookie. Arrow keys apply and save themes while keeping the picker open; clicking a theme or pressing Space/Enter selects it, closes the picker, and returns focus to the button. Escape keeps the selected theme and closes; Tab continues normal navigation, and outside clicks or leaving the window dismiss the panel. An open panel stays attached to the masthead when it scrolls away; resizing fits it to the viewport without moving the page. Night Sky adds a navy dark theme with pale text and static stars; it is selected manually, and device dark-mode preference does not change the default Deep Lake & Lodge theme. Themes use subtle woodgrain, dock boards, mist contours, paper, and star textures that follow the document, strongest at the masthead and page edges. Background colour washes retain their existing strength.
 
 A 48px circular “Back to top” arrow appears at the lower left as soon as the page scrolls away from the top. It sits 16px from the edges plus device safe-area insets and follows the selected theme. Its border fills clockwise from 12 o’clock according to the fraction of the page’s scrollable distance already covered, with no numeric label. Progress adjusts to viewport and content-height changes, including loaded images. Activation scrolls smoothly to the top, or immediately when reduced motion is enabled. The button stays visible while scrolling upward until the top is reached, then hides; if it holds keyboard focus, focus returns to the masthead home link without scrolling again. It is hidden on pages without scrolling, without JavaScript, and when printing.
 
 At widths up to 600px, 16px side gutters, compact header/article spacing, quiet 13px daily headings, and 20–22px story headlines bring the first story higher on the page. Group links are hidden on mobile while post times and categories remain visible. Body text stays 16px with a 1.6 line height, and full stories, images, captions, and links remain available without expansion. Desktop retains group links. Daily headings have no redundant rule below them. Headline links fill their heading’s width, underline on hover, and show a rectangular outline without an underline on keyboard focus, including when hovered. Body-only thumbnails and footer placement remain in use.
 
-If a historical source is missing, contains malformed JSON, or fails digest validation, a new publication omits that post and logs its ID, R2 key, and a fixed reason. Its reference is retained privately as `omitted_posts` in the manifest and reconsidered on later publications until its original receipt date leaves the seven-day window. Successful responses retain the same format. Storage outages and unexpected failures still fail publication instead of omitting content.
+If a historical source is missing, contains malformed JSON, or fails stored-content validation, a new publication omits that post and logs its ID, R2 key, and a fixed reason. Its reference is retained privately as `omitted_posts` in the manifest and reconsidered on later publications until its latest server receipt leaves the 30-day window. Reads report `omitted_post_ids`; damage to a referenced readable source or the selected append target returns an operator-repair error. Storage outages and unexpected failures still fail publication instead of omitting content.
 
-R2 has no transaction spanning these objects. Index replacement is the commit point, and a failure can leave private source or manifest objects. After a timeout or a response with `retryable: true`, retry the unchanged payload within its original seven-calendar-date receipt window. If the index committed, the repeated URLs resolve to their committed identities; otherwise the retry can publish them. Non-retryable rendering, configuration, or internal failures require repair first. After that window, check the saved response, logs, and publication before retrying because suppression has expired.
+R2 has no transaction spanning these objects. Index replacement is the commit point, and a failure can leave private source or manifest objects. After a timeout or a response with `retryable: true`, retry the unchanged payload within its original 30-calendar-date receipt window. If the index committed, the repeated URLs resolve to their committed identities; otherwise the retry can publish them. Non-retryable rendering, configuration, or internal failures require repair first. After that window, check the saved response, logs, and publication before retrying because suppression has expired.
 
 The Worker uses the versioned `publishV2` Durable Object RPC. During deployment skew, an unavailable method, failed RPC, or invalid reply returns `503 service_unavailable` with `publication_status: "unknown"`; it never falls back to another publish call. The legacy `publish` method retains throw-on-failure behavior for old Workers and the successful reply shape understood by the previous preview Worker.
 
 This intentionally corrects the earlier `500 publish_failed` response for digest publishing RPC failures while retaining `X-API-Version: 2`. All publishing clients are controlled; coordinate their updates before the next production rollout. Clients must handle unfamiliar error codes with a readable fallback and use `retryable` and `publication_status` for retry decisions rather than matching only `publish_failed`. A missing or unusable publisher binding instead returns `503 configuration_error`, `retryable: false`, and `publication_status: "not_attempted"`: publication was never invoked and the configuration needs operator repair. No API-version negotiation or alternate publishing call is provided.
+
+## Read recent stories and append sources
+
+Both endpoints use the same `Authorization: Bearer <API_SECRET>` credential and return `Cache-Control: no-store`. Topic matching belongs to the caller: the server attaches a source only to the explicit story target and never merges stories by wording.
+
+```sh
+[ -n "${API_SECRET:-}" ] && curl --fail-with-body "$SITE_URL/api/posts?days=7" \
+  -H "Authorization: Bearer $API_SECRET"
+```
+
+`GET /api/posts` (also HEAD) defaults to seven Los Angeles calendar dates of server receipt activity; `days` accepts integers from 1 through 30. An appended source makes its story recent even if the original source timestamp is old. Results contain up to 20 matching batches per page. Follow `next_cursor`, keeping the same `days` or omitting it; the signed cursor pins the publication, original read time, and next batch position even while new content publishes. Cursors use a private signing key retained in publisher storage across restarts. Invalid days or cursors return 400 with a readable message and restart suggestion.
+
+```json
+{
+  "ok": true,
+  "request_id": "request-uuid",
+  "days": 7,
+  "as_of": "2026-10-20T18:00:00.000Z",
+  "published_at": "2026-10-20T17:00:00.000Z",
+  "message": "Published stories are ready to review.",
+  "posts": [{
+    "post_id": "post-uuid",
+    "title": "Morning digest",
+    "source": "facebook-groups",
+    "date": "2026-10-19",
+    "received_at": "2026-10-19T18:00:00.000Z",
+    "items": [{
+      "item_index": 2,
+      "group": "RimTraffic",
+      "group_url": "https://facebook.com/groups/rimtraffic/",
+      "headline": "Highway closure",
+      "body": "Original Markdown summary.",
+      "post_url": "https://facebook.com/groups/rimtraffic/permalink/123/",
+      "category": "traffic",
+      "posted_at": "2026-10-19T10:00:00-07:00",
+      "last_received_at": "2026-10-20T17:00:00.000Z",
+      "latest_activity_at": "2026-10-20T07:12:00-07:00",
+      "updates": [{
+        "update_index": 0,
+        "group": "RimTraffic",
+        "post_url": "https://facebook.com/groups/rimtraffic/permalink/456/",
+        "body": "Both lanes have reopened.",
+        "posted_at": "2026-10-20T07:12:00-07:00",
+        "received_at": "2026-10-20T17:00:00.000Z"
+      }]
+    }]
+  }],
+  "omitted_post_ids": [],
+  "next_cursor": null
+}
+```
+
+Each returned story includes its complete original fields and update history. `item_index` is its original zero-based position, so filtered results can have gaps. Updates retain append order and stable `update_index` values in the API; display order uses source timestamps. `latest_activity_at` describes the newest source timestamp, including future timestamps; public feed eligibility still uses the saved seven-day source-date window. Read responses expose no storage keys. An empty history returns an empty `posts` array; an initial unpublished site also has `published_at: null`.
+
+Append one source with `POST /api/posts/{post_id}/items/{item_index}/updates`. Use the IDs returned by reads or digest publishing:
+
+```sh
+[ -n "${API_SECRET:-}" ] && curl --fail-with-body "$SITE_URL/api/posts/POST_ID/items/ITEM_INDEX/updates" \
+  -H "Authorization: Bearer $API_SECRET" \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/story-update.json
+```
+
+Required fields are `post_url`, `group`, and timezone-explicit `posted_at`. Optional `group_url` must be an absolute HTTP(S) URL without credentials; optional `body` defaults to an empty string, creating an attributed source link without a note. Markdown follows the original story's safety rules. Server-assigned receipt fields and incoming digest `updates` are ignored. Appends do not edit the original headline, body, category, or timestamp.
+
+Success returns `200 {"ok":true,"url":"/","request_id":"...","status":"appended","post_id":"...","item_index":2,"update_index":0,"message":"..."}` after the homepage and RSS commit. A repeated exact URL returns `status: "duplicate"`, a readable `message`, and a structured `suggestion` containing `action`, `message`, `method`, and `path`. Its identity points to the existing owner, which can differ from the requested target. `update_index` is present when that owner is an update; otherwise the owner is an original story. Digest duplicate items have the same message/suggestion and optional update index. Changed wording at an existing URL is still a duplicate, and duplicates perform no writes.
+
+Unknown, expired, or absent item targets return `404 story_not_found` with a suggestion to read `/api/posts?days=30` or publish a new digest. Errors include readable `message` and structured `suggestion` alongside the existing `error`, `code`, and diagnostics. Append failures use the same `retryable` and `publication_status` contract as digest publishing. Appending through `appendUpdateV1` never falls back to another write method when RPC transport fails.
+
+Updates write immutable private source revisions. The committed index chooses the exact manifest, source revisions, and RSS; abandoned revision or manifest objects do not affect reads or deduplication. Manifest version 2 retains 30 days of story receipt activity, while version 1 remains readable. History starts from the existing committed selection and fills forward; older raw files are not imported into the history automatically. Expired items can remain in private batch files to preserve positions but do not participate in reads, feed selection, or deduplication. No automatic deletion of private objects is introduced.
+
+Deploy to preview, run `node scripts/smoke-preview.mjs --verify-edge`, and check the queued rebuild's status before production rollout. The smoke check also reads stories, appends an update, retries it, and verifies matching HTML/RSS and unchanged duplicate ETags. Once a version 2 manifest is committed, rollback requires code that understands version 2; older writers reject it. Back up sources and manifests before operator repairs. Do not redeploy an older writer against this bucket.
 
 ## Search, sharing, and browser metadata
 
@@ -273,7 +347,7 @@ Only `https://lakearrowhead.town` is indexable. Preview, localhost, alternate pr
 | --- | --- |
 | `/rss.xml` | Full-content RSS 2.0 feed matching the homepage's saved seven-day selection and ordering. Includes images, categories, source links, and stable opaque GUIDs. |
 | `/robots.txt` | Allows public content, disallows `/api/`, and advertises the sitemap only on the production origin. |
-| `/sitemap.xml` | Production only; lists the canonical homepage. `lastmod` comes from the manifest referenced by the committed index, never the current clock or a rebuild's R2 upload time. Missing/malformed metadata omits the date; storage outages return an error. |
+| `/sitemap.xml` | Production only; lists the canonical homepage, archive index, published daily archives, and evergreen resource pages. `lastmod` comes from the manifest referenced by the committed index, never the current clock or a rebuild's R2 upload time. Missing/malformed metadata omits the date; storage outages return an error. |
 | `/site.webmanifest` | English browser-mode manifest with relative root URLs, theme colors, and 192/512px icons. |
 | `/favicon.svg`, `/favicon.ico` | SVG mark and conventional ICO fallback; cached for one day. |
 | `/assets/social-card-v1.png` | 1200 × 630 branded share image. |
@@ -281,11 +355,11 @@ Only `https://lakearrowhead.town` is indexable. Preview, localhost, alternate pr
 | `/assets/apple-touch-icon-v1.png` | 180px Apple touch icon. |
 | `/assets/icon-192-v1.png`, `/assets/icon-512-v1.png` | Square manifest icons. |
 
-These routes support GET, HEAD, and ETag revalidation. Versioned artwork has one-year immutable caching. Robots and manifest responses are cached for one hour; the sitemap and RSS revalidate like the homepage and bypass CDN caching. Artwork is bundled with the Worker and needs no upload to R2. Source artwork and fonts are not public routes.
+These routes support GET, HEAD, and ETag revalidation. Versioned artwork has one-year immutable caching. Robots and manifest responses are cached for one hour; the sitemap and RSS revalidate like the homepage and bypass CDN caching. Artwork is bundled with the Worker and needs no upload to R2. Source artwork and TTF fonts are not public routes. The Worker serves generated, versioned WOFF2 fonts under `/assets/fonts/` with immutable caching.
 
-Subscribe at `https://lakearrowhead.town/rss.xml` or use the footer's **RSS feed** link. Pages also advertise one absolute RSS autodiscovery link. Each RSS description includes the complete safe Markdown-rendered story, its images, and linked group/original-post attribution. Relative body links and images resolve against the publication's site origin. RSS text deliberately normalizes CRLF and lone CR line endings to LF; existing LF characters remain unchanged. XML-invalid characters become replacement characters; raw HTML and unsafe Markdown link protocols remain disabled. RSS dates use GMT: item `pubDate` comes from `posted_at`, and `lastBuildDate` comes from the saved publication time. Before first publication, RSS is a valid empty channel without `lastBuildDate`.
+Subscribe at `https://lakearrowhead.town/rss.xml` or use the footer's **RSS feed** link. Pages also advertise one absolute RSS autodiscovery link. The channel includes a 48px image and a 15-minute TTL. Each item includes its source group as `dc:creator` and, when available, its first original/update Markdown image as `media:content`, with known dimensions and type. WebSub is deferred. Each RSS description includes the complete safe Markdown-rendered story, its images, and linked group/original-post attribution. Relative body links and images resolve against the publication's site origin. RSS text deliberately normalizes CRLF and lone CR line endings to LF; existing LF characters remain unchanged. XML-invalid characters become replacement characters; raw HTML and unsafe Markdown link protocols remain disabled. RSS dates use GMT: item `pubDate` comes from `posted_at`, and `lastBuildDate` comes from the saved publication time. Before first publication, RSS is a valid empty channel without `lastBuildDate`.
 
-RSS and HTML share the exact saved seven-day selection, including equal-time ordering and historical duplicate copies. Each stored item has a stable opaque GUID derived from its private post identity and original item position; rebuilds and new publications retain existing GUIDs. RSS is rendered into a private immutable R2 object before the homepage commit stores its reference alongside the manifest reference. A failed feed write or uncommitted homepage replacement cannot expose a newer RSS snapshot. Duplicate-only submissions make no writes. Later source damage does not alter materialized RSS; omission on a new publication follows the same rules as HTML. Private RSS object keys and source IDs are never public routes or feed fields.
+RSS and HTML share the exact saved seven-day selection, including equal-time ordering and historical duplicate copies. Attached updates appear in each story's RSS description; ordering follows latest eligible activity, while `pubDate` keeps the original source timestamp. Each stored item has a stable opaque GUID derived from its private post identity and original item position; rebuilds, appends, and new publications retain existing GUIDs. RSS is rendered into a private immutable R2 object before the homepage commit stores its reference alongside the manifest reference. A failed feed write or uncommitted homepage replacement cannot expose a newer RSS snapshot. Duplicate-only submissions make no writes. Later source damage does not alter materialized RSS; omission on a new publication follows the same rules as HTML. Private RSS object keys and source IDs are never public routes or feed fields.
 
 GUIDs remain unkeyed deterministic SHA-256 fingerprints, not a confidentiality boundary. Predictable legacy IDs and item positions can be inferred by comparing candidate hashes. No hashing secret or per-item identity migration is required; existing GUIDs remain unchanged.
 
@@ -299,6 +373,21 @@ The generator uses the existing tree path from `favicon.svg`, editable SVG templ
 
 Code deployment alone does not update an existing R2 homepage. Use the normal `deploy:preview` or `deploy` command, which queues a rebuild, and check its job until completed. Until that rebuild or a new publication commits, pre-RSS homepages have no feed reference and `/rss.xml` returns 503 with `Retry-After: 60`; discovery links also appear only after the homepage is rebuilt. A missing referenced RSS object returns the same 503 and requires a rebuild to restore it. Storage outages remain errors rather than producing a false empty feed. Then check the rendered homepage and RSS subscription/discovery links, `/rss.xml`, `/robots.txt`, `/sitemap.xml` on production, the manifest, and its linked images. Rebuilds apply metadata changes while retaining the saved feed selection and publication timestamp. Search engines and social platforms may take time to refresh their own cached previews.
 
+
+## Daily archives and local resources
+
+Daily pages at `/YYYY/MM/DD/` preserve community news after it leaves the homepage. Day headings link to these pages, and **Older news** in the footer opens `/archive/`, with dates listed newest first. All dates use `America/Los_Angeles`. A story appears on each day with original or appended source activity; later updates refresh its existing archived copies without removing earlier activity days. Each page has a dated title, canonical URL, description and a 1200 × 630 share image featuring its first headline. The homepage's existing branded social image remains static.
+
+The first rebuild seeds only the currently saved visible seven days. The first new publication also seeds that previous visible snapshot before processing the new one, even if the previous snapshot is stale. Older manifests, orphan source objects and operator backups are not scanned. Future visible publications are retained permanently. The seven-day homepage/RSS selection, 30-day API history, and duplicate rules are independent of archive retention.
+
+Private content-addressed `archive-days/*.json` objects hold complete daily content and known image dimensions. An immutable `archive-catalogs/*.json` object maps dates to data and share images, with stable story identities and meaningful modification times. The committed publication's optional `archives` reference selects that catalogue. These objects and `/assets/daily/<sha256>.png` cards are written before the existing index commit. Failed writes leave the previous public catalogue and sitemap intact. Public reads never list raw sources; missing committed archive data returns `503` with `Retry-After: 60`, while an unpublished or invalid date returns `404`. Increment `DAILY_CARD_VERSION` when changing the daily card design; affected archive entries regenerate their immutable PNG without changing content modification times. Daily HTML uses the current shared template, so template changes do not require rewriting historical content. Rebuilds preserve content modification times.
+
+Shared navigation links to `/road-conditions/`, `/power-outages/`, and `/emergency-resources/`. These pages direct readers to verified official Caltrans, Southern California Edison and San Bernardino County resources. They do not mirror current incident status.
+
+To repair an archive, pause publishers and back up the committed index, manifest, catalogue, and affected day records. Correct a selected source through the existing operator runbook, then rebuild: archived copies of that selected source refresh, including deliberate removal of its items. For content already outside the selected source history, correct the affected private daily JSON records, write them at new SHA-256-based keys, update a copied catalogue with the new keys and honest modification times, then commit its reference through a copied publication manifest and index metadata. Keep the original objects for recovery; do not overwrite immutable data or cards. If the leading headline changes, regenerate its PNG through `dailyCard` and update that catalogue entry's image reference. Verify the page, card, catalogue and sitemap together before resuming publication. Rollback must retain both v2 source revisions and archive catalogue references; older publishing code can drop those references.
+
+Default browser fonts are self-hosted DM Sans and Instrument Serif with `font-display: swap`. Newsreader and Fraunces stylesheets load only for their active/restored themes. Regenerate committed WOFF2 files offline with `npm run fonts`; retain the adjacent font licenses and bump versioned filenames when replacing released bytes.
+
 ## Upload images
 
 ```sh
@@ -307,13 +396,13 @@ Code deployment alone does not update an existing R2 homepage. Use the normal `d
   -F 'file=@photo.jpg;type=image/jpeg'
 ```
 
-Use exactly one multipart `file`. JPEG (`image/jpeg`), PNG, WebP, and GIF files up to 10 MiB are supported. The canonical media type must match the signature; aliases, generic/missing types, SVG, and contradictory types receive `415`. Signatures are checked without full image decoding or re-encoding. Let curl generate the multipart boundary.
+Use exactly one multipart `file`. JPEG (`image/jpeg`), PNG, WebP, and GIF files up to 10 MiB are supported. The canonical media type must match the signature; aliases, generic/missing types, SVG, and contradictory types receive `415`. Signatures and readable positive image dimensions are checked without full image decoding or re-encoding. JPEG orientation is accounted for; truncated headers without dimensions receive `415`. Let curl generate the multipart boundary.
 
-The response is `200 {"ok":true,"url":"https://lakearrowhead.town/images/<sha256>.jpg"}`. Identical bytes return the same URL. Images have one-year immutable browser and Cloudflare Workers cache policies; an edge cache miss reads R2. See [Workers Caching configuration](https://developers.cloudflare.com/workers/cache/configuration/).
+The response is `200 {"ok":true,"url":"https://lakearrowhead.town/images/<sha256>.jpg","width":1200,"height":800}` (plus the existing request ID). Dimensions are recorded privately in `image-metadata/<sha256>.json`. Identical bytes return the same URL. Images have one-year immutable browser and Cloudflare Workers cache policies; an edge cache miss reads R2. See [Workers Caching configuration](https://developers.cloudflare.com/workers/cache/configuration/).
 
 Upload images first, include their returned URLs as `![Description](https://lakearrowhead.town/images/<hash>.jpg)` in Markdown, then publish. Two image uploads may process concurrently per isolate; excess requests return `503` with `Retry-After: 1` before their bodies are processed.
 
-The first Markdown image appears at the upper left of the article body, with text wrapping beside and below it. Thumbnails fit within 160 × 160 px, or 96 × 96 px on screens up to 600 px wide, preserving the full image without cropping. Additional images keep their body positions and use the same size limits. Every image and article headline links to the original `post_url`; articles without images use the linked headline. Captions, formatting, and other body links are preserved. Moving an image adds no spaces: text on either side joins directly unless the author supplied whitespace. Leading caption breaks are removed; middle and trailing breaks remain. These are rendering changes only: the stored Markdown and uploaded image bytes stay intact, and template rebuilds apply the layout to the existing published snapshot.
+The first Markdown image appears at the upper left of the article body, with text wrapping beside and below it. Thumbnails fit within 160 × 160 px, or 96 × 96 px on screens up to 600 px wide, preserving the full image without cropping. Additional images keep their body positions and use the same size limits. Every image and article headline links to the original `post_url`; articles without images use the linked headline. Captions, formatting, and other body links are preserved. Moving an image adds no spaces: text on either side joins directly unless the author supplied whitespace. Leading caption breaks are removed; middle and trailing breaks remain. The first rendered content image uses `loading="eager"`; subsequent images, including update images, use `loading="lazy"`. All use `decoding="async"`. Owned uploaded images get intrinsic width/height attributes; publication and rebuilds backfill metadata for existing images from R2. External image URLs are never fetched for dimensions. These are rendering changes only: the stored Markdown and uploaded image bytes stay intact, and template rebuilds apply the layout to the existing published snapshot.
 
 ## Rebuilds, migration, and operations
 

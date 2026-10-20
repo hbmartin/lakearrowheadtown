@@ -30,7 +30,8 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   form.append('file', new File([png], 'preview.png', { type: 'image/png' }));
   const imageResponse = await fetch(`${origin}/api/images`, { method: 'POST', headers, body: form });
   assert.equal(imageResponse.status, 200, await imageResponse.clone().text());
-  const { url: imageUrl } = await imageResponse.json();
+  const { url: imageUrl, width, height } = await imageResponse.json();
+  assert.equal(width, 1); assert.equal(height, 1);
   assert.equal(new URL(imageUrl).origin, origin);
   for (let attempt = 0; attempt < 2; attempt++) {
     const image = await fetch(imageUrl);
@@ -46,6 +47,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   let previousTag;
   let previousRssTag;
   let workerVersion;
+  let story;
   const requestIds = [];
   for (let attempt = 0; attempt < 3; attempt++) {
     input.title = `${run}${attempt === 2 ? ' follow-up correction' : ''}`;
@@ -54,6 +56,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     const response = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
     assert.equal(response.status, 200, await response.clone().text());
     const result = await response.json();
+    story ??= result.items[0];
     assert.equal(result.ok, true); assert.equal(result.url, '/');
     assert.equal(result.request_id, response.headers.get('X-Request-ID'));
     requestIds.push(result.request_id);
@@ -106,6 +109,50 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert(previousTag?.startsWith('W/'), 'HTML must expose a weak ETag');
     if (edge) assert.match(homepage.headers.get('content-encoding') || '', /gzip|br|zstd/, 'Cloudflare must compress HTML');
   }
+  const listStories = async () => {
+    let cursor;
+    const posts = [];
+    do {
+      const response = await fetch(`${origin}/api/posts?days=7${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, { headers });
+      assert.equal(response.status, 200, await response.clone().text());
+      assert.equal(response.headers.get('Cache-Control'), 'no-store');
+      const result = await response.json();
+      assert.equal(result.ok, true);
+      assert.equal(result.request_id, response.headers.get('X-Request-ID'));
+      posts.push(...result.posts);
+      cursor = result.next_cursor;
+    } while (cursor);
+    return posts;
+  };
+  assert((await listStories()).some(post => post.post_id === story.post_id && post.items.some(item => item.item_index === story.item_index)));
+  const update = { group: 'Preview follow-up', post_url: `${input.items[0].post_url}&attached=1`, body: `Attached **source update** for ${run}.`, posted_at: new Date().toISOString() };
+  const updatePath = `${origin}/api/posts/${story.post_id}/items/${story.item_index}/updates`;
+  let appendedTag;
+  let appendedRssTag;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await fetch(updatePath, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(update) });
+    assert.equal(response.status, 200, await response.clone().text());
+    const result = await response.json();
+    assert.equal(result.status, attempt ? 'duplicate' : 'appended');
+    assert.equal(result.post_id, story.post_id); assert.equal(result.item_index, story.item_index); assert.equal(result.update_index, 0);
+    assert(result.message); assert.equal(result.request_id, response.headers.get('X-Request-ID')); requestIds.push(result.request_id);
+    if (attempt) assert.equal(result.suggestion.action, 'review_existing_story');
+    const homepage = await fetch(origin, { headers: { 'If-None-Match': appendedTag ?? previousTag } });
+    const rss = await fetch(`${origin}/rss.xml`, { headers: { 'If-None-Match': appendedRssTag ?? previousRssTag } });
+    assert.equal(homepage.status, attempt ? 304 : 200); assert.equal(rss.status, attempt ? 304 : 200);
+    checkRssHeaders(rss);
+    if (!attempt) {
+      assert((await homepage.text()).includes('Attached <strong>source update</strong>'));
+      const xml = await rss.text();
+      const parser = new SaxesParser({ xmlns: true }); parser.write(xml).close();
+      assert(xml.includes('attached=1'));
+      appendedTag = homepage.headers.get('etag'); appendedRssTag = rss.headers.get('etag');
+      assert(appendedTag?.startsWith('W/')); assert(appendedRssTag?.startsWith('W/'));
+    }
+  }
+  const readStory = (await listStories()).find(post => post.post_id === story.post_id).items.find(item => item.item_index === story.item_index);
+  assert.equal(readStory.updates.length, 1); assert.equal(readStory.updates[0].post_url, update.post_url);
+  previousTag = appendedTag; previousRssTag = appendedRssTag;
   const empty = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ ...input, items: [] }) });
   assert.equal(empty.status, 400);
   const invalid = await empty.json();
@@ -131,6 +178,39 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   assert.equal((await fetch(`${origin}/api/digests`, { method: 'POST', body: '{}' })).status, 401);
   assert.equal((await fetch(`${origin}/digests/2026-10-16`)).status, 404);
   assert.equal((await fetch(`${origin}/posts/`)).status, 404);
+  const seoHtml = await (await fetch(origin)).text();
+  assert(seoHtml.includes('Lake Arrowhead News, Alerts &amp; Events | Lake Arrowhead . Town'));
+  assert(seoHtml.includes('"alternateName":["Lake Arrowhead Town","lakearrowhead.town"]'));
+  assert(seoHtml.includes('href="/archive/"'));
+  const images = [...seoHtml.matchAll(/<img\b[^>]*>/g)].map(match => match[0]);
+  assert.equal(images.filter(tag => tag.includes('loading="eager"')).length, 1);
+  assert(images.every(tag => tag.includes('decoding="async"')));
+  assert(images.some(tag => tag.includes(imageUrl) && tag.includes('width="1" height="1"')));
+  const dailyPath = seoHtml.match(/<h2 id="day-[^"]+"><a href="(\/\d{4}\/\d{2}\/\d{2}\/)"/)[1];
+  const daily = await fetch(origin + dailyPath);
+  assert.equal(daily.status, 200);
+  const dailyHtml = await daily.text();
+  assert(dailyHtml.includes(`<link rel="canonical" href="${origin}${dailyPath}">`));
+  assert.match(dailyHtml, /<title>Lake Arrowhead news — /);
+  const cardUrl = dailyHtml.match(/<meta property="og:image" content="([^"]+)"/)[1];
+  assert.equal(new URL(cardUrl).origin, origin);
+  const card = await fetch(cardUrl);
+  assert.equal(card.status, 200); assert.equal(card.headers.get('content-type'), 'image/png');
+  const cardBytes = Buffer.from(await card.arrayBuffer());
+  assert.equal(cardBytes.readUInt32BE(16), 1200); assert.equal(cardBytes.readUInt32BE(20), 630);
+  const archive = await fetch(`${origin}/archive/`);
+  assert.equal(archive.status, 200); assert((await archive.text()).includes(dailyPath));
+  for (const path of ['/road-conditions/', '/power-outages/', '/emergency-resources/']) {
+    const page = await fetch(origin + path);
+    assert.equal(page.status, 200); assert.equal(page.headers.get('X-Robots-Tag'), 'noindex');
+    assert((await page.text()).includes(`<link rel="canonical" href="${origin}${path}">`));
+  }
+  const font = await fetch(`${origin}/assets/fonts/dm-sans-v1.woff2`);
+  assert.equal(font.status, 200); assert.equal(font.headers.get('content-type'), 'font/woff2');
+  const feed = await (await fetch(`${origin}/rss.xml`)).text();
+  new SaxesParser({ xmlns: true }).write(feed).close();
+  assert(feed.includes('<ttl>15</ttl>')); assert(feed.includes('<image>')); assert(feed.includes('<dc:creator>'));
+  assert(feed.includes('<media:content '));
   const job = await maintenance('start', 'preview', undefined, { secret, origin, request: fetch });
   (options.log ?? console.log)(`Preview smoke checks passed: ${origin}. Rebuild ${job.id} queued; check its status manually.`);
   return { origin, job, request_ids: requestIds, worker_version: workerVersion };

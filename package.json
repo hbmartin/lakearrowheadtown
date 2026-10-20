@@ -16,9 +16,12 @@
     "secret:migrate-production": "node scripts/migrate-production-secret.mjs",
     "rebuild": "node scripts/maintenance.mjs start",
     "rebuild:status": "node scripts/maintenance.mjs status",
-    "rebuild:resume": "node scripts/maintenance.mjs resume"
+    "rebuild:resume": "node scripts/maintenance.mjs resume",
+    "fonts": "node scripts/generate-fonts.mjs"
   },
   "dependencies": {
+    "@resvg/resvg-wasm": "^2.6.2",
+    "image-size": "^2.0.4",
     "markdown-it": "^15.0.3"
   },
   "devDependencies": {
@@ -30,6 +33,7 @@
     "saxes": "^6.0.0",
     "typescript": "^5.9.3",
     "vitest": "^4.1.0",
+    "wawoff2": "^2.0.1",
     "wrangler": "^4.151.1"
   }
 }

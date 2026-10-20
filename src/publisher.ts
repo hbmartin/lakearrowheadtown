@@ -1,8 +1,9 @@
 import { DurableObject } from 'cloudflare:workers';
-import { initialMigration, migrateBatch, PublicationError, publishDigest, rebuildHomepage } from './publishing';
+import { appendUpdate, initialMigration, migrateBatch, PublicationError, publishDigest, rebuildHomepage } from './publishing';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { asHttpError, boundary, publicationFailure } from './errors';
-import type { Digest, Env, Migration, OperationContext, PublishReply, RebuildJob } from './types';
+import { readPosts, type PostsReply } from './posts';
+import type { AppendReply, Digest, Env, Migration, OperationContext, PublishReply, RebuildJob, StoryUpdate } from './types';
 
 // Inspection is read-only. Callers choose when to prune missing/completed references.
 async function queueHead(ids: string[], read: (id: string) => Promise<RebuildJob | undefined>) {
@@ -55,6 +56,47 @@ export class DigestPublisher extends DurableObject<Env> {
         const failure = publicationFailure(cause, stage, publication_status);
         emit('publish_failed', context, { stage, publication_status, publication_outcome: 'failed', error_code: failure.code, ...safeError(cause) }, 'error');
         return { ok: false, failure };
+      }
+    }, context);
+  }
+
+  async appendUpdateV1(postId: string, itemIndex: number, update: StoryUpdate, origin: string, context?: OperationContext): Promise<AppendReply> {
+    context = this.executingContext(context);
+    return this.serialize(async () => {
+      try {
+        const migration = await new OperationTrace(context).run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
+        return { ok: true, result: await appendUpdate(this.env.SITE_BUCKET, postId, itemIndex, update, origin, new Date(), migration?.complete, context) };
+      } catch (error) {
+        const stage = error instanceof PublicationError ? error.stage : 'migration_state';
+        const publication_status = error instanceof PublicationError ? error.publication_status : 'not_committed';
+        const cause = error instanceof PublicationError ? error.cause : error;
+        const failure = publicationFailure(cause, stage, publication_status);
+        emit('append_failed', context, { stage, publication_status, publication_outcome: 'failed', error_code: failure.code, ...safeError(cause) }, 'error');
+        return { ok: false, failure };
+      }
+    }, context);
+  }
+
+  async readPostsV1(query: string, context?: OperationContext): Promise<PostsReply> {
+    context = this.executingContext(context);
+    return this.serialize(async () => {
+      const trace = new OperationTrace(context);
+      try {
+        // The publishing credential is known to callers, so it cannot sign trusted cursors.
+        const key = await trace.run('cursor_key', () => boundary('storage', async () => {
+          let key = await this.ctx.storage.get<string>('posts_cursor_key');
+          if (!key) {
+            key = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+            await this.ctx.storage.put('posts_cursor_key', key);
+          }
+          return key;
+        }));
+        return { ok: true, result: await trace.run('posts_read', () => readPosts(this.env.SITE_BUCKET, new URLSearchParams(query), key)) };
+      } catch (error) {
+        const failure = asHttpError(error);
+        const stage = trace.failed_stage ?? 'posts_read';
+        emit('posts_read_failed', context, { stage, error_code: failure.code, ...safeError(error) }, 'error');
+        return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, retryable: failure.retryable, stage, publication_status: 'not_attempted' } };
       }
     }, context);
   }

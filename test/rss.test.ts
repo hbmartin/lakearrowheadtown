@@ -65,6 +65,9 @@ describe('RSS rendering', () => {
     expect(child(feed, 'link').text).toBe(SITE.origin + '/');
     expect(child(feed, 'description').text).toBe(SITE.description);
     expect(child(feed, 'language').text).toBe(SITE.language);
+    expect(child(feed, 'ttl').text).toBe('15');
+    expect(child(child(feed, 'image'), 'url').text).toBe(SITE.origin + '/assets/favicon-48-v1.png');
+    expect(child(child(feed, 'image'), 'width').text).toBe('48');
     expect(child(feed, 'atom:link')).toMatchObject({ uri: 'http://www.w3.org/2005/Atom', attrs: { href: SITE.origin + '/rss.xml', rel: 'self', type: 'application/rss+xml' } });
     expect(items(xml)).toEqual([]);
     expect(child(feed, 'lastBuildDate')).toBeUndefined();
@@ -105,6 +108,8 @@ describe('RSS rendering', () => {
     const input = digest();
     input.items[0].body = '**Wind** and *weather*.\n\n![Pine tree](/images/pine.png "Pine caption")\n\nCaption text.\n\n- First\n- Second\n\n[Details](updates/road?a=1&b=2) [Anchor](#news) [Email](mailto:news@example.com)\n\n<script>bad()</script> [Unsafe](javascript:alert(1))';
     const item = items(renderRss([stored(input)], { origin: SITE.origin, publication }))[0];
+    expect(child(item, 'dc:creator')).toMatchObject({ uri: 'http://purl.org/dc/elements/1.1/', text: 'Community group' });
+    expect(child(item, 'media:content')).toMatchObject({ uri: 'http://search.yahoo.com/mrss/', attrs: { url: SITE.origin + '/images/pine.png', medium: 'image' } });
     const body = child(item, 'description').text;
     expect(body).toContain('<strong>Wind</strong> and <em>weather</em>');
     expect(body).toContain(`src="${SITE.origin}/images/pine.png"`);

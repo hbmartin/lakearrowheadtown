@@ -1,3 +1,7 @@
+import dmSans from '../assets/fonts/dm-sans-v1.woff2';
+import instrumentSerif from '../assets/fonts/instrument-serif-v1.woff2';
+import { archivePath, loadCatalog } from './archives';
+import { RESOURCE_PAGES } from './resources';
 import faviconSvg from '../favicon.svg';
 import social from '../assets/social-card-v1.png';
 import favicon from '../assets/favicon-v1.ico';
@@ -29,11 +33,13 @@ const resources = new Map<string, Resource>([
     [ASSETS.social, social], [ASSETS.favicon48, favicon48], [ASSETS.appleTouch, appleTouch],
     [ASSETS.icon192, icon192], [ASSETS.icon512, icon512],
   ] as const).map(([path, body]): [string, Resource] => [path, { body, type: 'image/png', cache: IMAGE_CACHE }]),
+  ['/assets/fonts/dm-sans-v1.woff2', { body: dmSans, type: 'font/woff2', cache: IMAGE_CACHE }],
+  ['/assets/fonts/instrument-serif-v1.woff2', { body: instrumentSerif, type: 'font/woff2', cache: IMAGE_CACHE }],
   ['/site.webmanifest', { body: webManifest(), type: 'application/manifest+json; charset=utf-8', cache: 'public, max-age=3600' }],
 ]);
 const robots = [false, true].map(indexable => ({ body: robotsText(indexable), type: 'text/plain; charset=utf-8', cache: 'public, max-age=3600' }));
 
-async function resourceResponse(request: Request, resource: Resource): Promise<Response> {
+export async function resourceResponse(request: Request, resource: Resource): Promise<Response> {
   // Cache hashes for bundled resources, without caching request-specific headers.
   resource.etag ??= hashBytes(typeof resource.body === 'string' ? new TextEncoder().encode(resource.body) : new Uint8Array(resource.body))
     .then(hash => `${typeof resource.body === 'string' ? 'W/' : ''}"${hash}"`);
@@ -49,22 +55,23 @@ async function resourceResponse(request: Request, resource: Resource): Promise<R
   });
 }
 
-async function committedPublicationTime(bucket: ContentBucket): Promise<string | undefined> {
+async function committedMetadata(bucket: ContentBucket): Promise<{ publishedAt?: string; archives?: string }> {
   const index = await boundary('storage', () => bucket.head('pages/index.html'));
   const key = index?.customMetadata?.manifest;
-  if (!key) return;
+  if (!key) return {};
   const manifest = await boundary('storage', () => bucket.get(key));
-  if (!manifest) return;
+  if (!manifest) return {};
   // Transport/storage failures remain errors; malformed or absent metadata simply
   // cannot supply an honest lastmod. Never scan sources or use index upload time.
   const text = await boundary('storage', () => manifest.text());
   let value: unknown;
   try { value = JSON.parse(text); }
-  catch (error) { if (error instanceof SyntaxError) return; throw error; }
+  catch (error) { if (error instanceof SyntaxError) return {}; throw error; }
   const time = value && typeof value === 'object' && 'published_at' in value ? value.published_at : undefined;
-  if (typeof time !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(time)) return;
-  const date = new Date(time);
-  return Number.isFinite(date.getTime()) && date.toISOString() === time ? time : undefined;
+  const archives = value && typeof value === 'object' && 'archives' in value && typeof value.archives === 'string' ? value.archives : undefined;
+  const date = typeof time === 'string' ? new Date(time) : undefined;
+  const publishedAt = typeof time === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(time) && date && Number.isFinite(date.getTime()) && date.toISOString() === time ? time : undefined;
+  return { publishedAt, archives };
 }
 
 export function isIndexable(origin: string, requestOrigin: string): boolean {
@@ -76,8 +83,11 @@ export async function metadataResource(request: Request, bucket: ContentBucket, 
   const indexable = isIndexable(origin, url.origin);
   if (url.pathname === '/robots.txt') return resourceResponse(request, robots[Number(indexable)]);
   if (url.pathname === '/sitemap.xml' && indexable) {
+    const committed = await committedMetadata(bucket);
+    const catalog = await loadCatalog(bucket, committed.archives);
+    const pages = [{ path: '/archive/' }, ...RESOURCE_PAGES.map(page => ({ path: page.path })), ...Object.entries(catalog.days).sort(([a], [b]) => b.localeCompare(a)).map(([date, ref]) => ({ path: archivePath(date), modified: ref.modified }))];
     return resourceResponse(request, {
-      body: sitemapXml(await committedPublicationTime(bucket)), type: 'application/xml; charset=utf-8', cache: HTML_CACHE,
+      body: sitemapXml(committed.publishedAt, pages), type: 'application/xml; charset=utf-8', cache: HTML_CACHE,
     });
   }
   const resource = resources.get(url.pathname);

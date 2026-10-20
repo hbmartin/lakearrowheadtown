@@ -2,7 +2,18 @@
 <html lang="en" data-theme="deep-lake-lodge">
 <head>
   <meta charset="UTF-8" />
-  <script>
+  <script id="theme-fonts">
+    // Load optional display families only when the active theme needs them.
+    window.loadThemeFont = theme => {
+      const families = { 'golden-hour-dock': 'Newsreader', 'village-heritage': 'Fraunces' };
+      const family = families[theme];
+      if (!family || document.getElementById(`font-${family}`)) return;
+      const link = document.createElement('link');
+      link.id = `font-${family}`;
+      link.rel = 'stylesheet';
+      link.href = `https://fonts.googleapis.com/css2?family=${family}:wght@400;500&display=swap`;
+      document.head.append(link);
+    };
     // Restore the saved palette before styles or page content can paint.
     (() => {
       const themes = ['deep-lake-lodge', 'golden-hour-dock', 'morning-mist', 'village-heritage', 'night-sky'];
@@ -15,13 +26,19 @@
         // The default palette still works when browser storage is unavailable.
       }
     })();
+    window.loadThemeFont(document.documentElement.dataset.theme);
   </script>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <!-- page-meta -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Fraunces:wght@400;500&amp;family=Instrument+Serif&amp;family=Newsreader:wght@400;500&amp;display=swap" rel="stylesheet">
+  <link rel="preload" href="/assets/fonts/dm-sans-v1.woff2" as="font" type="font/woff2" crossorigin>
   <style>
+    @font-face { font-family: 'DM Sans'; src: url('/assets/fonts/dm-sans-v1.woff2') format('woff2'); font-weight: 100 1000; font-style: normal; font-display: swap; }
+    @font-face { font-family: 'Instrument Serif'; src: url('/assets/fonts/instrument-serif-v1.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+    .resource-nav { display: flex; flex-wrap: wrap; gap: .5rem 1.25rem; margin: 0 0 1.5rem; font-size: .875rem; }
+    .resource-nav a, .digest-header a { color: inherit; }
+    .resource-page { max-width: 48rem; }
+    .resource-page h2 { margin-bottom: 1rem; }
+    .resource-page p, .resource-page ul { margin: 1rem 0; }
     /* Modern reset: normalize the canvas while keeping native accessibility. */
     *, *::before, *::after { box-sizing: border-box; }
     html {
@@ -231,6 +248,9 @@
     .digest-item { padding-block: 1.75rem; border-top: 1px solid var(--border); }
     .digest-header + .digest-item { padding-top: 0; border-top: 0; }
     .item-meta { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: baseline; color: var(--muted); font-size: 0.8125rem; }
+    .story-updated { margin-top: 1rem; }
+    .story-updates { margin-top: 0.75rem; padding-left: 1rem; border-left: 2px solid var(--border); }
+    .story-update + .story-update { margin-top: 1.25rem; }
     .category { padding: 0.125rem 0.5rem; border: 1px solid var(--border); border-radius: 0.375rem; }
     .digest-item h3 { margin-top: 0.875rem; font-size: clamp(1.5rem, 3vw, 2rem); line-height: 1.2; }
     .headline-link { display: block; color: inherit; text-decoration: none; }
@@ -446,12 +466,13 @@
     </div>
   </header>
   <main>
+    <nav class="resource-nav" aria-label="Local resources"><a href="/road-conditions/">Road conditions</a><a href="/power-outages/">Power outages</a><a href="/emergency-resources/">Emergency resources</a></nav>
     <!-- digests:start -->
     <p class="empty-state">No posts from the past week. Check back for news from around the mountain.</p>
     <!-- digests:end -->
   </main>
   <footer>
-    <p>Community news from around the mountain. <a href="/rss.xml">RSS feed</a></p>
+    <p>Community news from around the mountain. <a href="/rss.xml">RSS feed</a> · <a href="/archive/">Older news</a></p>
     <!-- snapshot-meta -->
   </footer>
   <button class="back-to-top" id="back-to-top" type="button" aria-label="Back to top" title="Back to top" hidden>
@@ -518,6 +539,7 @@
       function applyTheme(value, persist = false) {
         const selected = radios.find(radio => radio.value === value) || radios[0];
         document.documentElement.dataset.theme = selected.value;
+        window.loadThemeFont?.(selected.value);
         selected.checked = true;
         const name = selected.closest('label').querySelector('.theme-name').textContent;
         trigger.setAttribute('aria-label', `Choose theme (current: ${name})`);
