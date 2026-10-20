@@ -1,4 +1,5 @@
-import type { AppendReply, PublicationStatus, PublishFailure, PublishReply } from './types';
+import type { AppendReply, BatchReply, PublicationStatus, PublishFailure, PublishReply, RetractReply } from './types';
+import { isTimestamp } from './validation';
 
 export interface ValidationIssue { path: string; code: string; message: string }
 interface ErrorOptions {
@@ -118,4 +119,22 @@ export function isAppendReply(value: unknown): value is AppendReply {
   return reply.ok === true && !!r && ['appended', 'duplicate'].includes(r.status) && typeof r.post_id === 'string'
     && Number.isSafeInteger(r.item_index) && r.item_index >= 0 && typeof r.message === 'string'
     && (r.update_index === undefined ? r.status === 'duplicate' : Number.isSafeInteger(r.update_index) && r.update_index >= 0);
+}
+
+export function isRetractReply(value: unknown): value is RetractReply {
+  if (!value || typeof value !== 'object') return false;
+  const reply = value as Record<string, any>;
+  if (reply.ok === false) return isPublishReply(value);
+  return reply.ok === true && !!reply.result && typeof reply.result.post_id === 'string'
+    && ['retracted', 'already_retracted'].includes(reply.result.status) && isTimestamp(reply.result.retracted_at);
+}
+
+export function isBatchReply(value: unknown): value is BatchReply {
+  if (!value || typeof value !== 'object') return false;
+  const reply = value as Record<string, any>;
+  if (reply.ok === false) return isPublishReply(value);
+  const r = reply.result;
+  return reply.ok === true && !!r && typeof r.client_ref === 'string' && !!r.post && typeof r.post.id === 'string'
+    && typeof r.post.date === 'string' && isTimestamp(r.post.received_at) && ['published', 'retracted'].includes(r.status)
+    && (r.status !== 'retracted' || isTimestamp(r.retracted_at));
 }

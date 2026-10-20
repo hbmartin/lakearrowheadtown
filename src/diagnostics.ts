@@ -28,6 +28,7 @@ export function emit(event: string, context: OperationContext | undefined, field
 export class OperationTrace {
   stage: string | undefined;
   failed_stage: string | undefined;
+  phase?: 'preparation' | 'commit';
   publication_status: PublicationStatus = 'not_committed';
   constructor(public context?: OperationContext) {}
 
@@ -40,7 +41,7 @@ export class OperationTrace {
     catch (error) { outcome = 'error'; this.failed_stage ??= stage; throw error; }
     finally {
       this.stage = previous;
-      emit('operation_stage', this.context, { stage, ...fields, outcome, duration_ms: performance.now() - started });
+      emit('operation_stage', this.context, { stage, ...(this.phase ? { phase: this.phase } : {}), ...fields, outcome, duration_ms: performance.now() - started });
     }
   }
 }

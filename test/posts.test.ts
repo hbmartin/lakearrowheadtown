@@ -54,7 +54,7 @@ describe('authenticated story reads and updates', () => {
     }
     const response = await request('/api/posts');
     expect(response.headers.get('cache-control')).toBe('no-store');
-    expect(response.headers.get('x-api-version')).toBe('2');
+    expect(response.headers.get('x-api-version')).toBe('3');
     expect(await response.json()).toMatchObject({ ok: true, request_id: response.headers.get('x-request-id'), days: 7, posts: [], published_at: null, next_cursor: null });
     expect((await request('/api/posts', { method: 'POST' })).status).toBe(405);
     const head = await request('/api/posts', { method: 'HEAD' });
@@ -69,7 +69,7 @@ describe('authenticated story reads and updates', () => {
     expect((await append(id, { group: 'Community', group_url: 'https://example.com/group2', post_url: 'https://example.com/link-only', posted_at: now() })).status).toBe(200);
     expect(await (await bindings.SITE_BUCKET.get(postKey(first.post!)))!.text()).toBe(original);
     const publication = await currentPublication(bindings.SITE_BUCKET);
-    expect(publication.version).toBe(2);
+    expect(publication.version).toBe(3);
     expect(publication.posts[0].key).toMatch(/^post-revisions\//);
     const result = await (await request('/api/posts')).json<any>();
     expect(result.posts[0]).toMatchObject({ post_id: id, items: [{ item_index: 0, headline: 'Original', body: 'Original **story**',

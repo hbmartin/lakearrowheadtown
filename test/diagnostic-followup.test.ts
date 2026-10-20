@@ -33,7 +33,7 @@ describe('API v2 configuration and transport classification', () => {
     for (const PUBLISHER of [undefined, {}, { getByName: 1 }, { getByName: () => null }]) {
       const response = await request(path, { method, headers, ...(path.endsWith('digests') ? { body: JSON.stringify(digest()) } : {}) }, { PUBLISHER: PUBLISHER as unknown as Env['PUBLISHER'] });
       expect(response.status).toBe(503);
-      expect(response.headers.get('X-API-Version')).toBe('2');
+      expect(response.headers.get('X-API-Version')).toBe('3');
       const result = await response.json<any>();
       expect(result).toMatchObject({ code: 'configuration_error', retryable: false, diagnostics: { stage: 'publisher_lookup' } });
       if (path.endsWith('digests')) expect(result.publication_status).toBe('not_attempted');
@@ -192,7 +192,7 @@ describe('parser locations and timing semantics', () => {
     expect(await response.json()).toMatchObject({ code: 'invalid_json', details: {} });
   });
   it('retains rejected digest request logs with explicit not-attempted publication status', async () => {
-    const rejected = [await request('/api/digests', { method: 'POST' }), await submit({ API_SECRET: '' }), await request('/api/digests'), await request('/api/digests', { method: 'POST', headers, body: '{}' })];
+    const rejected = [await request('/api/digests', { method: 'POST' }), await submit({ API_SECRET: '' }), await request('/api/digests', { method: 'PATCH' }), await request('/api/digests', { method: 'POST', headers, body: '{}' })];
     for (const response of rejected) {
       const result = await response.json<any>();
       expect(events).toContainEqual(expect.objectContaining({ event: 'request_completed', request_id: result.request_id, publication_outcome: 'failed', publication_status: 'not_attempted' }));

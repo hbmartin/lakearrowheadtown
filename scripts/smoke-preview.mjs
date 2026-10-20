@@ -25,6 +25,11 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const fetch = (url, init = {}) => (options.request ?? globalThis.fetch)(url, { ...init, signal: AbortSignal.timeout(30000) });
   const secret = validateCredential((options.credential ?? readCredential)('preview'));
   const headers = { Authorization: `Bearer ${secret}` };
+  // Confirm support through a read before any dry_run request reaches an older writer.
+  const capability = await fetch(`${origin}/api/posts?fields=index`, { headers });
+  assert.equal(capability.status, 200, await capability.clone().text());
+  assert.equal(capability.headers.get('X-API-Version'), '3');
+  assert.equal((await capability.json()).fields, 'index');
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
   const form = new FormData();
   form.append('file', new File([png], 'preview.png', { type: 'image/png' }));
@@ -42,6 +47,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const run = `Preview verification ${crypto.randomUUID()}`;
   const input = {
     date: '2099-01-01', title: run, source: 'deployment-smoke-test',
+    client_ref: `smoke:${crypto.randomUUID()}`,
     items: [{ group: 'Preview verification', group_url: 'https://lakearrowhead.town/', headline: run, body: `This is preview test content.\n\n**Markdown works.**\n\n![Uploaded image](${imageUrl})`, post_url: `https://lakearrowhead.town/?smoke=${encodeURIComponent(run)}`, category: 'announcement', posted_at: new Date().toISOString() }],
   };
   let previousTag;
@@ -52,7 +58,15 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
     input.title = `${run}${attempt === 2 ? ' follow-up correction' : ''}`;
     input.items[0].headline = input.title;
-    if (attempt === 2) input.items[0].post_url += '&followup=1';
+    if (attempt === 2) { input.items[0].post_url += '&followup=1'; input.client_ref += ':followup'; }
+    const beforePreview = await fetch(origin, { method: 'HEAD' });
+    assert.equal(beforePreview.status, 200);
+    const preview = await fetch(`${origin}/api/digests?dry_run=true`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+    assert.equal(preview.status, 200, await preview.clone().text());
+    const planned = await preview.json();
+    assert.equal(planned.dry_run, true); assert.equal(planned.committed, false); assert(planned.checked_at);
+    assert.equal(planned.counts.published, attempt === 1 ? 0 : 1);
+    assert.equal((await fetch(origin, { method: 'HEAD', headers: { 'If-None-Match': beforePreview.headers.get('etag') } })).status, 304);
     const response = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
     assert.equal(response.status, 200, await response.clone().text());
     const result = await response.json();
@@ -60,13 +74,19 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert.equal(result.ok, true); assert.equal(result.url, '/');
     assert.equal(result.request_id, response.headers.get('X-Request-ID'));
     requestIds.push(result.request_id);
-    assert.equal(response.headers.get('X-API-Version'), '2');
+    assert.equal(response.headers.get('X-API-Version'), '3');
     assert(response.headers.get('X-Worker-Version'));
     workerVersion ??= response.headers.get('X-Worker-Version');
     assert.equal(response.headers.get('X-Worker-Version'), workerVersion);
     assert.equal(result.duplicate, attempt === 1);
     assert.deepEqual(result.counts, { submitted: 1, published: attempt === 1 ? 0 : 1, duplicates: attempt === 1 ? 1 : 0 });
     assert.equal(result.post === null, attempt === 1);
+    assert.equal(result.client_ref, input.client_ref);
+    const lookup = await fetch(`${origin}/api/digests?client_ref=${encodeURIComponent(input.client_ref)}`, { headers });
+    assert.equal(lookup.status, 200);
+    const batch = await lookup.json();
+    assert.equal(batch.status, 'published');
+    assert.equal(batch.post.id, attempt === 1 ? story.post_id : result.post.id);
     const homepage = await fetch(origin, { headers: { 'Accept-Encoding': 'gzip', ...(previousTag ? { 'If-None-Match': previousTag } : {}) } });
     assert.equal(homepage.status, attempt === 1 ? 304 : 200, 'Duplicates must preserve the homepage and ETag');
     const rss = await fetch(`${origin}/rss.xml`, { headers: previousRssTag ? { 'If-None-Match': previousRssTag } : {} });
@@ -130,6 +150,10 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   let appendedTag;
   let appendedRssTag;
   for (let attempt = 0; attempt < 2; attempt++) {
+    const preview = await fetch(`${updatePath}?dry_run=true`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(update) });
+    assert.equal(preview.status, 200, await preview.clone().text());
+    const planned = await preview.json();
+    assert.equal(planned.dry_run, true); assert.equal(planned.committed, false); assert.equal(planned.status, attempt ? 'duplicate' : 'appended');
     const response = await fetch(updatePath, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(update) });
     assert.equal(response.status, 200, await response.clone().text());
     const result = await response.json();
@@ -152,6 +176,11 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   }
   const readStory = (await listStories()).find(post => post.post_id === story.post_id).items.find(item => item.item_index === story.item_index);
   assert.equal(readStory.updates.length, 1); assert.equal(readStory.updates[0].post_url, update.post_url);
+  const compact = await fetch(`${origin}/api/posts?days=30&fields=index`, { headers });
+  assert.equal(compact.status, 200);
+  const compactBody = await compact.json();
+  assert.equal(compactBody.fields, 'index');
+  assert(compactBody.posts.every(post => !('title' in post) && post.items.every(item => !('body' in item) && item.updates.every(source => !('body' in source)))));
   previousTag = appendedTag; previousRssTag = appendedRssTag;
   const empty = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ ...input, items: [] }) });
   assert.equal(empty.status, 400);
@@ -178,6 +207,19 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   assert.equal((await fetch(`${origin}/api/digests`, { method: 'POST', body: '{}' })).status, 401);
   assert.equal((await fetch(`${origin}/digests/2026-10-16`)).status, 404);
   assert.equal((await fetch(`${origin}/posts/`)).status, 404);
+  // Retract a separate labeled batch so the main HTML/RSS/archive checks retain their fixtures.
+  const cleanupInput = { ...input, client_ref: `${input.client_ref}:retract`, items: [{ ...input.items[0], headline: 'Self-retraction smoke fixture', post_url: `${input.items[0].post_url}&retract=1` }] };
+  const cleanupPublish = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(cleanupInput) });
+  assert.equal(cleanupPublish.status, 200);
+  const cleanupId = (await cleanupPublish.json()).post.id;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await fetch(`${origin}/api/posts/${cleanupId}/retract`, { method: 'POST', headers });
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal((await response.json()).status, attempt ? 'already_retracted' : 'retracted');
+  }
+  const cleanupLookup = await fetch(`${origin}/api/digests?client_ref=${encodeURIComponent(cleanupInput.client_ref)}`, { headers });
+  assert.equal((await cleanupLookup.json()).status, 'retracted');
+  assert(!(await listStories()).some(post => post.post_id === cleanupId));
   const seoHtml = await (await fetch(origin)).text();
   assert(seoHtml.includes('Lake Arrowhead News, Alerts &amp; Events | Lake Arrowhead . Town'));
   assert(seoHtml.includes('"alternateName":["Lake Arrowhead Town","lakearrowhead.town"]'));

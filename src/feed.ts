@@ -41,7 +41,7 @@ export function selectFeedItems(posts: StoredPost[], publication?: Publication) 
   const dates = snapshotDates(publication);
   const history = publication?.snapshot_date ? recentDates(new Date(`${publication.snapshot_date}T12:00:00Z`), 30) : [];
   const items = posts.flatMap(post => post.items.flatMap((item, itemIndex) => {
-    if (publication?.version === 2 && history.length && !history.includes(localDate(new Date(lastReceivedAt(post, item))))) return [];
+    if (publication && publication.version >= 2 && history.length && !history.includes(localDate(new Date(lastReceivedAt(post, item))))) return [];
     const activity = latestActivity(item, dates.length ? dates : undefined);
     return activity ? [{ item, postId: post.id, itemIndex, activity,
       date: localDate(new Date(activity)), timestamp: Date.parse(activity) }] : [];

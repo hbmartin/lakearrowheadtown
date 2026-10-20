@@ -143,7 +143,7 @@ describe('public errors', () => {
       const id = response.headers.get('X-Request-ID');
       expect(id).toMatch(/^[a-f0-9-]{36}$/);
       expect(response.headers.get('X-Worker-Version')).toBeTruthy();
-      expect(response.headers.get('X-API-Version')).toBe('2');
+      expect(response.headers.get('X-API-Version')).toBe('3');
       if (method === 'HEAD') expect(await response.text()).toBe('');
       else expect(await response.json()).toMatchObject({ code: 'not_found', request_id: id, diagnostics: { stage: 'public_read' } });
       const wrongCase = await request('/API/missing', { method });

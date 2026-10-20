@@ -80,7 +80,7 @@ it('shares one paginated bootstrap discovery and still discovers late arrivals o
   await bindings.SITE_BUCKET.put('digests/2026-08-03.json', JSON.stringify(digest('Late')));
   await publishDigest(bindings.SITE_BUCKET, digest('Next'), origin, now);
   const publication = await currentPublication(bindings.SITE_BUCKET);
-  expect(publication.version).toBe(2);
+  expect(publication.version).toBe(3);
   expect(publication.posts.some(ref => ref.id === 'legacy-2026-08-03')).toBe(true);
   expect(publication.legacy_receipts?.['legacy-2026-08-03']).toBeDefined();
 });

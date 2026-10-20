@@ -1,10 +1,11 @@
 import { DurableObject } from 'cloudflare:workers';
-import { appendUpdate, currentPublication, initialMigration, migrateBatch, PublicationError, publishDigest, rebuildHomepage } from './publishing';
+import { appendUpdate, currentPublication, initialMigration, migrateBatch, PublicationError, publishDigest, rebuildHomepage, retractPost } from './publishing';
+import { findBatch, loadHistoryIndex } from './history-index';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { committedSnapshot } from './committed';
 import { asHttpError, boundary, publicationFailure } from './errors';
 import { readPosts, type PostsReply } from './posts';
-import type { AppendReply, Digest, Env, Migration, OperationContext, PublishFailure, PublishReply, RebuildJob, StoryUpdate } from './types';
+import type { AppendReply, BatchReply, Digest, Env, Migration, OperationContext, PublishFailure, PublishReply, RebuildJob, RetractReply, StoryUpdate } from './types';
 
 // Inspection is read-only. Callers choose when to prune missing/completed references.
 async function queueHead(ids: string[], read: (id: string) => Promise<RebuildJob | undefined>) {
@@ -44,7 +45,7 @@ export class DigestPublisher extends DurableObject<Env> {
     return reply;
   }
 
-  private mutation<T>(operation: 'publish' | 'append', context: OperationContext | undefined,
+  private mutation<T>(operation: 'publish' | 'append' | 'retract' | 'preview', context: OperationContext | undefined,
     action: (complete: boolean | undefined, context: OperationContext | undefined) => Promise<T>): Promise<{ ok: true; result: T } | { ok: false; failure: PublishFailure }> {
     context = this.executingContext(context);
     return this.serialize(async () => {
@@ -53,17 +54,43 @@ export class DigestPublisher extends DurableObject<Env> {
         return { ok: true, result: await action(migration?.complete, context) };
       } catch (error) {
         const stage = error instanceof PublicationError ? error.stage : 'migration_state';
-        const publication_status = error instanceof PublicationError ? error.publication_status : 'not_committed';
+        const publication_status = operation === 'preview' ? 'not_attempted' : error instanceof PublicationError ? error.publication_status : 'not_committed';
         const cause = error instanceof PublicationError ? error.cause : error;
-        const failure = publicationFailure(cause, stage, publication_status);
+        const failure = operation === 'preview' ? { ...publicationFailure(cause, stage, publication_status), error: asHttpError(cause).message } : publicationFailure(cause, stage, publication_status);
         emit(`${operation}_failed`, context, { stage, publication_status, publication_outcome: 'failed', error_code: failure.code, ...safeError(cause) }, 'error');
         return { ok: false, failure };
       }
     }, context);
   }
 
-  async publishV2(digest: Digest, origin: string, context?: OperationContext): Promise<PublishReply> {
-    return this.mutation('publish', context, (complete, executing) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing));
+  async publishV2(digest: Digest, origin: string, context?: OperationContext, publisherFingerprint?: string): Promise<PublishReply> {
+    return this.mutation('publish', context, (complete, executing) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing, { publisherFingerprint }));
+  }
+
+  async previewDigestV1(digest: Digest, origin: string, context?: OperationContext): Promise<PublishReply> {
+    return this.mutation('preview', context, (complete, executing) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing, { dryRun: true }));
+  }
+
+  async previewAppendV1(postId: string, itemIndex: number, update: StoryUpdate, origin: string, context?: OperationContext): Promise<AppendReply> {
+    return this.mutation('preview', context, (complete, executing) => appendUpdate(this.env.SITE_BUCKET, postId, itemIndex, update, origin, new Date(), complete, executing, { dryRun: true }));
+  }
+
+  async retractPostV1(postId: string, publisherFingerprint: string, origin: string, context?: OperationContext): Promise<RetractReply> {
+    return this.mutation('retract', context, (complete, executing) => retractPost(this.env.SITE_BUCKET, postId, publisherFingerprint, origin, new Date(), complete, executing));
+  }
+
+  async findBatchV1(clientRef: string, context?: OperationContext): Promise<BatchReply> {
+    context = this.executingContext(context);
+    const trace = new OperationTrace(context);
+    try {
+      const publication = await trace.run('source_loading', () => currentPublication(this.env.SITE_BUCKET));
+      const index = await trace.run('history_index_loading', () => loadHistoryIndex(this.env.SITE_BUCKET, publication));
+      return { ok: true, result: findBatch(index, clientRef, new Date()) };
+    } catch (error) {
+      const failure = asHttpError(error);
+      return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, retryable: failure.retryable,
+        stage: trace.failed_stage ?? 'batch_lookup', publication_status: 'not_attempted' } };
+    }
   }
 
   async appendUpdateV1(postId: string, itemIndex: number, update: StoryUpdate, origin: string, context?: OperationContext): Promise<AppendReply> {

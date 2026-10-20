@@ -14,6 +14,7 @@ export interface Digest {
   title: string;
   source: string;
   items: DigestItem[];
+  client_ref?: string;
 }
 
 export interface StoryUpdate {
@@ -33,6 +34,8 @@ export interface StoredPost extends Digest {
   id: string;
   date: string;
   received_at: string;
+  publisher_fingerprint?: string;
+  retracted_at?: string;
 }
 
 export interface StoryIdentity {
@@ -52,7 +55,40 @@ export interface AppendResult extends StoryIdentity {
   status: 'appended' | 'duplicate';
   message: string;
   suggestion?: Suggestion;
+  dry_run?: true;
+  committed?: false;
+  checked_at?: string;
 }
+
+export interface PublishOptions { dryRun?: boolean; publisherFingerprint?: string }
+export interface RetractResult { post_id: string; status: 'retracted' | 'already_retracted'; retracted_at: string }
+export type RetractReply = { ok: true; result: RetractResult } | { ok: false; failure: PublishFailure };
+export interface BatchRecord {
+  id: string;
+  date: string;
+  received_at: string;
+  client_ref?: string;
+  publisher_fingerprint?: string;
+  retracted_at?: string;
+}
+export interface IndexItem {
+  item_index: number;
+  post_url: string;
+  posted_at: string;
+  last_received_at: string;
+  latest_activity_at: string;
+  updates: { update_index: number; post_url: string; posted_at: string; received_at: string }[];
+}
+export interface IndexPost {
+  post_id: string;
+  date: string;
+  received_at: string;
+  client_ref?: string;
+  items: IndexItem[];
+}
+export interface HistoryIndex { version: 1; posts: IndexPost[]; batches: BatchRecord[] }
+export interface BatchResult { client_ref: string; post: Pick<StoredPost, 'id' | 'date' | 'received_at'>; status: 'published' | 'retracted'; retracted_at?: string }
+export type BatchReply = { ok: true; result: BatchResult } | { ok: false; failure: PublishFailure };
 
 export type AppendReply = { ok: true; result: AppendResult } | { ok: false; failure: PublishFailure };
 
@@ -73,6 +109,10 @@ export interface PublishResult {
   duplicate: boolean;
   counts: { submitted: number; published: number; duplicates: number };
   items: (StoryIdentity & { index: number; status: 'published' | 'duplicate'; message?: string; suggestion?: Suggestion })[];
+  client_ref?: string;
+  dry_run?: true;
+  committed?: false;
+  checked_at?: string;
 }
 
 export interface PublishFailure {
@@ -95,13 +135,14 @@ export interface PostReference {
 }
 
 export interface Publication {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   posts: PostReference[];
   omitted_posts?: PostReference[];
   snapshot_date: string | null;
   published_at: string | null;
   archives?: string;
   legacy_receipts?: Record<string, string>;
+  history_index?: string;
 }
 
 export interface Migration {

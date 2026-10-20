@@ -11,8 +11,8 @@ import { errorSuggestion } from './suggestions';
 import { isIndexable, metadataResource } from './public-metadata';
 import type { AppendReply, Digest, Env, OperationContext, PublicationStatus, PublishReply, PublishResult, RebuildJob, StoryUpdate } from './types';
 import { emit, fingerprint, OperationTrace, safeError } from './diagnostics';
-import { HttpError, parseDigestJson, readLimited, validateDigest, validateUpdate } from './validation';
-import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isPublishReply, OperationFailure, publicationFailure } from './errors';
+import { HttpError, isTimestamp, parseDigestJson, readLimited, validateClientRef, validateDigest, validateUpdate } from './validation';
+import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isBatchReply, isPublishReply, isRetractReply, OperationFailure, publicationFailure } from './errors';
 import notFoundPage from './not-found';
 import { noStoreHeaders } from './responses';
 export { DigestPublisher } from './publisher';
@@ -116,16 +116,32 @@ interface RequestState {
   counts?: PublishResult['counts'];
   post_id?: string;
   publication_status?: PublicationStatus;
-  publication_outcome?: 'published' | 'duplicate' | 'failed';
+  publication_outcome?: 'published' | 'duplicate' | 'failed' | 'preview' | 'preview_failed' | 'retracted';
+  dry_run?: boolean;
 }
 
 async function handle(request: Request, env: Env, state: RequestState): Promise<Response> {
   const { context, trace } = state;
   const path = new URL(request.url).pathname;
+  const query = new URL(request.url).searchParams;
   const isApi = path === '/api' || path.startsWith('/api/');
   let publicationAttempted = false;
   const reply = (value: Record<string, unknown>, status = 200, headers: HeadersInit = {}) => json({ ...value, ...(isApi ? { request_id: context.request_id } : {}) }, status, headers);
   try {
+    if (path === '/api/digests' && ['GET', 'HEAD'].includes(request.method)) {
+      context.operation = 'batch_lookup';
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      if (query.getAll('client_ref').length !== 1) throw new HttpError(400, 'Supply exactly one client_ref.');
+      const clientRef = validateClientRef(query.get('client_ref'));
+      const publisher = await publisherFor(env, trace);
+      const received: unknown = await trace.run('batch_lookup_rpc', () => boundary('rpc', async () => await publisher.findBatchV1(clientRef, context)));
+      if (!isBatchReply(received)) throw new OperationFailure('rpc', new Error('Invalid batch reply'));
+      if (!received.ok) {
+        const f = received.failure;
+        throw new HttpError(f.status, f.error, {}, { code: f.code, retryable: f.retryable, details: { stage: f.stage } });
+      }
+      return reply({ ok: true, ...received.result });
+    }
     if (path === '/api/posts') {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       if (!['GET', 'HEAD'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD' });
@@ -139,6 +155,25 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       return reply({ ok: true, ...received.result });
     }
     const append = /^\/api\/posts\/([^/]+)\/items\/([^/]+)\/updates$/.exec(path);
+    const retract = /^\/api\/posts\/([^/]+)\/retract$/.exec(path);
+    if (retract) {
+      if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      const origin = await trace.run('configuration', () => originFor(request, env));
+      const publisher = await publisherFor(env, trace);
+      publicationAttempted = true;
+      state.publication_status = 'unknown';
+      const received: unknown = await trace.run('retract_rpc', () => boundary('rpc', async () => await publisher.retractPostV1(retract[1], fingerprint(env.API_SECRET!), origin, context)));
+      if (!isRetractReply(received)) throw new OperationFailure('rpc', new Error('Invalid retract reply'));
+      if (!received.ok) {
+        const f = received.failure;
+        throw new HttpError(f.status, f.error, {}, { code: f.code, retryable: f.retryable, publication_status: f.publication_status, details: { stage: f.stage } });
+      }
+      state.post_id = received.result.post_id;
+      state.publication_status = 'committed';
+      state.publication_outcome = 'retracted';
+      return reply({ ok: true, ...received.result });
+    }
     const maintenance = /^\/api\/rebuild(?:\/([a-f0-9-]{36})(\/resume)?)?$/.exec(path);
     if (maintenance) {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
@@ -162,8 +197,14 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       return reply({ ok: true, job }, 202);
     }
     if (path === '/api/digests' || path === '/api/images' || append) {
-      if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
+      if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: path === '/api/digests' ? 'GET, HEAD, POST' : 'POST' });
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      if (path === '/api/digests' || append) {
+        if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) {
+          throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
+        }
+        state.dry_run = query.get('dry_run') === 'true';
+      }
       state.bytes_received = 0;
       state.body_complete = false;
       state.declared_body_bytes = declaredBodyBytes(request);
@@ -182,19 +223,24 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
           return append ? validateUpdate(input) : validateDigest(input, { requireItems: true });
         });
         const publisher = await publisherFor(env, trace);
-        publicationAttempted = true;
-        state.publication_status = 'unknown';
+        publicationAttempted = !state.dry_run;
+        state.publication_status = state.dry_run ? 'not_attempted' : 'unknown';
         const rpc = { transport_outcome: 'error' };
         const result = await trace.run('publisher_rpc', async () => {
-          const received: unknown = await boundary('rpc', async () => append
-            ? await publisher.appendUpdateV1(append[1], Number(append[2]), payload as StoryUpdate, origin, context)
-            : await publisher.publishV2(payload as Digest, origin, context));
+          const received: unknown = await boundary('rpc', async () => state.dry_run
+            ? append ? await publisher.previewAppendV1(append[1], Number(append[2]), payload as StoryUpdate, origin, context)
+              : await publisher.previewDigestV1(payload as Digest, origin, context)
+            : append ? await publisher.appendUpdateV1(append[1], Number(append[2]), payload as StoryUpdate, origin, context)
+              : await publisher.publishV2(payload as Digest, origin, context, fingerprint(env.API_SECRET!)));
           rpc.transport_outcome = 'ok';
           if (!(append ? isAppendReply(received) : isPublishReply(received))) throw new OperationFailure('rpc', new Error('Invalid publisher reply'));
           const receivedReply = received as AppendReply | PublishReply;
           if (!receivedReply.ok) {
             const f = receivedReply.failure;
             throw new HttpError(f.status, f.error, {}, { code: f.code, details: { stage: f.stage }, retryable: f.retryable, publication_status: f.publication_status });
+          }
+          if (state.dry_run && (receivedReply.result.dry_run !== true || receivedReply.result.committed !== false || !isTimestamp(receivedReply.result.checked_at))) {
+            throw new OperationFailure('rpc', new Error('Invalid preview reply'));
           }
           return receivedReply.result;
         }, rpc);
@@ -207,6 +253,10 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
           state.post_id = result.post?.id;
           state.publication_status = result.post ? 'committed' : undefined;
           state.publication_outcome = result.duplicate ? 'duplicate' : 'published';
+        }
+        if (state.dry_run) {
+          state.publication_status = 'not_attempted';
+          state.publication_outcome = 'preview';
         }
         return reply({ ok: true, url: '/', ...result });
       }
@@ -244,9 +294,10 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     let failure = asHttpError(error);
     const detailStage = !Array.isArray(failure.details) && typeof failure.details.stage === 'string' ? failure.details.stage : undefined;
     const stage = detailStage ?? trace.failed_stage ?? trace.stage ?? 'request_processing';
-    if (context.operation === 'digest' || context.operation === 'append') {
+    if (['digest', 'append', 'retract'].includes(context.operation)) {
       state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
-      state.publication_outcome = 'failed';
+      state.publication_outcome = state.dry_run ? 'preview_failed' : 'failed';
+      if (state.dry_run) state.publication_status = 'not_attempted';
       if (publicationAttempted) {
         const f = publicationFailure(error, stage, state.publication_status);
         failure = new HttpError(f.status, f.error, failure.headers, { code: f.code, details: failure.details, retryable: f.retryable, publication_status: f.publication_status });
@@ -263,8 +314,8 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       return new Response(notFoundPage, { status: 404, headers });
     }
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
-    return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
-      diagnostics, ...(context.operation === 'digest' || context.operation === 'append' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
+    return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable, state.dry_run), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
+      diagnostics, ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(['digest', 'append', 'retract'].includes(context.operation) ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
   }
 }
 
@@ -273,6 +324,7 @@ function routeFor(path: string): { route: string; operation: string } {
   if (path === '/api/images') return { route: path, operation: 'image' };
   if (path === '/api/posts') return { route: path, operation: 'posts_read' };
   if (/^\/api\/posts\/[^/]+\/items\/[^/]+\/updates$/.test(path)) return { route: '/api/posts/:id/items/:index/updates', operation: 'append' };
+  if (/^\/api\/posts\/[^/]+\/retract$/.test(path)) return { route: '/api/posts/:id/retract', operation: 'retract' };
   if (/^\/api\/rebuild(?:\/[a-f0-9-]{36}(?:\/resume)?)?$/.test(path)) return { route: path === '/api/rebuild' ? path : path.endsWith('/resume') ? '/api/rebuild/:id/resume' : '/api/rebuild/:id', operation: 'rebuild' };
   if (path.startsWith('/api/') || path === '/api') return { route: '/api/*', operation: 'read' };
   return { route: path === '/' || path === '/index.html' ? '/' : path.startsWith('/images/') ? '/images/:file' : '/public/*', operation: 'read' };
@@ -291,12 +343,12 @@ export default {
     if (path === '/api' || path.startsWith('/api/')) {
       response.headers.set('X-Request-ID', context.request_id);
       response.headers.set('X-Worker-Version', context.worker_version);
-      response.headers.set('X-API-Version', '2');
+      response.headers.set('X-API-Version', '3');
     }
     const media = request.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
     emit('request_completed', context, { route: route.route, method: request.method, status: response.status, error_code: state.error_code,
       duration_ms: performance.now() - started, response_etag: response.headers.get('etag') ?? undefined, content_type: media && ['application/json', 'multipart/form-data', 'text/plain'].includes(media) ? media : 'other',
-      bytes_received: state.bytes_received, declared_body_bytes: state.declared_body_bytes, body_complete: state.body_complete, body_sha256: state.body_sha256, counts: state.counts, post_id: state.post_id, publication_status: state.publication_status, publication_outcome: state.publication_outcome });
+      bytes_received: state.bytes_received, declared_body_bytes: state.declared_body_bytes, body_complete: state.body_complete, body_sha256: state.body_sha256, counts: state.counts, post_id: state.post_id, publication_status: state.publication_status, publication_outcome: state.publication_outcome, dry_run: state.dry_run });
     // Stored HTML may have production metadata even when served from workers.dev.
     // Apply the actual serving-origin policy to every response, including 304s.
     let indexable = false;

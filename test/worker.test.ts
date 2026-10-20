@@ -865,7 +865,7 @@ describe('images and public serving', () => {
     await post(digest());
     await bindings.SITE_BUCKET.put('pages/digests/2026-10-16.html', 'old permalink');
     for (const path of ['/digests/2026-10-16', '/nope', '/api/digests/list', '/digests/2026-10-16.json', '/posts/', '/publications/', '/pages/index.html', '/wrangler.jsonc', '/.dev.vars']) expect((await fetch(path)).status, path).toBe(404);
-    expect((await fetch('/api/digests')).status).toBe(405);
+    expect((await fetch('/api/digests')).status).toBe(401);
     expect((await fetch('/', { method: 'DELETE' })).status).toBe(405);
     expect((await fetch('/favicon.svg')).headers.get('Content-Type')).toBe('image/svg+xml');
   });

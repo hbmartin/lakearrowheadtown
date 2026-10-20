@@ -1,9 +1,11 @@
 # Lake Arrowhead . Town
 
-A Cloudflare Worker publishes an append-only community news feed and hosts uploaded images. The homepage preserves the existing design and five selectable themes.
+A Cloudflare Worker publishes community news, supports caller-scoped batch retraction, and hosts uploaded images. The homepage preserves the existing design and five selectable themes.
 
 ```text
-POST /api/digests → authenticate and validate → serialized publisher → R2 post + manifest + index
+POST /api/digests[?dry_run=true] → validate + serialized dedup → preview or atomic publication
+GET  /api/digests?client_ref=... → authenticate → committed batch identity and state
+POST /api/posts/:post_id/retract → authenticate owner + 24-hour window → atomic retraction
 GET  /api/posts   → authenticate → committed snapshot → recent stories and updates
 POST /api/posts/:post_id/items/:item_index/updates → serialized publisher → source revision + snapshot
 POST /api/images  → authenticate and validate → R2 image → public image URL
@@ -70,7 +72,7 @@ npm run rebuild:status -- preview JOB_UUID
 node scripts/smoke-preview.mjs --verify-edge
 ```
 
-The smoke check reads recent stories, appends a source update and retries it, uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. It also checks daily archives and their PNG cards, local resource pages, WOFF2 serving, image dimensions/loading, and structured metadata. It parses `/rss.xml`, verifies full text/images, creator/media extensions and discovery links, checks HEAD, and confirms duplicate-only submissions preserve the RSS ETag. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
+The smoke check first confirms API version 3 with a read, previews digests and appends, verifies compact reads and batch-reference lookup, publishes/retracts a separate cleanup fixture twice, reads recent stories, appends a source update and retries it, uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. It also checks daily archives and their PNG cards, local resource pages, WOFF2 serving, image dimensions/loading, and structured metadata. It parses `/rss.xml`, verifies full text/images, creator/media extensions and discovery links, checks HEAD, and confirms duplicate-only submissions preserve the RSS ETag. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
 
 ### 4. Connect the domain
 
@@ -239,7 +241,7 @@ Successful publication returns `200` after the source, manifest, and index write
 - Duplicate identity is the exact validated `post_url` string, including query strings and fragments. No URL normalization, tracking-parameter removal, or fuzzy content matching occurs. Batch labels, source labels, wording, and other item fields do not change that identity.
 - Stories retained in the 30-day history suppress new copies of their original and appended URLs. Receipt dates, not `posted_at`, govern this window; retries never refresh it. A genuine appended source extends only its story's retention. Hidden items also count: correcting an out-of-window `posted_at` at the same URL remains a duplicate. Within a request the first new occurrence wins. Historical duplicate copies remain visible. The earliest source receipt supplies duplicate references, with ascending post ID, item position, and update position breaking ties.
 - Publishing and duplicate detection share the serialized queue. The committed manifest governs modern source membership, including eligible repaired `omitted_posts`; orphan source objects do not suppress retries. Eligible legacy sources also participate during migration. A repaired or legacy historical copy wins over an incoming copy. If the request is entirely duplicate, it still makes no writes: its returned historical identity may remain omitted from the homepage until a later publication containing new content.
-- There is no editing, deletion, preflight, individual-post page, or idempotency-key endpoint. `url` always points to `/`; post IDs identify targets for authenticated reads and appends, not public permalinks. See the manual cleanup runbook below for corrections at the same source URL.
+- Dry-run preflight and whole-batch self-retraction are available as described below. Individual story editing and idempotency keys are not provided. `url` always points to `/`; post IDs identify targets for authenticated reads and appends, not public permalinks. See the manual cleanup runbook below for corrections at the same source URL.
 - Omit top-level `date`, `id`, and `received_at`: none is required, and submitted values are ignored. The server assigns a unique ID, UTC ISO `received_at`, and `YYYY-MM-DD` date in `America/Los_Angeles` inside the serialized publisher. For example, receipt at `2026-10-19T01:00:00Z` gives date `2026-10-18`. Item `posted_at` remains the original source timestamp, not the receipt timestamp. Deduplication follows 30 Los Angeles calendar dates, including DST boundaries, rather than a rolling 720 hours.
 - `title`, `source`, `group`, and `headline` are required nonempty strings. `body` and `category` may be empty; submitted `items: []` receives a `400` validation error before writes. Historical empty sources remain readable. Categories accept arbitrary strings. Digest titles and receipt times remain private; the homepage displays item headlines.
 - Item timestamps require real calendar dates and an explicit timezone (`Z` or an offset). Source links must be absolute HTTP(S) URLs without credentials.
@@ -261,7 +263,51 @@ R2 has no transaction spanning these objects. Index replacement is the commit po
 
 The Worker uses the versioned `publishV2` Durable Object RPC. During deployment skew, an unavailable method, failed RPC, or invalid reply returns `503 service_unavailable` with `publication_status: "unknown"`; it never falls back to another publish call. The legacy `publish` method retains throw-on-failure behavior for old Workers and the successful reply shape understood by the previous preview Worker.
 
-This intentionally corrects the earlier `500 publish_failed` response for digest publishing RPC failures while retaining `X-API-Version: 2`. All publishing clients are controlled; coordinate their updates before the next production rollout. Clients must handle unfamiliar error codes with a readable fallback and use `retryable` and `publication_status` for retry decisions rather than matching only `publish_failed`. A missing or unusable publisher binding instead returns `503 configuration_error`, `retryable: false`, and `publication_status: "not_attempted"`: publication was never invoked and the configuration needs operator repair. No API-version negotiation or alternate publishing call is provided.
+This intentionally corrects the earlier `500 publish_failed` response for digest publishing RPC failures with `X-API-Version: 3`. All publishing clients are controlled; coordinate their updates before the next production rollout. Clients must handle unfamiliar error codes with a readable fallback and use `retryable` and `publication_status` for retry decisions rather than matching only `publish_failed`. A missing or unusable publisher binding instead returns `503 configuration_error`, `retryable: false`, and `publication_status: "not_attempted"`: publication was never invoked and the configuration needs operator repair. No API-version negotiation or alternate publishing call is provided.
+
+## Preview publishing against committed history
+
+`POST /api/digests?dry_run=true` and `POST /api/posts/{post_id}/items/{item_index}/updates?dry_run=true` accept the normal JSON payload and authentication. They run the same validation, deduplication, reference-conflict checks, archive preparation, image inspection, HTML rendering, and RSS rendering as a real operation. All proposed writes stay in memory: source objects, archives, share cards, image-metadata caches, reference records, and Durable Object storage remain unchanged. Duplicate-only requests follow the same early no-op path as real publishing.
+
+```sh
+[ -n "${API_SECRET:-}" ] && curl --fail-with-body "$SITE_URL/api/digests?dry_run=true" \
+  -H "Authorization: Bearer $API_SECRET" \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/digest.json
+```
+
+Successful previews return the normal per-item `published`/`duplicate` or append `appended`/`duplicate` results, plus `dry_run: true`, `committed: false`, and `checked_at`. Duplicate identities identify their actual owners. Newly proposed post IDs and append positions are provisional, including intra-batch duplicate references to a proposed item. A later real submission recomputes everything in the queue and may return different identities/results. Previews reserve neither URLs nor references, and cannot predict a later storage-write failure.
+
+Omit `dry_run` or use `dry_run=false` to publish. Other values and repeated parameters return `400 invalid_dry_run` before publisher invocation. Preview errors retain normal validation/error codes and always report `publication_status: "not_attempted"`; invoked preview errors also carry `dry_run: true` and `committed: false`. Missing preview RPCs fail closed with no fallback to a publishing call.
+
+Before enabling preview requests, complete deployment and verify a read response carries `X-API-Version: 3` (for example `GET /api/posts?fields=index`, whose response must identify `fields: "index"`). Older Workers ignore the dry-run query and can publish it as an ordinary submission. Use a complete rollout, without mixing older and new HTTP writers for these clients.
+
+## Look up a committed batch
+
+Add an optional `client_ref` to a digest. It is an exact, case-sensitive, nonblank string of at most 128 Unicode characters, without control characters; no trimming or normalization is performed. Choose a new reference for each intended new batch. Publishing echoes it, and both full and compact post reads include it.
+
+```sh
+[ -n "${API_SECRET:-}" ] && curl --fail-with-body --get "$SITE_URL/api/digests" \
+  -H "Authorization: Bearer $API_SECRET" \
+  --data-urlencode 'client_ref=morning-2026-10-20-01'
+```
+
+Authenticated GET/HEAD lookup returns `200 {"ok":true,"client_ref":"morning-2026-10-20-01","post":{"id":"post-uuid","date":"2026-10-20","received_at":"2026-10-20T18:00:00.000Z"},"status":"published","request_id":"..."}`. After retraction the same identity returns `status: "retracted"` and `retracted_at`. A missing reference returns `404 batch_not_found`. Exactly one `client_ref` parameter is required. All lookup replies use `Cache-Control: no-store`.
+
+References are unique site-wide for the original 30 Los Angeles receipt dates, including the receipt date. A request that would create a second batch using a retained reference returns `409 client_ref_conflict`, including in dry-run. References are lookup-only metadata: a duplicate-only retry returns ordinary URL deduplication results with `post: null`, rather than replaying an earlier response. A duplicate-only submission creates no record for a new reference. Lookup survives retraction, source damage/omission, and token rotation; appends never extend the reference window. After a timeout, look up the reference to learn which batch committed. Uncommitted orphan artifacts cannot create a lookup result.
+
+## Retract your own batch
+
+```sh
+[ -n "${API_SECRET:-}" ] && curl --fail-with-body -X POST "$SITE_URL/api/posts/POST_ID/retract" \
+  -H "Authorization: Bearer $API_SECRET"
+```
+
+No body is required. A first retraction must arrive less than 24 elapsed hours after the batch's original server receipt, using the exact token that published it. Appends do not extend the deadline. The server stores a private SHA-256 token fingerprint; callers cannot supply or override ownership. Everyone sharing a token shares ownership, and rotation loses self-retract access to batches published with the old token. Historical batches without recorded ownership require the operator runbook.
+
+Success returns `200 {"ok":true,"post_id":"post-uuid","status":"retracted","retracted_at":"2026-10-20T19:00:00.000Z","request_id":"..."}`. It removes the whole batch, including appended sources, from the current homepage, RSS, daily archive contents, and full/compact story reads. Its original and appended URLs become publishable again unless another eligible story owns them. The reference remains reserved until its original lookup window ends. Retraction advances publication time while preserving original receipt identities.
+
+The operation commits an immutable empty source revision and retraction record with the new snapshot; it preserves original private sources and historical snapshots. Cached or previously downloaded content cannot be withdrawn. Repeating the request with the same token returns `status: "already_retracted"` and the original timestamp, with no writes, including after the 24-hour deadline while its 30-day record remains available. Rebuilds preserve retractions. Missing posts return `404 post_not_found`; missing/mismatched ownership returns `403 retract_forbidden`; an expired first retraction returns `409 retract_window_expired`. Retraction failures use the existing publication certainty/retry contract. After an uncertain commit, repeat the retract or look up its original reference.
 
 ## Read recent stories and append sources
 
@@ -272,9 +318,9 @@ Both endpoints use the same `Authorization: Bearer <API_SECRET>` credential and 
   -H "Authorization: Bearer $API_SECRET"
 ```
 
-`GET /api/posts` (also HEAD) defaults to seven Los Angeles calendar dates of server receipt activity; `days` accepts integers from 1 through 30. An appended source makes its story recent even if the original source timestamp is old. Results contain up to 20 matching batches per page. Follow `next_cursor`, keeping the same `days` or omitting it; the signed cursor pins the publication, original read time, and next batch position even while new content publishes. Cursors use a private signing key retained in publisher storage across restarts. Invalid days or cursors return 400 with a readable message and restart suggestion.
+`GET /api/posts` (also HEAD) defaults to seven Los Angeles calendar dates of server receipt activity; `days` accepts integers from 1 through 30. An appended source makes its story recent even if the original source timestamp is old. Results contain up to 20 matching batches per page. Follow `next_cursor`, keeping the same `days` and `fields` or omitting them; the signed cursor pins the publication, original read time, representation, and next batch position even while new content publishes. Cursors use a private signing key retained in publisher storage across restarts. Invalid days or cursors return 400 with a readable message and restart suggestion.
 
-Story reads load immutable committed manifests and source revisions outside the publishing queue, so slow reads do not hold up publishing and rebuilds. Sources load in ordered batches of up to four without fetching beyond the completed page. Concurrent first reads share a transaction-backed cursor-key initialization; a failed initialization can retry on a later request. Publishing, appends, and rebuild operations remain serialized.
+Story reads load immutable committed manifests and source revisions outside the publishing queue, so slow reads do not hold up publishing and rebuilds. Sources load in ordered batches of up to four without fetching beyond the completed page. Concurrent first reads share a transaction-backed cursor-key initialization; a failed initialization can retry on a later request. Publishing, appends, previews, retractions, and rebuild operations remain serialized.
 
 ```json
 {
@@ -316,6 +362,10 @@ Story reads load immutable committed manifests and source revisions outside the 
 }
 ```
 
+Use `GET /api/posts?days=30&fields=index` for reconciliation without Markdown. The envelope includes `fields: "index"`; batches contain only `post_id`, `date`, `received_at`, optional `client_ref`, and `items`. Each item contains `item_index`, `post_url`, `posted_at`, `last_received_at`, `latest_activity_at`, and `updates`; each update contains `update_index`, `post_url`, `posted_at`, and `received_at`. Titles, attribution text, story bodies, and update notes are excluded. Original item/update indexes, filtering, ordering, omitted IDs, and pagination match full reads. Omitted `fields` or `fields=full` returns the full representation. Invalid/repeated fields return `400 invalid_fields`; switching representations during pagination returns `400 invalid_cursor`. Existing cursors represent full reads.
+
+Version 3 compact reads load the immutable `history-index/<sha256>.json` object selected by the committed manifest, without fetching source bodies. The same object retains bounded private batch records for reference lookup and retraction authorization; its integrity is checked against its content hash. Legacy v1/v2 compact reads project their sources until a rebuild or new publication materializes v3 metadata. Rebuilds preserve original receipt windows and do not assign ownership to old posts. Missing/damaged committed compact metadata returns an error instead of an empty result. This history index and retraction records commit through the same homepage replacement as HTML, RSS, and archives.
+
 Each returned story includes its complete original fields and update history. `item_index` is its original zero-based position, so filtered results can have gaps. Updates retain append order and stable `update_index` values in the API; display order uses source timestamps. `latest_activity_at` describes the newest source timestamp, including future timestamps; public feed eligibility still uses the saved seven-day source-date window. Read responses expose no storage keys. An empty history returns an empty `posts` array; an initial unpublished site also has `published_at: null`.
 
 Append one source with `POST /api/posts/{post_id}/items/{item_index}/updates`. Use the IDs returned by reads or digest publishing:
@@ -333,9 +383,9 @@ Success returns `200 {"ok":true,"url":"/","request_id":"...","status":"appended"
 
 Unknown, expired, or absent item targets return `404 story_not_found` with a suggestion to read `/api/posts?days=30` or publish a new digest. Errors include readable `message` and structured `suggestion` alongside the existing `error`, `code`, and diagnostics. Append failures use the same `retryable` and `publication_status` contract as digest publishing. Appending through `appendUpdateV1` never falls back to another write method when RPC transport fails.
 
-Updates write immutable private source revisions. The committed index chooses the exact manifest, source revisions, and RSS; abandoned revision or manifest objects do not affect reads or deduplication. Manifest version 2 retains 30 days of story receipt activity, while version 1 remains readable. History starts from the existing committed selection and fills forward; older raw files are not imported into the history automatically. Expired items can remain in private batch files to preserve positions but do not participate in reads, feed selection, or deduplication. No automatic deletion of private objects is introduced.
+Updates write immutable private source revisions. The committed index chooses the exact manifest, source revisions, and RSS; abandoned revision or manifest objects do not affect reads or deduplication. Manifest version 3 retains 30 days of story receipt activity and selects a compact history index; versions 1 and 2 remain readable. History starts from the existing committed selection and fills forward; older raw files are not imported into the history automatically. Expired items can remain in private batch files to preserve positions but do not participate in reads, feed selection, or deduplication. No automatic deletion of private objects is introduced.
 
-Deploy to preview, run `node scripts/smoke-preview.mjs --verify-edge`, and check the queued rebuild's status before production rollout. The smoke check also reads stories, appends an update, retries it, and verifies matching HTML/RSS and unchanged duplicate ETags. Once a version 2 manifest is committed, rollback requires code that understands version 2, immutable source revisions, and archive references; older writers reject it. Back up the index, sources, manifests, and archive catalogues before operator repairs. Do not downgrade manifest versions or redeploy an incompatible writer against this bucket.
+Deploy to preview, run `node scripts/smoke-preview.mjs --verify-edge`, and check the queued rebuild's status before production rollout. The smoke check also reads stories, appends an update, retries it, and verifies matching HTML/RSS and unchanged duplicate ETags. Once a version 3 manifest is committed, rollback requires code that understands version 3, its compact history index, publisher ownership, retraction records, immutable source revisions, and archive references; older writers reject it. Back up the index, sources, manifests, and archive catalogues before operator repairs. Do not downgrade manifest versions or redeploy an incompatible writer against this bucket.
 
 ## Search, sharing, and browser metadata
 
@@ -482,7 +532,7 @@ RSS smoke checks require its MIME type on GET/HEAD 200 responses. A 304 need not
 
 ## API errors and request provenance
 
-Every application-generated `/api` response has `X-Request-ID`, `X-Worker-Version` (Cloudflare version ID), and `X-API-Version: 2`. JSON API replies also include `request_id`; HEAD responses have no body. These headers identify the code handling the request independently of the stored homepage's age. Cloudflare edge/WAF failures that never reach the Worker may have a different response shape and no application request ID.
+Every application-generated `/api` response has `X-Request-ID`, `X-Worker-Version` (Cloudflare version ID), and `X-API-Version: 3`. JSON API replies also include `request_id`; HEAD responses have no body. These headers identify the code handling the request independently of the stored homepage's age. Cloudflare edge/WAF failures that never reach the Worker may have a different response shape and no application request ID.
 
 ```json
 {
@@ -520,7 +570,7 @@ Production and preview explicitly persist invocation logs and traces at sampling
 
 Structured `request_completed`, `request_error`, `operation_stage`, `publish_result`, `publish_failed`, `source_omitted`, and `rebuild_*` events carry request IDs, executing Worker version, environment, and available post/job IDs. Stage events measure authentication, body reading, parsing, validation, queue wait, source loading, duplicate filtering, rendering, and writes. Rebuild state writes, checkpoints, and finalization have separate stages: a finalization failure can report a committed homepage with a failed job. Rebuild alarms retain the enqueue request ID and job ID, while recording their executing version. Request summaries include total duration, status/code, counts, publication outcome, declared/consumed byte counts, origin response ETags, and complete-body hashes when available. Detailed public-read and 404 events remain enabled.
 
-Digest events use `publication_outcome: "published" | "duplicate" | "failed"`. Rejected digest requests remain logged as failed requests with `publication_status: "not_attempted"`; exclude that status when counting attempted publication failures. Duplicate-only success omits `publication_status`; it is not a failed commit. The `publisher_rpc` stage has both `transport_outcome` and application `outcome`: delivering a typed failure reply means transport `ok` and application `error`. Active stages are restored after completion and failures retain their actual failed stage. Error codes and retryability come from operation boundaries, not stage-name matching. The `upload_admission` stage measures slot acquisition and identifies busy rejections, which consume no body and emit no `upload_slot_held` event. For admitted uploads, the `upload_slot_held` stage measures the full slot occupancy through body handling, image validation, and storage completion, including the nested `image_validation` and `image_write` stages; it does not measure admission-check latency.
+Digest events use `publication_outcome: "published" | "duplicate" | "failed" | "preview" | "preview_failed"`. Preview success emits `preview_result`; preview failures always report `publication_status: "not_attempted"`, even when an RPC acknowledgement is lost. Retractions emit `retract_result` and `publication_outcome: "retracted"`. Preparation stages carry `phase: "preparation"`; durable artifact writes carry `phase: "commit"`. Filter write latency metrics to the commit phase. Token fingerprints and raw client references are never logged. Rejected digest requests remain logged as failed requests with `publication_status: "not_attempted"`; exclude that status when counting attempted publication failures. Duplicate-only success omits `publication_status`; it is not a failed commit. The `publisher_rpc` stage has both `transport_outcome` and application `outcome`: delivering a typed failure reply means transport `ok` and application `error`. Active stages are restored after completion and failures retain their actual failed stage. Error codes and retryability come from operation boundaries, not stage-name matching. The `upload_admission` stage measures slot acquisition and identifies busy rejections, which consume no body and emit no `upload_slot_held` event. For admitted uploads, the `upload_slot_held` stage measures the full slot occupancy through body handling, image validation, and storage completion, including the nested `image_validation` and `image_write` stages; it does not measure admission-check latency.
 
 In the selected Worker's **Observability → Logs**, use the top-level structured fields below with these Query Builder recipes. In **Traces**, open the related invocation by time and Cloudflare invocation/trace metadata; cross-reference application request ID in its logs.
 
@@ -551,7 +601,7 @@ If an edge smoke check cannot find the homepage ETag, compare the public respons
 
 ## Manual whole-batch cleanup
 
-Use this only for an operator-reviewed correction; rollout does not remove any existing production content.
+Use self-retraction below for a batch published by the current token less than 24 hours ago. Use this runbook for an operator-reviewed correction outside that scope; rollout does not remove any existing production content.
 
 1. Pause every publishing client and wait for in-flight publishes and rebuild jobs to finish. Record the affected post ID from the API reply or correlated logs. For older posts, inspect the current manifest and its sources in the private R2 bucket.
 2. Read `pages/index.html` custom metadata `manifest`, then inspect that exact manifest and find the affected `posts` entry. Use its exact `key`; legacy entries can point to `digests/...`, so do not guess the source path.

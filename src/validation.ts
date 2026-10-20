@@ -15,6 +15,17 @@ export function isTimestamp(value: unknown): value is string {
     && Number(match[6] ?? 0) <= 23 && Number(match[7] ?? 0) <= 59 && Number.isFinite(Date.parse(value));
 }
 
+export function isClientRef(value: unknown): value is string {
+  return typeof value === 'string' && !!value.trim() && [...value].length <= 128 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+export function validateClientRef(value: unknown): string {
+  if (!isClientRef(value)) throw new HttpError(400, 'client_ref must be a nonblank string of at most 128 characters without control characters.', {}, {
+    code: 'validation_failed', details: [{ path: 'client_ref', code: 'invalid_client_ref', message: 'Expected a nonblank string of at most 128 characters without control characters.' }],
+  });
+  return value;
+}
+
 function fields(message: string) {
   const issues: ValidationIssue[] = [];
   let issueCount = 0;
@@ -62,6 +73,7 @@ export function validateDigest(value: unknown, options: { requireItems?: boolean
   if (!input) return v.reject();
   const title = string(input.title, 'title');
   const source = string(input.source, 'source');
+  if (input.client_ref !== undefined && !isClientRef(input.client_ref)) invalid('client_ref', 'invalid_client_ref', 'Expected a nonblank string of at most 128 characters without control characters.');
   let items: DigestItem[] = [];
   if (!Array.isArray(input.items)) invalid('items', 'invalid_type', 'Expected an array.');
   else {
@@ -80,7 +92,7 @@ export function validateDigest(value: unknown, options: { requireItems?: boolean
   }
   v.check();
   // Client-supplied date/receipt/identity fields never control server publication.
-  return { title, source, items };
+  return { title, source, items, ...(input.client_ref === undefined ? {} : { client_ref: input.client_ref as string }) };
 }
 
 export function validateUpdate(value: unknown): StoryUpdate {
@@ -97,10 +109,14 @@ export function validateUpdate(value: unknown): StoryUpdate {
 }
 
 // Incoming digest validation deliberately ignores updates; only stored sources may carry them.
-export function validateStoredDigest(value: unknown): Digest & { items: StoredItem[] } {
+export function validateStoredDigest(value: unknown): Digest & { items: StoredItem[]; publisher_fingerprint?: string; retracted_at?: string } {
   const digest = validateDigest(value);
+  const metadata = value as Record<string, unknown>;
+  if (metadata.publisher_fingerprint !== undefined && (typeof metadata.publisher_fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(metadata.publisher_fingerprint))) throw new HttpError(400, 'Stored publisher fingerprint is invalid');
+  if (metadata.retracted_at !== undefined && (!isTimestamp(metadata.retracted_at) || digest.items.length)) throw new HttpError(400, 'Stored retraction is invalid');
   const inputs = (value as { items: Record<string, unknown>[] }).items;
-  return { ...digest, items: digest.items.map((item, index) => {
+  return { ...digest, ...(metadata.publisher_fingerprint === undefined ? {} : { publisher_fingerprint: metadata.publisher_fingerprint as string }),
+    ...(metadata.retracted_at === undefined ? {} : { retracted_at: metadata.retracted_at as string }), items: digest.items.map((item, index) => {
     const updates = inputs[index].updates;
     if (updates === undefined) return item;
     if (!Array.isArray(updates)) throw new HttpError(400, 'Stored updates must be an array');
