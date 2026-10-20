@@ -64,6 +64,7 @@ describe('production-state previews', () => {
     expect(response.headers.get('X-API-Version')).toBe('3');
     const result = await response.json<PublishResult>();
     expect(result).toMatchObject({ ok: true, dry_run: true, committed: false, checked_at: expect.any(String), client_ref: 'batch:preview',
+      warnings: [{ index: 0, field: 'items[0].category', code: 'unknown_category', value: 'news' }],
       counts: { submitted: 1, published: 1, duplicates: 0 }, items: [{ status: 'published', post_id: result.post!.id, item_index: 0 }] });
     expect(await snapshot()).toEqual([]);
     expect(await durableState()).toEqual(before);

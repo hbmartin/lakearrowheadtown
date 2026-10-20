@@ -11,6 +11,7 @@ import { emit, fingerprint, OperationTrace } from './diagnostics';
 import { boundary, DamagedSource } from './errors';
 import { batchRecord, indexPost, loadHistoryIndex, retainedBatches } from './history-index';
 import { prepareWrites } from './prepared-writes';
+import { digestItemWarnings, postedAtWarnings } from './warnings';
 import type { AppendResult, ContentBucket, Digest, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishOptions, PublishResult, RetractResult, StoredPost, StoryIdentity, StoryUpdate } from './types';
 
 export const HTML_CACHE = 'public, max-age=0, must-revalidate';
@@ -196,6 +197,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
       });
     });
     const counts = { submitted: items.length, published: post.items.length, duplicates: items.length - post.items.length };
+    const warnings = items.flatMap(item => item.status === 'published' ? digestItemWarnings(digest.items[item.index], item.index, now) : []);
     if (post.items.length) {
       if (digest.client_ref !== undefined) {
         const index = await trace.run('history_index_loading', () => loadHistoryIndex(bucket, previous));
@@ -217,6 +219,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
       post: post.items.length ? { id: post.id, date: post.date, received_at: post.received_at } : null,
       duplicate: items.length > 0 && post.items.length === 0, counts, items,
       ...(digest.client_ref === undefined ? {} : { client_ref: digest.client_ref }),
+      ...(warnings.length ? { warnings } : {}),
       ...(options.dryRun ? { dry_run: true as const, committed: false as const, checked_at: now.toISOString() } : {}),
     };
     emit(options.dryRun ? 'preview_result' : 'publish_result', context, { ...counts, post_id: result.post?.id, duplicate: result.duplicate, publication_outcome: options.dryRun ? 'preview' : result.duplicate ? 'duplicate' : 'published', ...(options.dryRun || result.duplicate ? {} : { publication_status: trace.publication_status }), duplicate_url_hashes: items.filter(item => item.status === 'duplicate').slice(0, 20).map(item => fingerprint(digest.items[item.index].post_url)) });
@@ -245,6 +248,7 @@ export async function appendUpdate(bucket: ContentBucket, postId: string, itemIn
       emit(options.dryRun ? 'preview_result' : 'append_result', context, { post_id: match.post_id, item_index: match.item_index, update_index: match.update_index, publication_outcome: options.dryRun ? 'preview' : 'duplicate', duplicate_url_hashes: [fingerprint(update.post_url)] });
       return { status: 'duplicate', ...match, message: duplicateMessage, suggestion: reviewStory, ...preview };
     }
+    const warnings = postedAtWarnings(update.posted_at, now);
     const updateIndex = item.updates?.length ?? 0;
     item.updates = [...(item.updates ?? []), { ...update, received_at: now.toISOString() }];
     const key = `post-revisions/${post.id}/${crypto.randomUUID()}.json`;
@@ -254,7 +258,7 @@ export async function appendUpdate(bucket: ContentBucket, postId: string, itemIn
     await prepareHomepage(bucket, { version: 3, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now });
     if (!options.dryRun) await prepared.commit();
     emit(options.dryRun ? 'preview_result' : 'append_result', context, { post_id: post.id, item_index: itemIndex, update_index: updateIndex, publication_outcome: options.dryRun ? 'preview' : 'published', ...(options.dryRun ? {} : { publication_status: trace.publication_status }) });
-    return { status: 'appended', post_id: post.id, item_index: itemIndex, update_index: updateIndex, message: options.dryRun ? 'The source would be added to this story.' : 'The source was added to this story and the publication was updated.', ...preview };
+    return { status: 'appended', post_id: post.id, item_index: itemIndex, update_index: updateIndex, message: options.dryRun ? 'The source would be added to this story.' : 'The source was added to this story and the publication was updated.', ...(warnings.length ? { warnings } : {}), ...preview };
   } catch (error) {
     throw new PublicationError(options.dryRun ? 'not_attempted' : trace.publication_status, trace.failed_stage ?? trace.stage ?? 'append_processing', error);
   }

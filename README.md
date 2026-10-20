@@ -243,7 +243,7 @@ Successful publication returns `200` after the source, manifest, and index write
 - Publishing and duplicate detection share the serialized queue. The committed manifest governs modern source membership, including eligible repaired `omitted_posts`; orphan source objects do not suppress retries. Eligible legacy sources also participate during migration. A repaired or legacy historical copy wins over an incoming copy. If the request is entirely duplicate, it still makes no writes: its returned historical identity may remain omitted from the homepage until a later publication containing new content.
 - Dry-run preflight and whole-batch self-retraction are available as described below. Individual story editing and idempotency keys are not provided. `url` always points to `/`; post IDs identify targets for authenticated reads and appends, not public permalinks. See the manual cleanup runbook below for corrections at the same source URL.
 - Omit top-level `date`, `id`, and `received_at`: none is required, and submitted values are ignored. The server assigns a unique ID, UTC ISO `received_at`, and `YYYY-MM-DD` date in `America/Los_Angeles` inside the serialized publisher. For example, receipt at `2026-10-19T01:00:00Z` gives date `2026-10-18`. Item `posted_at` remains the original source timestamp, not the receipt timestamp. Deduplication follows 30 Los Angeles calendar dates, including DST boundaries, rather than a rolling 720 hours.
-- `title`, `source`, `group`, and `headline` are required nonempty strings. `body` and `category` may be empty; submitted `items: []` receives a `400` validation error before writes. Historical empty sources remain readable. Categories accept arbitrary strings. Digest titles and receipt times remain private; the homepage displays item headlines.
+- `title`, `source`, `group`, and `headline` are required nonempty strings. `body` and `category` may be empty; submitted `items: []` receives a `400` validation error before writes. Historical empty sources remain readable. Categories follow the advisory [category vocabulary v1](#category-vocabulary-v1-and-advisory-warnings) below; arbitrary strings remain accepted. Digest titles and receipt times remain private; the homepage displays item headlines.
 - Item timestamps require real calendar dates and an explicit timezone (`Z` or an offset). Source links must be absolute HTTP(S) URLs without credentials.
 - Markdown is rendered with raw HTML disabled and unsafe link protocols blocked. Plain-text fields are escaped. JSON requests are limited to 1 MiB, including streamed requests.
 
@@ -265,6 +265,62 @@ The Worker uses the versioned `publishV2` Durable Object RPC. During deployment 
 
 This intentionally corrects the earlier `500 publish_failed` response for digest publishing RPC failures with `X-API-Version: 3`. All publishing clients are controlled; coordinate their updates before the next production rollout. Clients must handle unfamiliar error codes with a readable fallback and use `retryable` and `publication_status` for retry decisions rather than matching only `publish_failed`. A missing or unusable publisher binding instead returns `503 configuration_error`, `retryable: false`, and `publication_status: "not_attempted"`: publication was never invoked and the configuration needs operator repair. No API-version negotiation or alternate publishing call is provided.
 
+## Category vocabulary v1 and advisory warnings
+
+The canonical category vocabulary, version **1**, is `alert`, `announcement`, `discussion`, `event`, `traffic`, and `weather`. Values match exactly: lowercase only, without trimming or normalization. An empty string means uncategorized and produces no warning. Other strings, including `Traffic`, are accepted and stored exactly as submitted with an `unknown_category` warning. Historical categories remain readable as-is, without migration or read-time warnings. Hard rejection would require a separately approved future major API version; this addition keeps `X-API-Version: 3` and existing storage formats.
+
+Successful digest and append responses may include one top-level `warnings` array. Warnings apply only to newly published stories or newly appended sources, including proposed writes in a dry-run. Duplicate items and duplicate appends produce no warnings; append warnings inspect only the submitted update, without rechecking the target story. Warnings never change `ok`, statuses, counts, identities, or `publication_status`. The array is omitted when empty. Reads and error responses do not include warnings; malformed fields still receive their normal validation errors.
+
+| Code | Condition |
+| --- | --- |
+| `unknown_category` | A new digest item's nonempty category is outside vocabulary v1. |
+| `posted_at_in_future` | A new story or update timestamp is more than 15 minutes ahead of server time. |
+| `posted_at_stale` | A new story or update timestamp is more than 720 elapsed hours before server time. Deliberate backfills remain accepted. |
+
+Exactly 15 minutes ahead and exactly 720 hours old do not warn. Timestamp comparisons use instants, regardless of the submitted timezone offset. Both timestamp warnings include UTC ISO `server_time`: the existing publisher operation time used for `received_at` and dry-run `checked_at`, captured inside the serialized publisher. The stale cutoff uses elapsed time and is separate from retention's 30 Los Angeles calendar dates.
+
+Each warning contains `field`, `code`, a readable `message`, and the exact submitted `value`. Digest warnings additionally include the submitted zero-based `index`, independent of the stored `item_index`. They appear in submitted item order, category before timestamp. For example, the following warnings accompany newly published items at indexes 3 and 5:
+
+```json
+{
+  "warnings": [
+    {
+      "index": 3,
+      "field": "items[3].category",
+      "code": "unknown_category",
+      "message": "Category 'trafic' is not in category vocabulary v1 (alert, announcement, discussion, event, traffic, weather). Accepted as submitted.",
+      "value": "trafic"
+    },
+    {
+      "index": 5,
+      "field": "items[5].posted_at",
+      "code": "posted_at_in_future",
+      "message": "posted_at is more than 15 minutes ahead of server time; check the source timestamp and timezone.",
+      "value": "2026-10-21T06:12:00-07:00",
+      "server_time": "2026-10-20T23:12:00.000Z"
+    }
+  ]
+}
+```
+
+Append warnings use the same shape without `index`, with `field: "posted_at"`; existing response identity fields retain their meaning:
+
+```json
+{
+  "warnings": [
+    {
+      "field": "posted_at",
+      "code": "posted_at_stale",
+      "message": "posted_at is more than 30 elapsed days old; check the source timestamp or confirm the intended backfill.",
+      "value": "2026-08-01T12:00:00-07:00",
+      "server_time": "2026-10-20T23:12:00.000Z"
+    }
+  ]
+}
+```
+
+These checks diagnose source timestamps without changing feed selection. A timestamp later today can still be eligible because the feed uses Los Angeles source dates; a future-day source falls outside the saved window and never hides another eligible source. Warnings do not schedule content or promise automatic future appearance. Review them in a dry-run before publishing to catch timezone mistakes without committing content.
+
 ## Preview publishing against committed history
 
 `POST /api/digests?dry_run=true` and `POST /api/posts/{post_id}/items/{item_index}/updates?dry_run=true` accept the normal JSON payload and authentication. They run the same validation, deduplication, reference-conflict checks, archive preparation, image inspection, HTML rendering, and RSS rendering as a real operation. All proposed writes stay in memory: source objects, archives, share cards, image-metadata caches, reference records, and Durable Object storage remain unchanged. Duplicate-only requests follow the same early no-op path as real publishing.
@@ -276,7 +332,7 @@ This intentionally corrects the earlier `500 publish_failed` response for digest
   --data-binary @examples/digest.json
 ```
 
-Successful previews return the normal per-item `published`/`duplicate` or append `appended`/`duplicate` results, plus `dry_run: true`, `committed: false`, and `checked_at`. Duplicate identities identify their actual owners. Newly proposed post IDs and append positions are provisional, including intra-batch duplicate references to a proposed item. A later real submission recomputes everything in the queue and may return different identities/results. Previews reserve neither URLs nor references, and cannot predict a later storage-write failure.
+Successful previews return the normal per-item `published`/`duplicate` or append `appended`/`duplicate` results, plus `dry_run: true`, `committed: false`, and `checked_at`. They include the same advisory warnings for proposed new sources as real submissions. Duplicate identities identify their actual owners. Newly proposed post IDs and append positions are provisional, including intra-batch duplicate references to a proposed item. A later real submission recomputes everything in the queue and may return different identities/results. Previews reserve neither URLs nor references, and cannot predict a later storage-write failure.
 
 Omit `dry_run` or use `dry_run=false` to publish. Other values and repeated parameters return `400 invalid_dry_run` before publisher invocation. Preview errors retain normal validation/error codes and always report `publication_status: "not_attempted"`; invoked preview errors also carry `dry_run: true` and `committed: false`. Missing preview RPCs fail closed with no fallback to a publishing call.
 

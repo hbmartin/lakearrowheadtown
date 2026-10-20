@@ -51,10 +51,20 @@ export interface Suggestion {
   path?: string;
 }
 
+export interface PublicationWarning {
+  index?: number;
+  field: string;
+  code: 'unknown_category' | 'posted_at_in_future' | 'posted_at_stale';
+  message: string;
+  value: string;
+  server_time?: string;
+}
+
 export interface AppendResult extends StoryIdentity {
   status: 'appended' | 'duplicate';
   message: string;
   suggestion?: Suggestion;
+  warnings?: PublicationWarning[];
   dry_run?: true;
   committed?: false;
   checked_at?: string;
@@ -110,6 +120,7 @@ export interface PublishResult {
   counts: { submitted: number; published: number; duplicates: number };
   items: (StoryIdentity & { index: number; status: 'published' | 'duplicate'; message?: string; suggestion?: Suggestion })[];
   client_ref?: string;
+  warnings?: PublicationWarning[];
   dry_run?: true;
   committed?: false;
   checked_at?: string;
