@@ -526,7 +526,7 @@ describe('maintenance methods, manifest damage, and upload admission', () => {
     else await bindings.SITE_BUCKET.put(key, reason === 'invalid_json' ? '{"private-manifest-value":' : '{"version":1,"posts":"private-manifest-value"}');
     const response = await submit();
     expect(response.status).toBe(500);
-    expect(response.headers.get('X-API-Version')).toBe('2');
+    expect(response.headers.get('X-API-Version')).toBe('3');
     const reply = await response.json<any>();
     expect(reply).toMatchObject({ code: 'manifest_damaged', retryable: false, publication_status: 'not_committed' });
     expect(JSON.stringify(reply)).not.toContain(key);

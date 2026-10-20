@@ -437,7 +437,7 @@ describe('actionable diagnostics', () => {
       const id = response.headers.get('X-Request-ID'); ids.add(id);
       expect(id).toMatch(/^[a-f0-9-]{36}$/);
       expect(response.headers.get('X-Worker-Version')).toBe('test-release');
-      expect(response.headers.get('X-API-Version')).toBe('2');
+      expect(response.headers.get('X-API-Version')).toBe('3');
       expect(response.headers.get('Cache-Control')).toBe('no-store');
       const text = await response.text();
       if (text) expect(JSON.parse(text).request_id).toBe(id);

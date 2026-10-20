@@ -13,6 +13,10 @@ test('theme assembly rejects missing, misspelled, duplicate and misplaced marker
     '<head><!-- theme-head -->',
   ]) assert.throws(() => renderers.withThemeHead(template), /exactly one theme-head marker inside <head>/);
   assert.match(renderers.withThemeHead('<head><!-- theme-head --></head>'), /name="theme-color"/);
+  for (const template of ['<HEAD><!-- theme-head --></HEAD>', '<HeAd data-test="head"><!-- theme-head --></hEaD >']) {
+    assert.match(renderers.withThemeHead(template), /name="theme-color"/);
+    assert.throws(() => renderers.withThemeHead(template.replace('<!-- theme-head -->', '') + '<!-- theme-head -->'), /inside <head>/);
+  }
 });
 
 test('site placeholders are centrally escaped and unsupported or incomplete markers fail', async () => {

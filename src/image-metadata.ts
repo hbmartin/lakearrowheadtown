@@ -86,7 +86,3 @@ export function createImageResolver(bucket: ContentBucket, origin: string): Imag
     return result;
   };
 }
-
-// Standalone callers still get a fresh, bounded resolver.
-export const resolveImages = (bucket: ContentBucket, items: StoredItem[], origin: string): Promise<ImageMetadataMap> =>
-  createImageResolver(bucket, origin)(items);

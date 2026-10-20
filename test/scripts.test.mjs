@@ -193,7 +193,7 @@ test('documented shell reads treat files as data and gate curl and upload hooks 
   const upload = blocks.find(block => block.startsWith('API_SECRET=') && block.includes('wrangler secret put'));
   const requests = blocks.filter(block => block.startsWith('[ -n "${API_SECRET:-}" ] && curl'));
   assert(setup && upload);
-  assert.equal(requests.length, 4);
+  assert.equal(requests.length, 7);
   const hooks = 'curl() { printf REQUEST_HOOK; }\nnpx() { cat >/dev/null; printf UPLOAD_HOOK; }\n';
   const value = secret + '$DUMMY;:>INJECTED#`echo`';
   const file = saveCredential('production', value, root);
