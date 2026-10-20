@@ -1,7 +1,7 @@
 import { archivePath, archiveUnavailable, loadArchiveDay, loadCatalog } from './archives';
 import { boundary, DamagedManifest } from './errors';
 import { loadPublication } from './publishing';
-import { dateLabel } from './social';
+import { dateLabel } from './dates';
 import { escapeHtml } from './html';
 import { renderArchivePage, renderContentPage } from './render';
 import { isDate } from './validation';
@@ -24,8 +24,8 @@ export async function pageResource(request: Request, bucket: ContentBucket, orig
   // Keep private sources and uncommitted catalogues out of all public reads.
   const index = await boundary('storage', () => bucket.head('pages/index.html'));
   const key = index?.customMetadata?.manifest;
-  let archives: string | undefined;
-  if (key) {
+  let archives = index?.customMetadata?.archives;
+  if (archives === undefined && key) {
     try { archives = (await loadPublication(bucket, key)).archives; }
     catch (error) { if (error instanceof DamagedManifest) throw archiveUnavailable(); throw error; }
   }

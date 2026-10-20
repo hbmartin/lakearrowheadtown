@@ -3,7 +3,7 @@ import { appendUpdate, initialMigration, migrateBatch, PublicationError, publish
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { asHttpError, boundary, publicationFailure } from './errors';
 import { readPosts, type PostsReply } from './posts';
-import type { AppendReply, Digest, Env, Migration, OperationContext, PublishReply, RebuildJob, StoryUpdate } from './types';
+import type { AppendReply, Digest, Env, Migration, OperationContext, PublishFailure, PublishReply, RebuildJob, StoryUpdate } from './types';
 
 // Inspection is read-only. Callers choose when to prune missing/completed references.
 async function queueHead(ids: string[], read: (id: string) => Promise<RebuildJob | undefined>) {
@@ -43,62 +43,59 @@ export class DigestPublisher extends DurableObject<Env> {
     return reply;
   }
 
-  async publishV2(digest: Digest, origin: string, context?: OperationContext): Promise<PublishReply> {
+  private mutation<T>(operation: 'publish' | 'append', context: OperationContext | undefined,
+    action: (complete: boolean | undefined, context: OperationContext | undefined) => Promise<T>): Promise<{ ok: true; result: T } | { ok: false; failure: PublishFailure }> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
         const migration = await new OperationTrace(context).run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
-        return { ok: true, result: await publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), migration?.complete, context) };
+        return { ok: true, result: await action(migration?.complete, context) };
       } catch (error) {
         const stage = error instanceof PublicationError ? error.stage : 'migration_state';
         const publication_status = error instanceof PublicationError ? error.publication_status : 'not_committed';
         const cause = error instanceof PublicationError ? error.cause : error;
         const failure = publicationFailure(cause, stage, publication_status);
-        emit('publish_failed', context, { stage, publication_status, publication_outcome: 'failed', error_code: failure.code, ...safeError(cause) }, 'error');
+        emit(`${operation}_failed`, context, { stage, publication_status, publication_outcome: 'failed', error_code: failure.code, ...safeError(cause) }, 'error');
         return { ok: false, failure };
       }
     }, context);
   }
 
+  async publishV2(digest: Digest, origin: string, context?: OperationContext): Promise<PublishReply> {
+    return this.mutation('publish', context, (complete, executing) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing));
+  }
+
   async appendUpdateV1(postId: string, itemIndex: number, update: StoryUpdate, origin: string, context?: OperationContext): Promise<AppendReply> {
-    context = this.executingContext(context);
-    return this.serialize(async () => {
-      try {
-        const migration = await new OperationTrace(context).run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
-        return { ok: true, result: await appendUpdate(this.env.SITE_BUCKET, postId, itemIndex, update, origin, new Date(), migration?.complete, context) };
-      } catch (error) {
-        const stage = error instanceof PublicationError ? error.stage : 'migration_state';
-        const publication_status = error instanceof PublicationError ? error.publication_status : 'not_committed';
-        const cause = error instanceof PublicationError ? error.cause : error;
-        const failure = publicationFailure(cause, stage, publication_status);
-        emit('append_failed', context, { stage, publication_status, publication_outcome: 'failed', error_code: failure.code, ...safeError(cause) }, 'error');
-        return { ok: false, failure };
+    return this.mutation('append', context, (complete, executing) => appendUpdate(this.env.SITE_BUCKET, postId, itemIndex, update, origin, new Date(), complete, executing));
+  }
+
+  private cursorKey?: Promise<string>;
+  private getCursorKey(): Promise<string> {
+    // The caller credential cannot sign trusted cursors. A transaction also
+    // protects first initialization while reads bypass the publication queue.
+    this.cursorKey ??= boundary('storage', () => this.ctx.storage.transaction(async storage => {
+      let key = await storage.get<string>('posts_cursor_key');
+      if (!key) {
+        key = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+        await storage.put('posts_cursor_key', key);
       }
-    }, context);
+      return key;
+    })).catch(error => { this.cursorKey = undefined; throw error; });
+    return this.cursorKey;
   }
 
   async readPostsV1(query: string, context?: OperationContext): Promise<PostsReply> {
     context = this.executingContext(context);
-    return this.serialize(async () => {
-      const trace = new OperationTrace(context);
-      try {
-        // The publishing credential is known to callers, so it cannot sign trusted cursors.
-        const key = await trace.run('cursor_key', () => boundary('storage', async () => {
-          let key = await this.ctx.storage.get<string>('posts_cursor_key');
-          if (!key) {
-            key = `${crypto.randomUUID()}${crypto.randomUUID()}`;
-            await this.ctx.storage.put('posts_cursor_key', key);
-          }
-          return key;
-        }));
-        return { ok: true, result: await trace.run('posts_read', () => readPosts(this.env.SITE_BUCKET, new URLSearchParams(query), key)) };
-      } catch (error) {
-        const failure = asHttpError(error);
-        const stage = trace.failed_stage ?? 'posts_read';
-        emit('posts_read_failed', context, { stage, error_code: failure.code, ...safeError(error) }, 'error');
-        return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, retryable: failure.retryable, stage, publication_status: 'not_attempted' } };
-      }
-    }, context);
+    const trace = new OperationTrace(context);
+    try {
+      const key = await trace.run('cursor_key', () => this.getCursorKey());
+      return { ok: true, result: await trace.run('posts_read', () => readPosts(this.env.SITE_BUCKET, new URLSearchParams(query), key)) };
+    } catch (error) {
+      const failure = asHttpError(error);
+      const stage = trace.failed_stage ?? 'posts_read';
+      emit('posts_read_failed', context, { stage, error_code: failure.code, ...safeError(error) }, 'error');
+      return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, retryable: failure.retryable, stage, publication_status: 'not_attempted' } };
+    }
   }
 
   private rebuildRequest<T>(context: OperationContext | undefined, identity: { job_id: string } | { candidate_job_id: string }, action: (trace: OperationTrace, context?: OperationContext) => Promise<T>): Promise<T> {

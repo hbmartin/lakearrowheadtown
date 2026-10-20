@@ -216,11 +216,14 @@ describe('snapshot reads and publication failure recovery', () => {
     expect((await request('/api/posts')).status).toBe(500);
     expect(await (await append(first.post!.id, update('second'))).json()).toMatchObject({ code: 'source_damaged', retryable: false });
   });
-  it('reads v1 manifests, upgrades on append, and excludes raw archives from v2 history', async () => {
+  it('reads v1 manifests, upgrades on append, and excludes raw sources after migration completes', async () => {
     const post: StoredPost = { ...digest(), id: 'legacy-2026-10-15', date: localDate(new Date()), received_at: now() };
     await seed([post], 1);
     expect((await request('/api/posts')).status).toBe(200);
     await append(post.id);
+    const publisher = bindings.PUBLISHER.getByName('site');
+    await publisher.enqueueRebuild(origin);
+    await runDurableObjectAlarm(publisher);
     await bindings.SITE_BUCKET.put('digests/2026-01-01.json', JSON.stringify(digest('uncommitted')));
     await submit(digest('new'));
     await rebuildHomepage(bindings.SITE_BUCKET, origin);

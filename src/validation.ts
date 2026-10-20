@@ -15,7 +15,7 @@ export function isTimestamp(value: unknown): value is string {
     && Number(match[6] ?? 0) <= 23 && Number(match[7] ?? 0) <= 59 && Number.isFinite(Date.parse(value));
 }
 
-export function validateDigest(value: unknown, options: { requireItems?: boolean } = {}): Digest {
+function fields(message: string) {
   const issues: ValidationIssue[] = [];
   let issueCount = 0;
   function invalid(path: string, code: string, message: string): void {
@@ -51,8 +51,15 @@ export function validateDigest(value: unknown, options: { requireItems?: boolean
     }
     return text;
   }
+  const reject = (): never => { throw new HttpError(400, message, {}, { code: 'validation_failed', details: issues, details_truncated: issueCount > issues.length }); };
+  return { invalid, record, string, httpUrl, timestamp, reject, check() { if (issueCount) reject(); } };
+}
+
+export function validateDigest(value: unknown, options: { requireItems?: boolean } = {}): Digest {
+  const v = fields('Digest validation failed');
+  const { invalid, record, string, httpUrl, timestamp } = v;
   const input = record(value, 'digest');
-  if (!input) throw new HttpError(400, 'Digest validation failed', {}, { code: 'validation_failed', details: issues });
+  if (!input) return v.reject();
   const title = string(input.title, 'title');
   const source = string(input.source, 'source');
   let items: DigestItem[] = [];
@@ -71,35 +78,29 @@ export function validateDigest(value: unknown, options: { requireItems?: boolean
       }];
     });
   }
-  if (issueCount) throw new HttpError(400, 'Digest validation failed', {}, { code: 'validation_failed', details: issues, details_truncated: issueCount > issues.length });
+  v.check();
   // Client-supplied date/receipt/identity fields never control server publication.
   return { title, source, items };
 }
 
 export function validateUpdate(value: unknown): StoryUpdate {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new HttpError(400, 'Update validation failed', {}, { code: 'validation_failed', details: [{ path: 'update', code: 'invalid_type', message: 'Expected an object.' }] });
-  }
-  const input = value as Record<string, unknown>;
-  try {
-    const item = validateDigest({ title: 'Update', source: 'update', items: [{
-      ...input, headline: 'Update', category: '', body: input.body === undefined ? '' : input.body,
-      group_url: input.group_url === undefined ? input.post_url : input.group_url,
-    }] }).items[0];
-    return { post_url: item.post_url, group: item.group, posted_at: item.posted_at, body: item.body,
-      ...(input.group_url !== undefined ? { group_url: item.group_url } : {}) };
-  } catch (error) {
-    if (!(error instanceof HttpError)) throw error;
-    throw new HttpError(error.status, 'Update validation failed', {}, { code: error.code, details_truncated: error.details_truncated,
-      details: Array.isArray(error.details) ? error.details.map(issue => ({ ...issue, path: issue.path.replace(/^items\[0\]\./, '') })) : error.details });
-  }
+  const v = fields('Update validation failed');
+  const input = v.record(value, 'update');
+  if (!input) return v.reject();
+  const group = v.string(input.group, 'group');
+  const group_url = input.group_url === undefined ? undefined : v.httpUrl(input.group_url, 'group_url');
+  const body = v.string(input.body === undefined ? '' : input.body, 'body', true);
+  const post_url = v.httpUrl(input.post_url, 'post_url');
+  const posted_at = v.timestamp(input.posted_at, 'posted_at');
+  v.check();
+  return { group, ...(group_url === undefined ? {} : { group_url }), body, post_url, posted_at };
 }
 
 // Incoming digest validation deliberately ignores updates; only stored sources may carry them.
-export function validateStoredItems(value: unknown): StoredItem[] {
+export function validateStoredDigest(value: unknown): Digest & { items: StoredItem[] } {
   const digest = validateDigest(value);
   const inputs = (value as { items: Record<string, unknown>[] }).items;
-  return digest.items.map((item, index) => {
+  return { ...digest, items: digest.items.map((item, index) => {
     const updates = inputs[index].updates;
     if (updates === undefined) return item;
     if (!Array.isArray(updates)) throw new HttpError(400, 'Stored updates must be an array');
@@ -108,8 +109,10 @@ export function validateStoredItems(value: unknown): StoredItem[] {
       if (!isTimestamp(value.received_at)) throw new HttpError(400, 'Stored update receipt timestamp is invalid');
       return { ...update, received_at: value.received_at };
     }) };
-  });
+  }) };
 }
+
+export const validateStoredItems = (value: unknown): StoredItem[] => validateStoredDigest(value).items;
 
 export function parseDigestJson(bytes: ArrayBuffer): unknown {
   let text: string;

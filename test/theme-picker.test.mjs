@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
+import { pages } from './helpers/rendered-pages.mjs';
 
-const template = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+const template = pages.homepage;
 const script = template.match(/<script id="theme-picker">([\s\S]*?)<\/script>/)[1];
 
 // Exercise the real script's event handlers; browser QA covers native focus/keys.
@@ -163,20 +163,4 @@ test('pointer selection and document keyup recover from interrupted arrow naviga
   keyup.emit(keyup.radios[2].name, 'click');
   assert.equal(keyup.panel.hidden, true);
   assert.equal(keyup.document.documentElement.dataset.theme, 'morning-mist');
-});
-
-test('restored theme colour is synchronized in the head before body parsing', () => {
-  const shared = readFileSync(new URL('../src/theme-head.html', import.meta.url), 'utf8');
-  for (const source of [template, readFileSync(new URL('../src/not-found.html', import.meta.url), 'utf8')]) {
-    const head = source.replace('<!-- theme-head -->', () => shared).split('</head>')[0];
-    const restore = head.match(/<script id="theme-fonts">([\s\S]*?)<\/script>/)[1];
-    const color = head.match(/<script id="theme-color">([\s\S]*?)<\/script>/)[1];
-    const meta = { content: '#F8F6F1' };
-    const document = { cookie: 'lakearrowhead_theme=night-sky', documentElement: { dataset: { theme: 'deep-lake-lodge' } }, querySelector: () => meta };
-    const context = { document, window: {}, getComputedStyle: element => ({ getPropertyValue: () => element.dataset.theme === 'night-sky' ? '#0B1426' : '#F8F6F1' }) };
-    runInNewContext(restore, context);
-    runInNewContext(color, context);
-    assert.equal(document.documentElement.dataset.theme, 'night-sky');
-    assert.equal(meta.content, '#0B1426');
-  }
 });

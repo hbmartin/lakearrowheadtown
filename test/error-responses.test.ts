@@ -15,6 +15,9 @@ const entries = [
   ['allow', 'GET, HEAD'], ['retry-after', '60'], ['x-extra', 'preserved'],
   ['content-type', 'text/plain'], ['cache-control', 'public, max-age=86400'],
   ['cloudflare-cdn-cache-control', 'public'], ['x-content-type-options', 'wrong'],
+  ['cDn-CaChE-CoNtRoL', 'public, max-age=86400'], ['Surrogate-Control', 'max-age=86400, stale-if-error=3600'],
+  ['set-cookie', 'intentional=value; Path=/; SameSite=Lax'],
+  ['www-authenticate', 'Bearer'], ['x-test-diagnostic', 'preserved'],
 ];
 const formats: Array<[string, () => HeadersInit]> = [
   ['record', () => Object.fromEntries(entries)],
@@ -25,6 +28,8 @@ function safeHeaders(response: Response, type: string) {
   expect(response.headers.get('Content-Type')).toBe(type);
   expect(response.headers.get('Cache-Control')).toBe('no-store');
   expect(response.headers.get('Cloudflare-CDN-Cache-Control')).toBe('no-store');
+  expect(response.headers.get('CDN-Cache-Control')).toBe('no-store');
+  expect(response.headers.get('Surrogate-Control')).toBe('no-store');
   expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
 }
 
@@ -43,6 +48,9 @@ describe('error headers', () => {
     expect(headers.get('ALLOW')).toBe('GET, HEAD');
     expect(headers.get('Retry-After')).toBe('60');
     expect(headers.get('X-Extra')).toBe('preserved');
+    expect(headers.get('Set-Cookie')).toBe('intentional=value; Path=/; SameSite=Lax');
+    expect(headers.get('WWW-Authenticate')).toBe('Bearer');
+    expect(headers.get('X-Test-Diagnostic')).toBe('preserved');
     expect([...new Headers(input)]).toEqual(before);
   });
 
@@ -56,6 +64,9 @@ describe('error headers', () => {
       expect(response.headers.get('Allow')).toBe('GET, HEAD');
       expect(response.headers.get('Retry-After')).toBe('60');
       expect(response.headers.get('X-Extra')).toBe('preserved');
+      expect(response.headers.get('Set-Cookie')).toBe('intentional=value; Path=/; SameSite=Lax');
+      expect(response.headers.get('WWW-Authenticate')).toBe('Bearer');
+      expect(response.headers.get('X-Test-Diagnostic')).toBe('preserved');
       if (method === 'HEAD') expect(await response.text()).toBe('');
       else if (status === 503) expect(await response.json()).toEqual({ ok: false, error: 'Public message' });
       else expect(await response.text()).toContain('<h1>Page not found</h1>');
@@ -64,10 +75,14 @@ describe('error headers', () => {
 });
 
 describe('public errors', () => {
-  it.each([SITE.origin, 'https://preview.example.test'])('serves safe HTML 404s on %s, including missing images and conditional requests', async origin => {
+  it.each([
+    { name: 'production', origin: SITE.origin, SITE_ORIGIN: SITE.origin, ENVIRONMENT: 'production' },
+    { name: 'alternate production hostname', origin: 'https://alternate.example.test', SITE_ORIGIN: SITE.origin, ENVIRONMENT: 'production' },
+    { name: 'preview', origin: 'https://preview.example.test', SITE_ORIGIN: '', ENVIRONMENT: 'preview' },
+  ])('serves safe HTML 404s with $name configuration, including missing images and conditional requests', async ({ origin, SITE_ORIGIN, ENVIRONMENT }) => {
     for (const path of ['/missing', `/images/${'a'.repeat(64)}.png`, '/2026/02/30/', '/2026/10/19/']) {
       for (const init of [{}, { method: 'HEAD' }, { headers: { 'If-None-Match': '*' } }]) {
-        const response = await request(path, init, origin);
+        const response = await request(path, init, origin, { SITE_ORIGIN, ENVIRONMENT });
         expect(response.status).toBe(404);
         safeHeaders(response, 'text/html; charset=utf-8');
         expect(response.headers.get('X-Robots-Tag')).toBe('noindex');

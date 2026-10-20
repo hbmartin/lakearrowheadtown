@@ -59,7 +59,6 @@ export function renderMetadata(origin: string, items: DigestItem[], publishedAt?
     description,
     'application-name': SITE.name,
     robots: origin === SITE.origin ? 'index, follow, max-image-preview:large' : 'noindex',
-    'theme-color': SITE.background,
     'twitter:card': 'summary_large_image',
     'twitter:title': socialTitle,
     'twitter:description': description,

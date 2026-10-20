@@ -1,7 +1,7 @@
 import { boundary, HttpError } from './errors';
-import { localDate, selectFeedItems, snapshotDates } from './feed';
+import { latestActivity, localDate, selectFeedItems, snapshotDates } from './feed';
 import { hashBytes, IMAGE_CACHE } from './images';
-import { resolveImages, validImageMetadata, type ImageMetadataMap } from './image-metadata';
+import { createImageResolver, validImageMetadata, type ImageMetadataMap, type ImageResolver } from './image-metadata';
 import { dailyCard, DAILY_CARD_VERSION } from './social';
 import { isDate, isTimestamp, validateStoredItems } from './validation';
 import type { ContentBucket, Publication, StoredPost } from './types';
@@ -11,7 +11,8 @@ export type ArchiveStory = ReturnType<typeof selectFeedItems>[number];
 export interface ArchiveDay { date: string; stories: ArchiveStory[]; images: ImageMetadataMap }
 export interface ArchiveReference { key: string; image: string; modified?: string; cardVersion?: number; identities: string[] }
 export interface ArchiveCatalog { version: 1; days: Record<string, ArchiveReference> }
-const stableJson = (value: unknown) => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item) ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
+export const stableJson = (value: unknown) => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+  ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item);
 const identity = (story: Pick<ArchiveStory, 'postId' | 'itemIndex'>) => `${story.postId}:${story.itemIndex}`;
 export const archivePath = (date: string) => `/${date.replaceAll('-', '/')}/`;
 export const archiveUnavailable = () => new HttpError(503, 'News archives are temporarily unavailable. Please try again later.', { 'Retry-After': '60' });
@@ -25,7 +26,7 @@ async function readJson(bucket: ContentBucket, key: string): Promise<unknown> {
 }
 
 export async function loadCatalog(bucket: ContentBucket, key?: string): Promise<ArchiveCatalog> {
-  if (!key) return { version: 1, days: {} };
+  if (key === undefined) return { version: 1, days: {} };
   if (!/^archive-catalogs\/[a-f0-9]{64}\.json$/.test(key)) throw archiveUnavailable();
   const value = await readJson(bucket, key) as ArchiveCatalog;
   if (!value || value.version !== 1 || !value.days || typeof value.days !== 'object' || Array.isArray(value.days)
@@ -49,7 +50,7 @@ export async function loadArchiveDay(bucket: ContentBucket, date: string, ref: A
 // A catalogue is only public once its reference is committed by the homepage index.
 // Daily records contain independent content, never mutable source references.
 export async function prepareArchives(bucket: ContentBucket, posts: StoredPost[], publication: Publication, origin: string,
-  previous: string | undefined, trace: OperationTrace): Promise<string> {
+  previous: string | undefined, trace: OperationTrace, resolve: ImageResolver = createImageResolver(bucket, origin)): Promise<string> {
   const catalog = await trace.run('archive_loading', () => loadCatalog(bucket, previous));
   const active = new Map<string, import('./types').StoredItem>(posts.flatMap(post => post.items.map((item, itemIndex) => [`${post.id}:${itemIndex}`, item] as const)));
   const knownPosts = new Set(posts.map(post => post.id));
@@ -59,7 +60,7 @@ export async function prepareArchives(bucket: ContentBucket, posts: StoredPost[]
   for (const entry of visible) {
     const activities = [entry.item.posted_at, ...(entry.item.updates ?? []).map(update => update.posted_at)];
     for (const date of new Set(activities.map(time => localDate(new Date(time))).filter(date => dates.includes(date)))) {
-      const activity = activities.filter(time => localDate(new Date(time)) === date).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+      const activity = latestActivity(entry.item, [date])!;
       if (!additions.has(date)) additions.set(date, []);
       additions.get(date)!.push({ ...entry, date, activity, timestamp: Date.parse(activity) });
     }
@@ -78,18 +79,23 @@ export async function prepareArchives(bucket: ContentBucket, posts: StoredPost[]
     }));
     for (const entry of additions.get(date) ?? []) stories.set(identity(entry), entry);
     const ordered = [...stories.values()].sort((a, b) => b.timestamp - a.timestamp);
-    const images = await trace.run('archive_images', () => resolveImages(bucket, ordered.map(story => story.item), origin));
+    const images = await trace.run('archive_images', () => resolve(ordered.map(story => story.item)));
     const day: ArchiveDay = { date, stories: ordered, images: { ...old?.images, ...images } };
     const body = stableJson(day);
     const key = `archive-days/${await hashBytes(new TextEncoder().encode(body))}.json`;
-    const contentChanged = key !== ref?.key;
-    if (!contentChanged && ref?.cardVersion === DAILY_CARD_VERSION) continue;
+    // A new canonical key order can change bytes without changing news content.
+    const contentChanged = !old || body !== stableJson(old);
+    if (key === ref?.key && ref.cardVersion === DAILY_CARD_VERSION) continue;
     const headline = ordered[0]?.item.headline ?? 'Lake Arrowhead community news';
-    const png = await trace.run('archive_card_rendering', () => boundary('rendering', () => dailyCard(date, headline)));
-    const image = `/assets/daily/${await hashBytes(png)}.png`;
-    await trace.run('archive_image_write', () => boundary('storage', () => bucket.put(image.slice(1), png, { httpMetadata: { contentType: 'image/png', cacheControl: IMAGE_CACHE } })));
-    await trace.run('archive_day_write', () => boundary('storage', () => bucket.put(key, body, { httpMetadata: { contentType: 'application/json' } })));
-    catalog.days[date] = { key, image, ...((contentChanged ? publication.published_at : ref?.modified) ? { modified: (contentChanged ? publication.published_at : ref?.modified)! } : {}), cardVersion: DAILY_CARD_VERSION, identities: ordered.map(identity) };
+    let image = ref?.image;
+    if (!ref || ref.cardVersion !== DAILY_CARD_VERSION || headline !== (old?.stories[0]?.item.headline ?? 'Lake Arrowhead community news')) {
+      const png = await trace.run('archive_card_rendering', () => boundary('rendering', () => dailyCard(date, headline)));
+      image = `/assets/daily/${await hashBytes(png)}.png`;
+      await trace.run('archive_image_write', () => boundary('storage', () => bucket.put(image!.slice(1), png, { httpMetadata: { contentType: 'image/png', cacheControl: IMAGE_CACHE } })));
+    }
+    if (key !== ref?.key) await trace.run('archive_day_write', () => boundary('storage', () => bucket.put(key, body, { httpMetadata: { contentType: 'application/json' } })));
+    const modified = contentChanged ? publication.published_at : ref?.modified;
+    catalog.days[date] = { key, image: image!, ...(modified ? { modified } : {}), cardVersion: DAILY_CARD_VERSION, identities: ordered.map(identity) };
   }
   const body = stableJson(catalog);
   const key = `archive-catalogs/${await hashBytes(new TextEncoder().encode(body))}.json`;

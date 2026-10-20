@@ -4,7 +4,7 @@ import { boundary, HttpError, isPublishReply } from './errors';
 import { lastReceivedAt, latestActivity, localDate, recentDates } from './feed';
 import { currentPublication, loadPost, loadPublication } from './publishing';
 import { isTimestamp } from './validation';
-import type { ContentBucket, PublishFailure } from './types';
+import type { ContentBucket, PostReference, PublishFailure } from './types';
 
 interface Cursor { snapshot: string; as_of: string; days: number; offset: number }
 const invalidCursor = () => new HttpError(400, 'The cursor is invalid or does not match days. Start a fresh read.', {}, { code: 'invalid_cursor' });
@@ -48,17 +48,28 @@ export async function readPosts(bucket: ContentBucket, query: URLSearchParams, s
   if (offset > publication.posts.length) throw invalidCursor();
   const posts = [];
   while (offset < publication.posts.length && posts.length < 20) {
-    const ref = publication.posts[offset++];
-    if (!dates.includes(localDate(new Date(ref.last_received_at ?? ref.received_at)))) continue;
-    const post = await loadPost(bucket, ref);
-    const items = post.items.flatMap((item, item_index) => {
-      const last_received_at = lastReceivedAt(post, item);
-      if (!dates.includes(localDate(new Date(last_received_at)))) return [];
-      return [{ ...item, item_index, last_received_at, latest_activity_at: latestActivity(item),
-        updates: (item.updates ?? []).map((update, update_index) => ({ ...update, update_index })) }];
-    });
-    if (items.length) posts.push({ post_id: post.id, date: post.date, received_at: post.received_at, title: post.title, source: post.source, items });
+    const refs: PostReference[] = [];
+    // Never prefetch beyond the number of remaining response slots.
+    const capacity = Math.min(4, 20 - posts.length);
+    while (offset < publication.posts.length && refs.length < capacity) {
+      const ref = publication.posts[offset++];
+      if (dates.includes(localDate(new Date(ref.last_received_at ?? ref.received_at)))) refs.push(ref);
+    }
+    const loaded = await Promise.allSettled(refs.map(ref => loadPost(bucket, ref)));
+    for (const result of loaded) {
+      // Completion order must not change source or failure ordering.
+      if (result.status === 'rejected') throw result.reason;
+      const post = result.value;
+      const items = post.items.flatMap((item, item_index) => {
+        const last_received_at = lastReceivedAt(post, item);
+        if (!dates.includes(localDate(new Date(last_received_at)))) return [];
+        return [{ ...item, item_index, last_received_at, latest_activity_at: latestActivity(item),
+          updates: (item.updates ?? []).map((update, update_index) => ({ ...update, update_index })) }];
+      });
+      if (items.length) posts.push({ post_id: post.id, date: post.date, received_at: post.received_at, title: post.title, source: post.source, items });
+    }
   }
+
   return { days, as_of: asOf, published_at: publication.published_at, posts,
     omitted_post_ids: (publication.omitted_posts ?? []).map(ref => ref.id),
     message: publication.omitted_posts?.length ? 'Some sources were omitted from this publication because they require operator repair.' : 'Published stories are ready to review.',
