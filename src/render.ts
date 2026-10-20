@@ -1,5 +1,6 @@
 import MarkdownIt, { type Token } from 'markdown-it';
-import template from '../index.html';
+import rawTemplate from '../index.html';
+import { withThemeHead } from './theme';
 import { escapeHtml } from './html';
 import { archivePath, type ArchiveDay, type ArchiveReference } from './archives';
 import type { ImageMetadataMap } from './image-metadata';
@@ -9,6 +10,8 @@ import { orderedUpdates, selectFeedItems, snapshotDates, TIME_ZONE } from './fee
 import type { DigestItem, Publication, StoredItem, StoredPost } from './types';
 export { escapeHtml } from './html';
 export { recentDates, TIME_ZONE } from './feed';
+
+const template = withThemeHead(rawTemplate);
 
 const markdown = new MarkdownIt({ html: false, linkify: false, typographer: false });
 interface ImageContext extends Record<PropertyKey, unknown> { origin: string; images: ImageMetadataMap; count: number }

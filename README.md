@@ -1,6 +1,6 @@
 # Lake Arrowhead . Town
 
-A Cloudflare Worker publishes an append-only community news feed and hosts uploaded images. The homepage preserves the existing design and four selectable themes.
+A Cloudflare Worker publishes an append-only community news feed and hosts uploaded images. The homepage preserves the existing design and five selectable themes.
 
 ```text
 POST /api/digests → authenticate and validate → serialized publisher → R2 post + manifest + index
@@ -388,6 +388,8 @@ To repair an archive, pause publishers and back up the committed index, manifest
 
 Default browser fonts are self-hosted DM Sans and Instrument Serif with `font-display: swap`. Newsreader and Fraunces stylesheets load only for their active/restored themes. Regenerate committed WOFF2 files offline with `npm run fonts`; retain the adjacent font licenses and bump versioned filenames when replacing released bytes.
 
+Normal pages and the public 404 page inline the same bundled theme initialization, palettes, font declarations, and browser theme-color update. The 404 page restores the saved `lakearrowhead_theme` cookie before painting, including Night Sky, and uses the selected theme's fonts without adding a theme picker. Invalid or inaccessible cookies and disabled JavaScript retain the default Deep Lake & Lodge palette. Error rendering needs no R2 reads or publication data.
+
 ## Upload images
 
 ```sh
@@ -452,11 +454,15 @@ API version 2 intentionally changes the resume conflict code from `job_not_faile
 | `publications/<uuid>.json` | Immutable private snapshot manifests |
 | `pages/index.html` | Public rendered index; metadata references its manifest |
 | `images/<sha256>.<extension>` | Immutable uploaded images |
+| `archive-days/<sha256>.json`, `archive-catalogs/<sha256>.json` | Private immutable daily content and archive catalogues |
+| `assets/daily/<sha256>.png` | Immutable public daily share cards |
 | `digests/*.json`, `pages/digests/*.html` | Retained private legacy backups |
 
-Only `/`, `/index.html`, `/images/<hash>.<extension>`, and the explicit metadata/artwork routes listed above are public. Old daily routes return `404`. Digest sources, publication manifests, bucket listings, artwork source files, and config files are never exposed. There is no archive listing or public administration UI.
+Public routes include `/`, `/index.html`, `/archive/`, published `/YYYY/MM/DD/` daily pages, `/road-conditions/`, `/power-outages/`, `/emergency-resources/`, `/images/<hash>.<extension>`, `/assets/daily/<hash>.png`, the versioned `/assets/fonts/` files, and the explicit metadata/artwork routes listed above. Invalid or unpublished daily dates and legacy `/digests/...` routes return `404`. Digest sources, publication manifests, private archive content/catalogues, bucket listings, artwork source files, and config files are never exposed. There is no public administration UI.
 
 HTML and RSS support HEAD and weak ETag revalidation, require revalidation, permit compression, and bypass edge caching. Malformed `If-None-Match` conditions are ignored consistently for public GET and HEAD requests. Image GETs use Workers Caching. Protected APIs always return `no-store` JSON. Maintenance CLI errors preserve HTTP status even when Cloudflare returns non-JSON content.
+
+Public non-API `404` responses use an HTML page, including missing image URLs. Other public errors remain minimal JSON; `/api` errors retain their structured JSON contract. All application error responses use browser and CDN `no-store` caching and `X-Content-Type-Options: nosniff`, preserve headers such as `Allow` and `Retry-After`, and have no body on HEAD. A conditional request to a missing resource remains `404`. The 404 page always sends `noindex` through its robots meta tag and `X-Robots-Tag` header; the origin-based indexing policy still applies independently. API paths are case-sensitive, so incorrectly capitalized paths such as `/API/posts` are unknown public paths.
 
 RSS smoke checks require its MIME type on GET/HEAD 200 responses. A 304 need not contain `Content-Type`, but a present value must match the RSS MIME type; conditional checks still require the unchanged ETag, cache/indexing policy, and an empty body. The separate strict public HTML ETag check remains required before production rollout.
 
@@ -480,7 +486,7 @@ Every application-generated `/api` response has `X-Request-ID`, `X-Worker-Versio
 
 Validation collects up to 50 field issues and rejects the entire batch before writes; `details_truncated` indicates additional issues. A non-object digest or item gets one structural issue without redundant child-field issues; later items are still checked. Malformed JSON and invalid UTF-8 have separate codes. Syntax details include zero-based UTF-16 `position` and one-based `line`/`column` only for recognized, bounds-checked parser-location formats; CRLF counts as one line break, and lone CR or LF each count as one. Unknown formats omit locations. Input excerpts are never returned or searched for locations. Complete authenticated digest bodies are fingerprinted before parsing. Partial or rejected-before-read bodies never receive a complete-body hash. Compare `body_sha256` against `shasum -a 256 payload.json` and use `--data-binary @payload.json` to investigate transmitted-byte differences.
 
-`bytes_received` counts body bytes consumed by the Worker, not transport bytes received by Cloudflare. Optional `declared_body_bytes` is the unverified numeric Content-Length header. Rejecting that header before reading reports zero consumed bytes and `body_complete: false`. Multipart `body_complete` follows stream EOF independently of parsing: a fully read malformed form can report true. Public non-API errors retain a minimal `{ok, error}` body, with full diagnostic details in logs.
+`bytes_received` counts body bytes consumed by the Worker, not transport bytes received by Cloudflare. Optional `declared_body_bytes` is the unverified numeric Content-Length header. Rejecting that header before reading reports zero consumed bytes and `body_complete: false`. Multipart `body_complete` follows stream EOF independently of parsing: a fully read malformed form can report true. Public non-API errors other than the HTML 404 page retain a minimal `{ok, error}` body, with full diagnostic details in logs.
 
 | Status | Codes / meaning | Caller action |
 | --- | --- | --- |

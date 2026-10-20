@@ -112,7 +112,14 @@ describe('permanent daily archives', () => {
     await publishDigest(bindings.SITE_BUCKET, digest(), origin, now, true);
     const ref = (await catalog()).days['2026-10-20'];
     await bindings.SITE_BUCKET.delete(ref.key);
-    expect((await fetch('/2026/10/20/')).status).toBe(503);
+    for (const method of ['GET', 'HEAD']) {
+      const response = await fetch('/2026/10/20/', { method });
+      expect(response.status).toBe(503);
+      expect(response.headers.get('Retry-After')).toBe('60');
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      if (method === 'HEAD') expect(await response.text()).toBe('');
+      else expect(await response.json()).toEqual({ ok: false, error: 'News archives are temporarily unavailable. Please try again later.' });
+    }
   });
 
   it('escapes hostile headlines in archive HTML, JSON-LD and PNG rendering', async () => {

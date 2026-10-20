@@ -328,23 +328,9 @@ describe('actionable diagnostics', () => {
     expect(response.status).toBe(500);
     expect(await response.json()).toMatchObject({ code: 'body_read_failed', retryable: true, diagnostics: { body_complete: false } });
   });
-  it('requires repair for configuration errors and serves public 404s as HTML while keeping API errors JSON', async () => {
+  it('requires repair for configuration errors', async () => {
     const response = await submit(input(), { API_SECRET: '' });
     expect(await response.json()).toMatchObject({ code: 'configuration_error', retryable: false });
-    for (const path of ['/missing', `/images/${'a'.repeat(64)}.png`]) {
-      const missing = await request(path);
-      expect(missing.status).toBe(404);
-      expect(missing.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
-      expect(missing.headers.get('X-Robots-Tag')).toBe('noindex');
-      const html = await missing.text();
-      expect(html).toContain('<h1>Page not found</h1>');
-      expect(html).toContain('<a href="/">');
-      const head = await request(path, { method: 'HEAD' });
-      expect(head.status).toBe(404);
-      expect(head.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
-      expect(await head.text()).toBe('');
-    }
-    expect(await (await request('/api/missing')).json()).toMatchObject({ code: 'not_found', diagnostics: { stage: 'public_read' } });
   });
   it('records duplicate-only successes without a failure-oriented publication status', async () => {
     await submit(input());

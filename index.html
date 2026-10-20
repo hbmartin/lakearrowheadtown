@@ -2,38 +2,10 @@
 <html lang="en" data-theme="deep-lake-lodge">
 <head>
   <meta charset="UTF-8" />
-  <script id="theme-fonts">
-    // Load optional display families only when the active theme needs them.
-    window.loadThemeFont = theme => {
-      const families = { 'golden-hour-dock': 'Newsreader', 'village-heritage': 'Fraunces' };
-      const family = families[theme];
-      if (!family || document.getElementById(`font-${family}`)) return;
-      const link = document.createElement('link');
-      link.id = `font-${family}`;
-      link.rel = 'stylesheet';
-      link.href = `https://fonts.googleapis.com/css2?family=${family}:wght@400;500&display=swap`;
-      document.head.append(link);
-    };
-    // Restore the saved palette before styles or page content can paint.
-    (() => {
-      const themes = ['deep-lake-lodge', 'golden-hour-dock', 'morning-mist', 'village-heritage', 'night-sky'];
-      try {
-        const cookie = document.cookie.split(';').map(part => part.trim())
-          .find(part => part.startsWith('lakearrowhead_theme='));
-        const savedTheme = cookie?.slice('lakearrowhead_theme='.length);
-        if (themes.includes(savedTheme)) document.documentElement.dataset.theme = savedTheme;
-      } catch {
-        // The default palette still works when browser storage is unavailable.
-      }
-    })();
-    window.loadThemeFont(document.documentElement.dataset.theme);
-  </script>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <!-- page-meta -->
-  <link rel="preload" href="/assets/fonts/dm-sans-v1.woff2" as="font" type="font/woff2" crossorigin>
+  <!-- theme-head -->
   <style>
-    @font-face { font-family: 'DM Sans'; src: url('/assets/fonts/dm-sans-v1.woff2') format('woff2'); font-weight: 100 1000; font-style: normal; font-display: swap; }
-    @font-face { font-family: 'Instrument Serif'; src: url('/assets/fonts/instrument-serif-v1.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
     .resource-nav { display: flex; flex-wrap: wrap; gap: .5rem 1.25rem; margin: 0 0 1.5rem; font-size: .875rem; }
     .resource-nav a, .digest-header a { color: inherit; }
     .resource-page { max-width: 48rem; }
@@ -69,123 +41,6 @@
         transition-duration: 0.01ms !important;
         scroll-behavior: auto !important;
       }
-    }
-
-    :root {
-      color-scheme: light;
-      --body-font: 'DM Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      --display-font: 'Instrument Serif', Georgia, serif;
-      --heading-weight: 400;
-      --page-bg: #F8F6F1;
-      --surface: #FFFDF8;
-      --surface-hover: #EEF1ED;
-      --selected-bg: #CBD6D6;
-      --heading: #1B3B1F;
-      --text: #1B3B1F;
-      --muted: #526057;
-      --border: #CBD6D6;
-      --control-border: #8A8E93;
-      --primary: #2E5F73;
-      --on-primary: #F8F6F1;
-      --accent: #8A6B4F;
-      --texture-ink: #8A6B4F;
-      --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='480' fill='none' stroke='%238A6B4F' stroke-width='1'%3E%3Cpath d='M18-20Q42 90 20 190T22 500M40-20Q66 95 45 190T48 500M68-20Q92 110 70 210T74 500M100-20Q124 120 98 235T104 500M134-20Q154 120 132 240T138 500M168-20Q188 140 166 260T174 500M206-20Q224 140 204 260T210 500'/%3E%3Cellipse cx='98' cy='234' rx='8' ry='36'/%3E%3Cellipse cx='98' cy='234' rx='3' ry='18'/%3E%3C/svg%3E");
-      --texture-size: 240px 480px;
-      --texture-opacity: 0.132;
-      --atmosphere: radial-gradient(ellipse at 0 0, rgb(138 107 79 / 12%), transparent 65%), radial-gradient(ellipse at 100% 12%, rgb(46 95 115 / 9%), transparent 60%);
-      --shadow: 0 12px 40px rgb(27 59 31 / 10%), 0 2px 6px rgb(27 59 31 / 5%);
-      --gutter: clamp(1.5rem, 6vw, 6rem);
-      --radius: 14px;
-    }
-
-    :root[data-theme="golden-hour-dock"] {
-      --display-font: 'Newsreader', Georgia, serif;
-      --page-bg: #F5EEDC;
-      --surface: #FCF7EC;
-      --surface-hover: #F1E8D8;
-      --selected-bg: #EFE4DD;
-      --heading: #5A3F5F;
-      --text: #5A3F5F;
-      --muted: #496E6E;
-      --border: #D5C4B1;
-      --control-border: #8B5E3C;
-      --primary: #5A3F5F;
-      --on-primary: #F5EEDC;
-      --accent: #D9782F;
-      --texture-ink: #8B5E3C;
-      --texture: repeating-linear-gradient(0deg, transparent 0 76px, var(--texture-ink) 77px, transparent 79px 80px), repeating-linear-gradient(1deg, transparent 0 12px, rgb(139 94 60 / 35%) 13px, transparent 14px 29px);
-      --texture-size: 360px 240px;
-      --texture-opacity: 0.144;
-      --atmosphere: radial-gradient(ellipse at 100% 0, rgb(217 120 47 / 19%), transparent 65%), radial-gradient(ellipse at 0 20%, rgb(90 63 95 / 8%), transparent 60%);
-      --shadow: 0 12px 40px rgb(90 63 95 / 10%), 0 2px 6px rgb(90 63 95 / 5%);
-    }
-
-    :root[data-theme="morning-mist"] {
-      --display-font: var(--body-font);
-      --heading-weight: 500;
-      --page-bg: #F2F4F3;
-      --surface: #FAFCFB;
-      --surface-hover: #E8EEEC;
-      --selected-bg: #D9E2E1;
-      --heading: #2C3633;
-      --text: #2C3633;
-      --muted: #52645F;
-      --border: #D9E2E1;
-      --control-border: #667A75;
-      --primary: #2C3633;
-      --on-primary: #F2F4F3;
-      --accent: #C2B280;
-      --texture-ink: #A3B5B2;
-      --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='400' viewBox='0 0 600 400' fill='none' stroke='%232C3633' stroke-width='1.5'%3E%3Cdefs%3E%3Cpath id='line' d='M0 0C100-60 200-60 300 0S500 60 600 0'/%3E%3C/defs%3E%3Cuse href='%23line' y='-50'/%3E%3Cuse href='%23line' y='-25'/%3E%3Cuse href='%23line' y='0'/%3E%3Cuse href='%23line' y='25'/%3E%3Cuse href='%23line' y='50'/%3E%3Cuse href='%23line' y='75'/%3E%3Cuse href='%23line' y='100'/%3E%3Cuse href='%23line' y='125'/%3E%3Cuse href='%23line' y='150'/%3E%3Cuse href='%23line' y='175'/%3E%3Cuse href='%23line' y='200'/%3E%3Cuse href='%23line' y='225'/%3E%3Cuse href='%23line' y='250'/%3E%3Cuse href='%23line' y='275'/%3E%3Cuse href='%23line' y='300'/%3E%3Cuse href='%23line' y='325'/%3E%3Cuse href='%23line' y='350'/%3E%3Cuse href='%23line' y='375'/%3E%3Cuse href='%23line' y='400'/%3E%3Cuse href='%23line' y='425'/%3E%3Cuse href='%23line' y='450'/%3E%3C/svg%3E");
-      --texture-size: 600px 400px;
-      --texture-opacity: 0.096;
-      --atmosphere: radial-gradient(ellipse at 0 0, rgb(163 181 178 / 28%), transparent 65%), radial-gradient(ellipse at 100% 30%, rgb(255 255 255 / 90%), transparent 65%);
-      --shadow: 0 12px 40px rgb(44 54 51 / 8%), 0 2px 6px rgb(44 54 51 / 4%);
-    }
-
-    :root[data-theme="village-heritage"] {
-      --display-font: 'Fraunces', Georgia, serif;
-      --heading-weight: 500;
-      --page-bg: #FFF9F0;
-      --surface: #FFFCF7;
-      --surface-hover: #F5EDDF;
-      --selected-bg: #E8DCC3;
-      --heading: #2B4C3F;
-      --text: #1E1E1E;
-      --muted: #4C594D;
-      --border: #E8DCC3;
-      --control-border: #6F796A;
-      --primary: #2B4C3F;
-      --on-primary: #FFF9F0;
-      --accent: #A33529;
-      --texture-ink: #2B4C3F;
-      --texture: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' fill='none' stroke='%238A6B4F' stroke-width='.7'%3E%3Cpath d='m8 22 12-3m32 18 16 2m49-24 7 4m32 30-13 2M18 80l7 3m36-17 14-2m28 28 11 3m38-20 14-1M7 144l13-2m30 21 9-4m32-31 17 1m37 26 11-4'/%3E%3C/svg%3E"), radial-gradient(var(--texture-ink) 0.7px, transparent 1px), radial-gradient(var(--texture-ink) 0.5px, transparent 0.8px);
-      --texture-size: 180px 180px, 19px 23px, 31px 37px;
-      --texture-opacity: 0.168;
-      --atmosphere: radial-gradient(ellipse at 0 0, rgb(194 178 128 / 22%), transparent 70%), radial-gradient(ellipse at 100% 15%, rgb(163 53 41 / 6%), transparent 60%);
-      --shadow: 0 12px 40px rgb(43 76 63 / 10%), 0 2px 6px rgb(43 76 63 / 5%);
-    }
-
-    :root[data-theme="night-sky"] {
-      color-scheme: dark;
-      --page-bg: #0B1426;
-      --surface: #13213A;
-      --surface-hover: #1B2D49;
-      --selected-bg: #203654;
-      --heading: #F2F4FA;
-      --text: #DEE5F0;
-      --muted: #A7B7CF;
-      --border: #344761;
-      --control-border: #7F96B5;
-      --primary: #9FC7F5;
-      --on-primary: #0B1426;
-      --accent: #E0C58A;
-      --texture-ink: #DEE5F0;
-      --texture: radial-gradient(circle at 24px 20px, var(--texture-ink) 0 1px, transparent 1.5px), radial-gradient(circle at 101px 91px, var(--texture-ink) 0 0.7px, transparent 1.2px), radial-gradient(circle at 48px 115px, var(--accent) 0 0.8px, transparent 1.3px);
-      --texture-size: 173px 191px, 257px 227px, 311px 283px;
-      --texture-opacity: 0.39;
-      --atmosphere: radial-gradient(ellipse at 100% 0, rgb(64 100 156 / 25%), transparent 70%), radial-gradient(ellipse at 0 20%, rgb(91 77 126 / 14%), transparent 65%);
-      --shadow: 0 12px 40px rgb(0 0 0 / 35%), 0 2px 6px rgb(0 0 0 / 20%);
     }
 
     body {
@@ -390,11 +245,6 @@
       .theme-swatches { forced-color-adjust: none; }
     }
   </style>
-  <script id="theme-color">
-    // The restored theme and its styles are available before body content parses.
-    const themeColor = document.querySelector('meta[name="theme-color"]');
-    if (themeColor) themeColor.content = getComputedStyle(document.documentElement).getPropertyValue('--page-bg').trim();
-  </script>
 </head>
 <body>
   <header>
