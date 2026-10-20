@@ -46,6 +46,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   let previousTag;
   let previousRssTag;
   let workerVersion;
+  let story;
   const requestIds = [];
   for (let attempt = 0; attempt < 3; attempt++) {
     input.title = `${run}${attempt === 2 ? ' follow-up correction' : ''}`;
@@ -54,6 +55,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     const response = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
     assert.equal(response.status, 200, await response.clone().text());
     const result = await response.json();
+    story ??= result.items[0];
     assert.equal(result.ok, true); assert.equal(result.url, '/');
     assert.equal(result.request_id, response.headers.get('X-Request-ID'));
     requestIds.push(result.request_id);
@@ -106,6 +108,50 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert(previousTag?.startsWith('W/'), 'HTML must expose a weak ETag');
     if (edge) assert.match(homepage.headers.get('content-encoding') || '', /gzip|br|zstd/, 'Cloudflare must compress HTML');
   }
+  const listStories = async () => {
+    let cursor;
+    const posts = [];
+    do {
+      const response = await fetch(`${origin}/api/posts?days=7${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, { headers });
+      assert.equal(response.status, 200, await response.clone().text());
+      assert.equal(response.headers.get('Cache-Control'), 'no-store');
+      const result = await response.json();
+      assert.equal(result.ok, true);
+      assert.equal(result.request_id, response.headers.get('X-Request-ID'));
+      posts.push(...result.posts);
+      cursor = result.next_cursor;
+    } while (cursor);
+    return posts;
+  };
+  assert((await listStories()).some(post => post.post_id === story.post_id && post.items.some(item => item.item_index === story.item_index)));
+  const update = { group: 'Preview follow-up', post_url: `${input.items[0].post_url}&attached=1`, body: `Attached **source update** for ${run}.`, posted_at: new Date().toISOString() };
+  const updatePath = `${origin}/api/posts/${story.post_id}/items/${story.item_index}/updates`;
+  let appendedTag;
+  let appendedRssTag;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await fetch(updatePath, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(update) });
+    assert.equal(response.status, 200, await response.clone().text());
+    const result = await response.json();
+    assert.equal(result.status, attempt ? 'duplicate' : 'appended');
+    assert.equal(result.post_id, story.post_id); assert.equal(result.item_index, story.item_index); assert.equal(result.update_index, 0);
+    assert(result.message); assert.equal(result.request_id, response.headers.get('X-Request-ID')); requestIds.push(result.request_id);
+    if (attempt) assert.equal(result.suggestion.action, 'review_existing_story');
+    const homepage = await fetch(origin, { headers: { 'If-None-Match': appendedTag ?? previousTag } });
+    const rss = await fetch(`${origin}/rss.xml`, { headers: { 'If-None-Match': appendedRssTag ?? previousRssTag } });
+    assert.equal(homepage.status, attempt ? 304 : 200); assert.equal(rss.status, attempt ? 304 : 200);
+    checkRssHeaders(rss);
+    if (!attempt) {
+      assert((await homepage.text()).includes('Attached <strong>source update</strong>'));
+      const xml = await rss.text();
+      const parser = new SaxesParser({ xmlns: true }); parser.write(xml).close();
+      assert(xml.includes('attached=1'));
+      appendedTag = homepage.headers.get('etag'); appendedRssTag = rss.headers.get('etag');
+      assert(appendedTag?.startsWith('W/')); assert(appendedRssTag?.startsWith('W/'));
+    }
+  }
+  const readStory = (await listStories()).find(post => post.post_id === story.post_id).items.find(item => item.item_index === story.item_index);
+  assert.equal(readStory.updates.length, 1); assert.equal(readStory.updates[0].post_url, update.post_url);
+  previousTag = appendedTag; previousRssTag = appendedRssTag;
   const empty = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ ...input, items: [] }) });
   assert.equal(empty.status, 400);
   const invalid = await empty.json();

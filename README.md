@@ -4,12 +4,14 @@ A Cloudflare Worker publishes an append-only community news feed and hosts uploa
 
 ```text
 POST /api/digests → authenticate and validate → serialized publisher → R2 post + manifest + index
+GET  /api/posts   → authenticate → committed snapshot → recent stories and updates
+POST /api/posts/:post_id/items/:item_index/updates → serialized publisher → source revision + snapshot
 POST /api/images  → authenticate and validate → R2 image → public image URL
 POST /api/rebuild → durable background job → migrate legacy sources → rebuild the same snapshot
 GET  /           → read published HTML from R2
 ```
 
-New posts rebuild the homepage without a Git commit, deployment, or CI run. New story URLs append to the feed. Repeated source URLs within the seven-day receipt window are skipped; changed wording at the same URL is also skipped.
+New posts rebuild the homepage without a Git commit, deployment, or CI run. New story URLs append to the feed. Exact source URLs on stories retained in the 30-day history are skipped, including URLs attached as updates; changed wording at the same URL is also skipped.
 
 ## Set up Cloudflare
 
@@ -68,7 +70,7 @@ npm run rebuild:status -- preview JOB_UUID
 node scripts/smoke-preview.mjs --verify-edge
 ```
 
-The smoke check uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. It also parses `/rss.xml`, verifies full text/images and discovery links, checks HEAD, and confirms duplicate-only submissions preserve the RSS ETag. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
+The smoke check reads recent stories, appends a source update and retries it, uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. It also parses `/rss.xml`, verifies full text/images and discovery links, checks HEAD, and confirms duplicate-only submissions preserve the RSS ETag. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
 
 ### 4. Connect the domain
 
@@ -235,15 +237,15 @@ Successful publication returns `200` after the source, manifest, and index write
 `index` is the submitted item position; `item_index` is the position in the identified stored batch. An all-duplicate request returns `post: null`, `duplicate: true`, and zero published stories. It performs no writes and does not change the homepage, publication timestamp, or ETag. Mixed batches set `duplicate: false` and store only their new stories.
 
 - Duplicate identity is the exact validated `post_url` string, including query strings and fragments. No URL normalization, tracking-parameter removal, or fuzzy content matching occurs. Batch labels, source labels, wording, and other item fields do not change that identity.
-- Existing stories received today or during the preceding six Los Angeles calendar dates suppress new copies. Receipt dates, not `posted_at`, govern this window; retries never refresh it. Hidden items also count: correcting an out-of-window `posted_at` at the same URL remains a duplicate. Within a request the first new occurrence wins. Historical duplicate copies remain visible. The earliest receipt supplies duplicate references, with ascending post ID and item position breaking ties.
+- Stories retained in the 30-day history suppress new copies of their original and appended URLs. Receipt dates, not `posted_at`, govern this window; retries never refresh it. A genuine appended source extends only its story's retention. Hidden items also count: correcting an out-of-window `posted_at` at the same URL remains a duplicate. Within a request the first new occurrence wins. Historical duplicate copies remain visible. The earliest source receipt supplies duplicate references, with ascending post ID, item position, and update position breaking ties.
 - Publishing and duplicate detection share the serialized queue. The committed manifest governs modern source membership, including eligible repaired `omitted_posts`; orphan source objects do not suppress retries. Eligible legacy sources also participate during migration. A repaired or legacy historical copy wins over an incoming copy. If the request is entirely duplicate, it still makes no writes: its returned historical identity may remain omitted from the homepage until a later publication containing new content.
-- There is no editing, deletion, listing, preflight, individual-post page, or idempotency-key endpoint. `url` always points to `/`; post IDs are private diagnostic identifiers, not public permalinks. See the manual cleanup runbook below for corrections at the same source URL.
-- Omit top-level `date`, `id`, and `received_at`: none is required, and submitted values are ignored. The server assigns a unique ID, UTC ISO `received_at`, and `YYYY-MM-DD` date in `America/Los_Angeles` inside the serialized publisher. For example, receipt at `2026-10-19T01:00:00Z` gives date `2026-10-18`. Item `posted_at` remains the original source timestamp, not the receipt timestamp. Deduplication follows seven Los Angeles calendar dates, including DST boundaries, rather than a rolling 168 hours.
+- There is no editing, deletion, preflight, individual-post page, or idempotency-key endpoint. `url` always points to `/`; post IDs identify targets for authenticated reads and appends, not public permalinks. See the manual cleanup runbook below for corrections at the same source URL.
+- Omit top-level `date`, `id`, and `received_at`: none is required, and submitted values are ignored. The server assigns a unique ID, UTC ISO `received_at`, and `YYYY-MM-DD` date in `America/Los_Angeles` inside the serialized publisher. For example, receipt at `2026-10-19T01:00:00Z` gives date `2026-10-18`. Item `posted_at` remains the original source timestamp, not the receipt timestamp. Deduplication follows 30 Los Angeles calendar dates, including DST boundaries, rather than a rolling 720 hours.
 - `title`, `source`, `group`, and `headline` are required nonempty strings. `body` and `category` may be empty; submitted `items: []` receives a `400` validation error before writes. Historical empty sources remain readable. Categories accept arbitrary strings. Digest titles and receipt times remain private; the homepage displays item headlines.
 - Item timestamps require real calendar dates and an explicit timezone (`Z` or an offset). Source links must be absolute HTTP(S) URLs without credentials.
 - Markdown is rendered with raw HTML disabled and unsafe link protocols blocked. Plain-text fields are escaped. JSON requests are limited to 1 MiB, including streamed requests.
 
-A publish retains sources received today and during the preceding six Los Angeles dates. The homepage combines their items into one feed, showing only items whose original `posted_at` falls within those same seven calendar dates in Los Angeles. Items appear newest first under one heading per populated day; equal timestamps preserve source and submitted item order, and preexisting historical duplicate copies remain visible. Older and future-day items and empty digests create no sections. Source timestamps describe already-published material; this feed does not schedule future posts.
+A publish retains each story for 30 Los Angeles dates after its latest genuine server-received addition. The homepage shows stories whose original post or any update has a source `posted_at` within the published seven-day window. Cards appear newest first under the day of their newest in-window source activity; a future-day source never hides another eligible source. Original timestamps remain visible, and updates appear beneath the original body, oldest source timestamp first, with attribution and source links. Equal activity timestamps preserve source and item order, and historical duplicate copies remain visible. Empty digests create no sections. Source timestamps describe already-published material; this feed does not schedule future posts.
 
 The footer labels the post-date range and last publication time. Feed contents and calendar datelines stay unchanged between publications, even when the covered week is old. There is no scheduled feed refresh. In the browser, post timestamps display relative ages such as “3 hr ago” or “2 days ago”; they update each minute while the page is visible and when returning to the page. Timestamps ahead of the reader’s clock retain future labels such as “in 3 min”. Each age is rendered once for reading and copying, including double-click and drag selection. Full Los Angeles timestamps use native browser tooltips, which screen readers may announce alongside the age; original `datetime` values stay intact. Without JavaScript, absolute timestamps display once. Daily headings and footer dates stay absolute. Template rebuilds retain the exact published selection, date window, and publication timestamp, while applying the current layout.
 
@@ -253,13 +255,85 @@ A 48px circular “Back to top” arrow appears at the lower left as soon as the
 
 At widths up to 600px, 16px side gutters, compact header/article spacing, quiet 13px daily headings, and 20–22px story headlines bring the first story higher on the page. Group links are hidden on mobile while post times and categories remain visible. Body text stays 16px with a 1.6 line height, and full stories, images, captions, and links remain available without expansion. Desktop retains group links. Daily headings have no redundant rule below them. Headline links fill their heading’s width, underline on hover, and show a rectangular outline without an underline on keyboard focus, including when hovered. Body-only thumbnails and footer placement remain in use.
 
-If a historical source is missing, contains malformed JSON, or fails digest validation, a new publication omits that post and logs its ID, R2 key, and a fixed reason. Its reference is retained privately as `omitted_posts` in the manifest and reconsidered on later publications until its original receipt date leaves the seven-day window. Successful responses retain the same format. Storage outages and unexpected failures still fail publication instead of omitting content.
+If a historical source is missing, contains malformed JSON, or fails stored-content validation, a new publication omits that post and logs its ID, R2 key, and a fixed reason. Its reference is retained privately as `omitted_posts` in the manifest and reconsidered on later publications until its latest server receipt leaves the 30-day window. Reads report `omitted_post_ids`; damage to a referenced readable source or the selected append target returns an operator-repair error. Storage outages and unexpected failures still fail publication instead of omitting content.
 
-R2 has no transaction spanning these objects. Index replacement is the commit point, and a failure can leave private source or manifest objects. After a timeout or a response with `retryable: true`, retry the unchanged payload within its original seven-calendar-date receipt window. If the index committed, the repeated URLs resolve to their committed identities; otherwise the retry can publish them. Non-retryable rendering, configuration, or internal failures require repair first. After that window, check the saved response, logs, and publication before retrying because suppression has expired.
+R2 has no transaction spanning these objects. Index replacement is the commit point, and a failure can leave private source or manifest objects. After a timeout or a response with `retryable: true`, retry the unchanged payload within its original 30-calendar-date receipt window. If the index committed, the repeated URLs resolve to their committed identities; otherwise the retry can publish them. Non-retryable rendering, configuration, or internal failures require repair first. After that window, check the saved response, logs, and publication before retrying because suppression has expired.
 
 The Worker uses the versioned `publishV2` Durable Object RPC. During deployment skew, an unavailable method, failed RPC, or invalid reply returns `503 service_unavailable` with `publication_status: "unknown"`; it never falls back to another publish call. The legacy `publish` method retains throw-on-failure behavior for old Workers and the successful reply shape understood by the previous preview Worker.
 
 This intentionally corrects the earlier `500 publish_failed` response for digest publishing RPC failures while retaining `X-API-Version: 2`. All publishing clients are controlled; coordinate their updates before the next production rollout. Clients must handle unfamiliar error codes with a readable fallback and use `retryable` and `publication_status` for retry decisions rather than matching only `publish_failed`. A missing or unusable publisher binding instead returns `503 configuration_error`, `retryable: false`, and `publication_status: "not_attempted"`: publication was never invoked and the configuration needs operator repair. No API-version negotiation or alternate publishing call is provided.
+
+## Read recent stories and append sources
+
+Both endpoints use the same `Authorization: Bearer <API_SECRET>` credential and return `Cache-Control: no-store`. Topic matching belongs to the caller: the server attaches a source only to the explicit story target and never merges stories by wording.
+
+```sh
+[ -n "${API_SECRET:-}" ] && curl --fail-with-body "$SITE_URL/api/posts?days=7" \
+  -H "Authorization: Bearer $API_SECRET"
+```
+
+`GET /api/posts` (also HEAD) defaults to seven Los Angeles calendar dates of server receipt activity; `days` accepts integers from 1 through 30. An appended source makes its story recent even if the original source timestamp is old. Results contain up to 20 matching batches per page. Follow `next_cursor`, keeping the same `days` or omitting it; the signed cursor pins the publication, original read time, and next batch position even while new content publishes. Cursors use a private signing key retained in publisher storage across restarts. Invalid days or cursors return 400 with a readable message and restart suggestion.
+
+```json
+{
+  "ok": true,
+  "request_id": "request-uuid",
+  "days": 7,
+  "as_of": "2026-10-20T18:00:00.000Z",
+  "published_at": "2026-10-20T17:00:00.000Z",
+  "message": "Published stories are ready to review.",
+  "posts": [{
+    "post_id": "post-uuid",
+    "title": "Morning digest",
+    "source": "facebook-groups",
+    "date": "2026-10-19",
+    "received_at": "2026-10-19T18:00:00.000Z",
+    "items": [{
+      "item_index": 2,
+      "group": "RimTraffic",
+      "group_url": "https://facebook.com/groups/rimtraffic/",
+      "headline": "Highway closure",
+      "body": "Original Markdown summary.",
+      "post_url": "https://facebook.com/groups/rimtraffic/permalink/123/",
+      "category": "traffic",
+      "posted_at": "2026-10-19T10:00:00-07:00",
+      "last_received_at": "2026-10-20T17:00:00.000Z",
+      "latest_activity_at": "2026-10-20T07:12:00-07:00",
+      "updates": [{
+        "update_index": 0,
+        "group": "RimTraffic",
+        "post_url": "https://facebook.com/groups/rimtraffic/permalink/456/",
+        "body": "Both lanes have reopened.",
+        "posted_at": "2026-10-20T07:12:00-07:00",
+        "received_at": "2026-10-20T17:00:00.000Z"
+      }]
+    }]
+  }],
+  "omitted_post_ids": [],
+  "next_cursor": null
+}
+```
+
+Each returned story includes its complete original fields and update history. `item_index` is its original zero-based position, so filtered results can have gaps. Updates retain append order and stable `update_index` values in the API; display order uses source timestamps. `latest_activity_at` describes the newest source timestamp, including future timestamps; public feed eligibility still uses the saved seven-day source-date window. Read responses expose no storage keys. An empty history returns an empty `posts` array; an initial unpublished site also has `published_at: null`.
+
+Append one source with `POST /api/posts/{post_id}/items/{item_index}/updates`. Use the IDs returned by reads or digest publishing:
+
+```sh
+[ -n "${API_SECRET:-}" ] && curl --fail-with-body "$SITE_URL/api/posts/POST_ID/items/ITEM_INDEX/updates" \
+  -H "Authorization: Bearer $API_SECRET" \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/story-update.json
+```
+
+Required fields are `post_url`, `group`, and timezone-explicit `posted_at`. Optional `group_url` must be an absolute HTTP(S) URL without credentials; optional `body` defaults to an empty string, creating an attributed source link without a note. Markdown follows the original story's safety rules. Server-assigned receipt fields and incoming digest `updates` are ignored. Appends do not edit the original headline, body, category, or timestamp.
+
+Success returns `200 {"ok":true,"url":"/","request_id":"...","status":"appended","post_id":"...","item_index":2,"update_index":0,"message":"..."}` after the homepage and RSS commit. A repeated exact URL returns `status: "duplicate"`, a readable `message`, and a structured `suggestion` containing `action`, `message`, `method`, and `path`. Its identity points to the existing owner, which can differ from the requested target. `update_index` is present when that owner is an update; otherwise the owner is an original story. Digest duplicate items have the same message/suggestion and optional update index. Changed wording at an existing URL is still a duplicate, and duplicates perform no writes.
+
+Unknown, expired, or absent item targets return `404 story_not_found` with a suggestion to read `/api/posts?days=30` or publish a new digest. Errors include readable `message` and structured `suggestion` alongside the existing `error`, `code`, and diagnostics. Append failures use the same `retryable` and `publication_status` contract as digest publishing. Appending through `appendUpdateV1` never falls back to another write method when RPC transport fails.
+
+Updates write immutable private source revisions. The committed index chooses the exact manifest, source revisions, and RSS; abandoned revision or manifest objects do not affect reads or deduplication. Manifest version 2 retains 30 days of story receipt activity, while version 1 remains readable. History starts from the existing committed selection and fills forward; older raw files are not imported into the history automatically. Expired items can remain in private batch files to preserve positions but do not participate in reads, feed selection, or deduplication. No automatic deletion of private objects is introduced.
+
+Deploy to preview, run `node scripts/smoke-preview.mjs --verify-edge`, and check the queued rebuild's status before production rollout. The smoke check also reads stories, appends an update, retries it, and verifies matching HTML/RSS and unchanged duplicate ETags. Once a version 2 manifest is committed, rollback requires code that understands version 2; older writers reject it. Back up sources and manifests before operator repairs. Do not redeploy an older writer against this bucket.
 
 ## Search, sharing, and browser metadata
 
@@ -285,7 +359,7 @@ These routes support GET, HEAD, and ETag revalidation. Versioned artwork has one
 
 Subscribe at `https://lakearrowhead.town/rss.xml` or use the footer's **RSS feed** link. Pages also advertise one absolute RSS autodiscovery link. Each RSS description includes the complete safe Markdown-rendered story, its images, and linked group/original-post attribution. Relative body links and images resolve against the publication's site origin. RSS text deliberately normalizes CRLF and lone CR line endings to LF; existing LF characters remain unchanged. XML-invalid characters become replacement characters; raw HTML and unsafe Markdown link protocols remain disabled. RSS dates use GMT: item `pubDate` comes from `posted_at`, and `lastBuildDate` comes from the saved publication time. Before first publication, RSS is a valid empty channel without `lastBuildDate`.
 
-RSS and HTML share the exact saved seven-day selection, including equal-time ordering and historical duplicate copies. Each stored item has a stable opaque GUID derived from its private post identity and original item position; rebuilds and new publications retain existing GUIDs. RSS is rendered into a private immutable R2 object before the homepage commit stores its reference alongside the manifest reference. A failed feed write or uncommitted homepage replacement cannot expose a newer RSS snapshot. Duplicate-only submissions make no writes. Later source damage does not alter materialized RSS; omission on a new publication follows the same rules as HTML. Private RSS object keys and source IDs are never public routes or feed fields.
+RSS and HTML share the exact saved seven-day selection, including equal-time ordering and historical duplicate copies. Attached updates appear in each story's RSS description; ordering follows latest eligible activity, while `pubDate` keeps the original source timestamp. Each stored item has a stable opaque GUID derived from its private post identity and original item position; rebuilds, appends, and new publications retain existing GUIDs. RSS is rendered into a private immutable R2 object before the homepage commit stores its reference alongside the manifest reference. A failed feed write or uncommitted homepage replacement cannot expose a newer RSS snapshot. Duplicate-only submissions make no writes. Later source damage does not alter materialized RSS; omission on a new publication follows the same rules as HTML. Private RSS object keys and source IDs are never public routes or feed fields.
 
 GUIDs remain unkeyed deterministic SHA-256 fingerprints, not a confidentiality boundary. Predictable legacy IDs and item positions can be inferred by comparing candidate hashes. No hashing secret or per-item identity migration is required; existing GUIDs remain unchanged.
 

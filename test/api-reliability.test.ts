@@ -71,7 +71,7 @@ describe('source URL duplicate suppression', () => {
     const result = await (await submit(digest)).json<PublishResult>();
     expect(result.counts).toEqual({ submitted: 5, published: 2, duplicates: 3 });
     expect(result.duplicate).toBe(false);
-    expect(result.items).toEqual([
+    expect(result.items).toMatchObject([
       { index: 0, status: 'duplicate', post_id: old.post!.id, item_index: 0 },
       { index: 1, status: 'published', post_id: result.post!.id, item_index: 0 },
       { index: 2, status: 'duplicate', post_id: result.post!.id, item_index: 0 },
@@ -96,8 +96,8 @@ describe('source URL duplicate suppression', () => {
     expect(await snapshot()).toEqual(before);
   });
   it('deduplicates against eligible legacy sources discovered during the same publication', async () => {
-    await submit(input('https://example.com/committed'));
     await bindings.SITE_BUCKET.put('digests/2099-01-01.json', JSON.stringify(input()));
+    await submit(input('https://example.com/committed'));
     const before = await snapshot();
     const duplicate = await (await submit(input())).json<PublishResult>();
     expect(duplicate).toMatchObject({ duplicate: true, items: [{ post_id: 'legacy-2099-01-01', item_index: 0 }] });
@@ -114,9 +114,9 @@ describe('source URL duplicate suppression', () => {
     expect((await bindings.SITE_BUCKET.list({ prefix: 'posts/' })).objects).toHaveLength(1);
   });
   it.each([
-    ['2026-10-18T06:59:59Z', '2026-10-24T06:59:59Z', '2026-10-24T07:00:00Z'],
-    ['2026-03-07T08:00:00Z', '2026-03-14T06:59:59Z', '2026-03-14T07:00:00Z'],
-    ['2026-10-31T07:00:00Z', '2026-11-07T07:59:59Z', '2026-11-07T08:00:00Z'],
+    ['2026-10-18T06:59:59Z', '2026-11-16T07:59:59Z', '2026-11-16T08:00:00Z'],
+    ['2026-03-07T08:00:00Z', '2026-04-06T06:59:59Z', '2026-04-06T07:00:00Z'],
+    ['2026-10-31T07:00:00Z', '2026-11-30T07:59:59Z', '2026-11-30T08:00:00Z'],
   ])('uses original LA receipt dates across midnight and DST: %s', async (firstTime, lastTime, expiredTime) => {
     const digest = input();
     const first = await publishDigest(bindings.SITE_BUCKET, digest, base, new Date(firstTime), true);

@@ -2,8 +2,8 @@ import MarkdownIt, { type Token } from 'markdown-it';
 import template from '../index.html';
 import { escapeHtml } from './html';
 import { renderMetadata } from './metadata';
-import { selectFeedItems, snapshotDates, TIME_ZONE } from './feed';
-import type { DigestItem, Publication, StoredPost } from './types';
+import { orderedUpdates, selectFeedItems, snapshotDates, TIME_ZONE } from './feed';
+import type { DigestItem, Publication, StoredItem, StoredPost } from './types';
 export { escapeHtml } from './html';
 export { recentDates, TIME_ZONE } from './feed';
 
@@ -115,8 +115,13 @@ function renderBody(item: DigestItem): string {
   return image + markdown.renderer.render(removeEmptiedWrappers(tokens, affectedBlocks), markdown.options, env);
 }
 
-function renderItem(item: DigestItem): string {
+function renderTime(value: string): string {
+  return `<time class="post-time" datetime="${escapeHtml(value)}" title="${escapeHtml(fullTimeFormat.format(new Date(value)))}">${escapeHtml(timeFormat.format(new Date(value)))}</time>`;
+}
+
+function renderItem({ item }: { item: StoredItem }): string {
   const postedAt = new Date(item.posted_at);
+  const updates = orderedUpdates(item);
   const exactTime = escapeHtml(fullTimeFormat.format(postedAt));
   const displayTime = escapeHtml(timeFormat.format(postedAt));
   return `<article class="digest-item">
@@ -124,15 +129,24 @@ function renderItem(item: DigestItem): string {
       <time class="post-time" datetime="${escapeHtml(item.posted_at)}" title="${exactTime}">${displayTime}</time>
       ${item.category ? `<span class="category">${escapeHtml(item.category)}</span>` : ''}</div>
     <h3><a class="headline-link" href="${escapeHtml(item.post_url)}" rel="noopener noreferrer">${escapeHtml(item.headline)}</a></h3>
-    <div class="markdown">${renderBody(item)}</div>
+    <div class="markdown">${renderBody(item)}</div>${updates.length ? `
+    <p class="item-meta story-updated">Updated ${renderTime(updates.at(-1)!.posted_at)}</p>
+    <div class="story-updates" aria-label="Story updates">${updates.map(update => `
+      <div class="story-update">
+        <div class="item-meta"><span>${update.body.trim() ? 'Update' : 'Additional source'}</span>${renderTime(update.posted_at)}
+          <span>${update.group_url ? `<a href="${escapeHtml(update.group_url)}" rel="noopener noreferrer">${escapeHtml(update.group)}</a>` : escapeHtml(update.group)} · <a href="${escapeHtml(update.post_url)}" rel="noopener noreferrer">View source post</a></span></div>
+        ${update.body ? `<div class="markdown">${renderBody({ ...item, ...update, group_url: update.group_url ?? '' })}</div>` : ''}
+      </div>`).join('\n')}
+    </div>` : ''}
   </article>`;
 }
 
 function renderFeed(items: ReturnType<typeof selectFeedItems>): string {
-  const days = new Map<string, DigestItem[]>();
-  for (const { item, date } of items) {
+  const days = new Map<string, typeof items>();
+  for (const entry of items) {
+    const { date } = entry;
     if (!days.has(date)) days.set(date, []);
-    days.get(date)!.push(item);
+    days.get(date)!.push(entry);
   }
   return [...days].map(([date, items]) => `<section class="digest" aria-labelledby="day-${date}">
     <header class="digest-header">

@@ -193,7 +193,7 @@ test('documented shell reads treat files as data and gate curl and upload hooks 
   const upload = blocks.find(block => block.startsWith('API_SECRET=') && block.includes('wrangler secret put'));
   const requests = blocks.filter(block => block.startsWith('[ -n "${API_SECRET:-}" ] && curl'));
   assert(setup && upload);
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 4);
   const hooks = 'curl() { printf REQUEST_HOOK; }\nnpx() { cat >/dev/null; printf UPLOAD_HOOK; }\n';
   const value = secret + '$DUMMY;:>INJECTED#`echo`';
   const file = saveCredential('production', value, root);
@@ -204,7 +204,7 @@ test('documented shell reads treat files as data and gate curl and upload hooks 
   assert.equal(loaded.status, 0);
   assert.equal(loaded.stderr, '');
   assert(loaded.stdout.includes(`<VALUE>${value}</VALUE>`));
-  assert.equal(loaded.stdout.match(/REQUEST_HOOK/g).length, 2);
+  assert.equal(loaded.stdout.match(/REQUEST_HOOK/g).length, requests.length);
   assert.equal(loaded.stdout.match(/UPLOAD_HOOK/g).length, 1);
   assert.equal(existsSync(join(root, 'INJECTED')), false);
   assert.equal(existsSync(join(root, 'UNRELATED_EXECUTED')), false);

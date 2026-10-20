@@ -205,7 +205,7 @@ describe('damaged source omission and recovery', () => {
     await publishDigest(bindings.SITE_BUCKET, digest('Day 10', '2026-10-10T20:00:00Z'), base, new Date('2026-10-10T20:00:00Z'), true);
     expect((await currentPublication(bindings.SITE_BUCKET)).omitted_posts).toHaveLength(1);
     await bindings.SITE_BUCKET.put(key, original);
-    await publishDigest(bindings.SITE_BUCKET, digest('Day 16', '2026-10-16T20:00:00Z'), base, new Date('2026-10-16T20:00:00Z'), true);
+    await publishDigest(bindings.SITE_BUCKET, digest('Day 39', '2026-11-08T20:00:00Z'), base, new Date('2026-11-08T20:00:00Z'), true);
     const snapshot = await currentPublication(bindings.SITE_BUCKET);
     expect(snapshot.omitted_posts).toBeUndefined(); expect(snapshot.posts).toHaveLength(2);
     expect(await (await fetch('/')).text()).not.toContain('Expired omitted post');

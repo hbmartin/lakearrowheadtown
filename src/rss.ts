@@ -1,6 +1,6 @@
 import MarkdownIt from 'markdown-it';
 import { fingerprint } from './diagnostics';
-import { selectFeedItems } from './feed';
+import { orderedUpdates, selectFeedItems } from './feed';
 import { escapeHtml } from './html';
 import { SITE } from './site';
 import type { Publication, StoredPost } from './types';
@@ -32,16 +32,17 @@ function xml(text: string): string {
 
 export function renderRss(posts: StoredPost[], options: { origin: string; publication?: Publication }): string {
   const { origin, publication } = options;
-  const items = selectFeedItems(posts, publication).map(({ item, postId, itemIndex, timestamp }) => {
+  const items = selectFeedItems(posts, publication).map(({ item, postId, itemIndex }) => {
     const body = markdown.render(item.body, { origin });
     const attribution = `<p>From <a href="${escapeHtml(item.group_url)}">${escapeHtml(item.group)}</a> · <a href="${escapeHtml(item.post_url)}">View original post</a></p>`;
+    const updates = orderedUpdates(item).map(update => `<section><p><strong>${update.body.trim() ? 'Update' : 'Additional source'}</strong> · ${escapeHtml(update.posted_at)} · ${update.group_url ? `<a href="${escapeHtml(update.group_url)}">${escapeHtml(update.group)}</a>` : escapeHtml(update.group)} · <a href="${escapeHtml(update.post_url)}">View source post</a></p>${markdown.render(update.body, { origin })}</section>`).join('');
     const guid = `urn:sha256:${fingerprint(JSON.stringify([postId, itemIndex]))}`;
     return `    <item>
       <title>${xml(item.headline)}</title>
       <link>${xml(item.post_url)}</link>
       <guid isPermaLink="false">${guid}</guid>
-      <pubDate>${new Date(timestamp).toUTCString()}</pubDate>
-      ${item.category ? `<category>${xml(item.category)}</category>\n      ` : ''}<description>${xml(body + attribution)}</description>
+      <pubDate>${new Date(item.posted_at).toUTCString()}</pubDate>
+      ${item.category ? `<category>${xml(item.category)}</category>\n      ` : ''}<description>${xml(body + attribution + updates)}</description>
     </item>`;
   });
   return `<?xml version="1.0" encoding="UTF-8"?>

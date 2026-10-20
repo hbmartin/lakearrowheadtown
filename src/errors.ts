@@ -1,4 +1,4 @@
-import type { PublicationStatus, PublishFailure, PublishReply } from './types';
+import type { AppendReply, PublicationStatus, PublishFailure, PublishReply } from './types';
 
 export interface ValidationIssue { path: string; code: string; message: string }
 interface ErrorOptions {
@@ -69,14 +69,14 @@ export function asHttpError(error: unknown): HttpError {
   return new HttpError(failure.status, failure.error, {}, failure);
 }
 
-export const UNKNOWN_PUBLICATION = 'Unable to confirm publication; it may have completed. Retry the unchanged payload within the original seven Los Angeles receipt-date deduplication window.';
+export const UNKNOWN_PUBLICATION = 'Unable to confirm publication; it may have completed. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.';
 
 export function publicationFailure(error: unknown, stage: string, publication_status: PublicationStatus): PublishFailure {
   const failure = asHttpError(error);
   const retryable = publication_status === 'unknown' || failure.retryable;
   const message = publication_status === 'unknown' ? UNKNOWN_PUBLICATION
     : publication_status === 'committed' ? 'Publication committed, but subsequent processing failed. Use the request ID to contact the operator.'
-    : retryable ? 'Publication did not commit. Retry the unchanged payload within the original seven Los Angeles receipt-date deduplication window.'
+    : retryable ? 'Publication did not commit. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.'
     : failure.message;
   return { status: failure.status, code: failure.code, error: message, stage, publication_status, retryable };
 }
@@ -108,4 +108,14 @@ export function isPublishReply(value: unknown): value is PublishReply {
   return r.items.every((item: any, index: number) => item && item.index === index && ['published', 'duplicate'].includes(item.status)
     && typeof item.post_id === 'string' && integer(item.item_index))
     && r.items.filter((item: any) => item.status === 'published').length === c.published;
+}
+
+export function isAppendReply(value: unknown): value is AppendReply {
+  if (!value || typeof value !== 'object') return false;
+  const reply = value as Record<string, any>;
+  if (reply.ok === false) return isPublishReply(value);
+  const r = reply.result;
+  return reply.ok === true && !!r && ['appended', 'duplicate'].includes(r.status) && typeof r.post_id === 'string'
+    && Number.isSafeInteger(r.item_index) && r.item_index >= 0 && typeof r.message === 'string'
+    && (r.update_index === undefined ? r.status === 'duplicate' : Number.isSafeInteger(r.update_index) && r.update_index >= 0);
 }

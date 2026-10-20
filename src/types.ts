@@ -16,11 +16,45 @@ export interface Digest {
   items: DigestItem[];
 }
 
+export interface StoryUpdate {
+  post_url: string;
+  group: string;
+  group_url?: string;
+  body: string;
+  posted_at: string;
+}
+
+export interface StoredItem extends DigestItem {
+  updates?: (StoryUpdate & { received_at: string })[];
+}
+
 export interface StoredPost extends Digest {
+  items: StoredItem[];
   id: string;
   date: string;
   received_at: string;
 }
+
+export interface StoryIdentity {
+  post_id: string;
+  item_index: number;
+  update_index?: number;
+}
+
+export interface Suggestion {
+  action: string;
+  message: string;
+  method?: string;
+  path?: string;
+}
+
+export interface AppendResult extends StoryIdentity {
+  status: 'appended' | 'duplicate';
+  message: string;
+  suggestion?: Suggestion;
+}
+
+export type AppendReply = { ok: true; result: AppendResult } | { ok: false; failure: PublishFailure };
 
 export type PublicationStatus = 'not_attempted' | 'not_committed' | 'committed' | 'unknown';
 
@@ -38,7 +72,7 @@ export interface PublishResult {
   post: Pick<StoredPost, 'id' | 'date' | 'received_at'> | null;
   duplicate: boolean;
   counts: { submitted: number; published: number; duplicates: number };
-  items: { index: number; status: 'published' | 'duplicate'; post_id: string; item_index: number }[];
+  items: (StoryIdentity & { index: number; status: 'published' | 'duplicate'; message?: string; suggestion?: Suggestion })[];
 }
 
 export interface PublishFailure {
@@ -57,10 +91,11 @@ export interface PostReference {
   key: string;
   date: string;
   received_at: string;
+  last_received_at?: string;
 }
 
 export interface Publication {
-  version: 1;
+  version: 1 | 2;
   posts: PostReference[];
   omitted_posts?: PostReference[];
   snapshot_date: string | null;

@@ -1,4 +1,4 @@
-import type { Digest, DigestItem } from './types';
+import type { Digest, DigestItem, StoredItem, StoryUpdate } from './types';
 import { boundary, declaredBodyBytes, HttpError, type ValidationIssue } from './errors';
 export { HttpError } from './errors';
 
@@ -6,6 +6,13 @@ export function isDate(value: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || value.startsWith('0000')) return false;
   const parsed = new Date(`${value}T00:00:00Z`);
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+export function isTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))$/.exec(value);
+  return !!match && isDate(match[1]) && Number(match[2]) <= 23 && Number(match[3]) <= 59 && Number(match[4]) <= 59
+    && Number(match[6] ?? 0) <= 23 && Number(match[7] ?? 0) <= 59 && Number.isFinite(Date.parse(value));
 }
 
 export function validateDigest(value: unknown, options: { requireItems?: boolean } = {}): Digest {
@@ -39,8 +46,7 @@ export function validateDigest(value: unknown, options: { requireItems?: boolean
   function timestamp(input: unknown, path: string): string {
     const text = string(input, path);
     if (typeof input !== 'string' || !text.trim()) return text;
-    const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))$/.exec(text);
-    if (!match || !isDate(match[1]) || Number(match[2]) > 23 || Number(match[3]) > 59 || Number(match[4]) > 59 || Number(match[6] ?? 0) > 23 || Number(match[7] ?? 0) > 59 || !Number.isFinite(Date.parse(text))) {
+    if (!isTimestamp(text)) {
       invalid(path, 'invalid_timestamp', 'Expected an ISO timestamp with a real calendar date and explicit timezone.');
     }
     return text;
@@ -68,6 +74,41 @@ export function validateDigest(value: unknown, options: { requireItems?: boolean
   if (issueCount) throw new HttpError(400, 'Digest validation failed', {}, { code: 'validation_failed', details: issues, details_truncated: issueCount > issues.length });
   // Client-supplied date/receipt/identity fields never control server publication.
   return { title, source, items };
+}
+
+export function validateUpdate(value: unknown): StoryUpdate {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new HttpError(400, 'Update validation failed', {}, { code: 'validation_failed', details: [{ path: 'update', code: 'invalid_type', message: 'Expected an object.' }] });
+  }
+  const input = value as Record<string, unknown>;
+  try {
+    const item = validateDigest({ title: 'Update', source: 'update', items: [{
+      ...input, headline: 'Update', category: '', body: input.body === undefined ? '' : input.body,
+      group_url: input.group_url === undefined ? input.post_url : input.group_url,
+    }] }).items[0];
+    return { post_url: item.post_url, group: item.group, posted_at: item.posted_at, body: item.body,
+      ...(input.group_url !== undefined ? { group_url: item.group_url } : {}) };
+  } catch (error) {
+    if (!(error instanceof HttpError)) throw error;
+    throw new HttpError(error.status, 'Update validation failed', {}, { code: error.code, details_truncated: error.details_truncated,
+      details: Array.isArray(error.details) ? error.details.map(issue => ({ ...issue, path: issue.path.replace(/^items\[0\]\./, '') })) : error.details });
+  }
+}
+
+// Incoming digest validation deliberately ignores updates; only stored sources may carry them.
+export function validateStoredItems(value: unknown): StoredItem[] {
+  const digest = validateDigest(value);
+  const inputs = (value as { items: Record<string, unknown>[] }).items;
+  return digest.items.map((item, index) => {
+    const updates = inputs[index].updates;
+    if (updates === undefined) return item;
+    if (!Array.isArray(updates)) throw new HttpError(400, 'Stored updates must be an array');
+    return { ...item, updates: updates.map(value => {
+      const update = validateUpdate(value);
+      if (!isTimestamp(value.received_at)) throw new HttpError(400, 'Stored update receipt timestamp is invalid');
+      return { ...update, received_at: value.received_at };
+    }) };
+  });
 }
 
 export function parseDigestJson(bytes: ArrayBuffer): unknown {

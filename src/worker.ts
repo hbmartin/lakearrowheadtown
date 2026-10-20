@@ -4,11 +4,13 @@ import { hashBytes, IMAGE_CACHE, imageUpload, withImageUploadSlot } from './imag
 import { HTML_CACHE } from './publishing';
 import { renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
+import { isPostsReply } from './posts';
+import { errorSuggestion } from './suggestions';
 import { isIndexable, metadataResource } from './public-metadata';
-import type { Env, OperationContext, PublicationStatus, PublishResult, RebuildJob } from './types';
+import type { AppendReply, Digest, Env, OperationContext, PublicationStatus, PublishReply, PublishResult, RebuildJob, StoryUpdate } from './types';
 import { emit, fingerprint, OperationTrace, safeError } from './diagnostics';
-import { HttpError, parseDigestJson, readLimited, validateDigest } from './validation';
-import { asHttpError, boundary, declaredBodyBytes, isPublishReply, OperationFailure, publicationFailure } from './errors';
+import { HttpError, parseDigestJson, readLimited, validateDigest, validateUpdate } from './validation';
+import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isPublishReply, OperationFailure, publicationFailure } from './errors';
 import notFoundPage from './not-found.html';
 export { DigestPublisher } from './publisher';
 
@@ -121,6 +123,19 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
   let publicationAttempted = false;
   const reply = (value: Record<string, unknown>, status = 200, headers: HeadersInit = {}) => json({ ...value, ...(isApi ? { request_id: context.request_id } : {}) }, status, headers);
   try {
+    if (path === '/api/posts') {
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      if (!['GET', 'HEAD'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD' });
+      const publisher = await publisherFor(env, trace);
+      const received: unknown = await trace.run('posts_read_rpc', () => boundary('rpc', async () => await publisher.readPostsV1(new URL(request.url).searchParams.toString(), context)));
+      if (!isPostsReply(received)) throw new OperationFailure('rpc', new Error('Invalid posts reply'));
+      if (!received.ok) {
+        const f = received.failure;
+        throw new HttpError(f.status, f.error, {}, { code: f.code, retryable: f.retryable, details: { stage: f.stage } });
+      }
+      return reply({ ok: true, ...received.result });
+    }
+    const append = /^\/api\/posts\/([^/]+)\/items\/([^/]+)\/updates$/.exec(path);
     const maintenance = /^\/api\/rebuild(?:\/([a-f0-9-]{36})(\/resume)?)?$/.exec(path);
     if (maintenance) {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
@@ -143,14 +158,14 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (job === 'conflict') throw new HttpError(409, 'Only a failed queue head or a stalled queued/running head without an alarm can resume', {}, { code: 'job_not_resumable' });
       return reply({ ok: true, job }, 202);
     }
-    if (path === '/api/digests' || path === '/api/images') {
+    if (path === '/api/digests' || path === '/api/images' || append) {
       if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       state.bytes_received = 0;
       state.body_complete = false;
       state.declared_body_bytes = declaredBodyBytes(request);
       const origin = await trace.run('configuration', () => originFor(request, env));
-      if (path === '/api/digests') {
+      if (path === '/api/digests' || append) {
         await trace.run('content_type', () => {
           if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json', {}, { details: { expected: 'application/json' } });
         });
@@ -159,25 +174,37 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         state.body_complete = true;
         state.body_sha256 = fingerprint(new Uint8Array(bytes));
         const input = await trace.run('parsing', () => parseDigestJson(bytes));
-        const digest = await trace.run('validation', () => validateDigest(input, { requireItems: true }));
+        const payload = await trace.run('validation', () => {
+          if (append && (!/^(?:0|[1-9][0-9]*)$/.test(append[2]) || !Number.isSafeInteger(Number(append[2])))) throw new HttpError(400, 'item_index must be a nonnegative safe integer.');
+          return append ? validateUpdate(input) : validateDigest(input, { requireItems: true });
+        });
         const publisher = await publisherFor(env, trace);
         publicationAttempted = true;
         state.publication_status = 'unknown';
         const rpc = { transport_outcome: 'error' };
         const result = await trace.run('publisher_rpc', async () => {
-          const received: unknown = await boundary('rpc', async () => await publisher.publishV2(digest, origin, context));
+          const received: unknown = await boundary('rpc', async () => append
+            ? await publisher.appendUpdateV1(append[1], Number(append[2]), payload as StoryUpdate, origin, context)
+            : await publisher.publishV2(payload as Digest, origin, context));
           rpc.transport_outcome = 'ok';
-          if (!isPublishReply(received)) throw new OperationFailure('rpc', new Error('Invalid publisher reply'));
-          if (!received.ok) {
-            const f = received.failure;
+          if (!(append ? isAppendReply(received) : isPublishReply(received))) throw new OperationFailure('rpc', new Error('Invalid publisher reply'));
+          const receivedReply = received as AppendReply | PublishReply;
+          if (!receivedReply.ok) {
+            const f = receivedReply.failure;
             throw new HttpError(f.status, f.error, {}, { code: f.code, details: { stage: f.stage }, retryable: f.retryable, publication_status: f.publication_status });
           }
-          return received.result;
+          return receivedReply.result;
         }, rpc);
-        state.counts = result.counts;
-        state.post_id = result.post?.id;
-        state.publication_status = result.post ? 'committed' : undefined;
-        state.publication_outcome = result.duplicate ? 'duplicate' : 'published';
+        if ('status' in result) {
+          state.post_id = result.post_id;
+          state.publication_status = result.status === 'appended' ? 'committed' : undefined;
+          state.publication_outcome = result.status === 'duplicate' ? 'duplicate' : 'published';
+        } else {
+          state.counts = result.counts;
+          state.post_id = result.post?.id;
+          state.publication_status = result.post ? 'committed' : undefined;
+          state.publication_outcome = result.duplicate ? 'duplicate' : 'published';
+        }
         return reply({ ok: true, url: '/', ...result });
       }
       return await withImageUploadSlot(() => trace.run('upload_slot_held', async () => {
@@ -210,7 +237,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     let failure = asHttpError(error);
     const detailStage = !Array.isArray(failure.details) && typeof failure.details.stage === 'string' ? failure.details.stage : undefined;
     const stage = detailStage ?? trace.failed_stage ?? trace.stage ?? 'request_processing';
-    if (context.operation === 'digest') {
+    if (context.operation === 'digest' || context.operation === 'append') {
       state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
       state.publication_outcome = 'failed';
       if (publicationAttempted) {
@@ -228,14 +255,16 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       'Cloudflare-CDN-Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Robots-Tag': 'noindex',
     } });
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
-    return reply({ ok: false, error: failure.message, code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
-      diagnostics, ...(context.operation === 'digest' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
+    return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
+      diagnostics, ...(context.operation === 'digest' || context.operation === 'append' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
   }
 }
 
 function routeFor(path: string): { route: string; operation: string } {
   if (path === '/api/digests') return { route: path, operation: 'digest' };
   if (path === '/api/images') return { route: path, operation: 'image' };
+  if (path === '/api/posts') return { route: path, operation: 'posts_read' };
+  if (/^\/api\/posts\/[^/]+\/items\/[^/]+\/updates$/.test(path)) return { route: '/api/posts/:id/items/:index/updates', operation: 'append' };
   if (/^\/api\/rebuild(?:\/[a-f0-9-]{36}(?:\/resume)?)?$/.test(path)) return { route: path === '/api/rebuild' ? path : path.endsWith('/resume') ? '/api/rebuild/:id/resume' : '/api/rebuild/:id', operation: 'rebuild' };
   if (path.startsWith('/api/') || path === '/api') return { route: '/api/*', operation: 'read' };
   return { route: path === '/' || path === '/index.html' ? '/' : path.startsWith('/images/') ? '/images/:file' : '/public/*', operation: 'read' };
