@@ -57,21 +57,22 @@ export async function resourceResponse(request: Request, resource: Resource): Pr
 
 async function committedMetadata(bucket: ContentBucket): Promise<{ publishedAt?: string; archives?: string }> {
   const index = await boundary('storage', () => bucket.head('pages/index.html'));
+  const directArchives = index?.customMetadata?.archives;
   const key = index?.customMetadata?.manifest;
-  if (!key) return {};
+  if (!key) return { archives: directArchives };
   const manifest = await boundary('storage', () => bucket.get(key));
-  if (!manifest) return {};
+  if (!manifest) return { archives: directArchives };
   // Transport/storage failures remain errors; malformed or absent metadata simply
   // cannot supply an honest lastmod. Never scan sources or use index upload time.
   const text = await boundary('storage', () => manifest.text());
   let value: unknown;
   try { value = JSON.parse(text); }
-  catch (error) { if (error instanceof SyntaxError) return {}; throw error; }
+  catch (error) { if (error instanceof SyntaxError) return { archives: directArchives }; throw error; }
   const time = value && typeof value === 'object' && 'published_at' in value ? value.published_at : undefined;
   const archives = value && typeof value === 'object' && 'archives' in value && typeof value.archives === 'string' ? value.archives : undefined;
   const date = typeof time === 'string' ? new Date(time) : undefined;
   const publishedAt = typeof time === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(time) && date && Number.isFinite(date.getTime()) && date.toISOString() === time ? time : undefined;
-  return { publishedAt, archives };
+  return { publishedAt, archives: directArchives ?? archives };
 }
 
 export function isIndexable(origin: string, requestOrigin: string): boolean {

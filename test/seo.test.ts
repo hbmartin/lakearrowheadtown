@@ -123,7 +123,7 @@ describe('permanent daily archives', () => {
   });
 
   it('escapes hostile headlines in archive HTML, JSON-LD and PNG rendering', async () => {
-    const title = '</script><script>bad()</script> & "quoted"';
+    const title = '</script><script>bad()</script> & "quoted" \u0008\uFFFE\uFFFF 🌲';
     await publishDigest(bindings.SITE_BUCKET, digest(title), origin, now, true);
     const html = await (await fetch('/2026/10/20/')).text();
     expect(html).not.toContain('<script>bad()');

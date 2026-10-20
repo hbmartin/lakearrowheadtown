@@ -1,6 +1,7 @@
 import MarkdownIt, { type Token } from 'markdown-it';
 import rawTemplate from '../index.html';
 import { withThemeHead } from './theme';
+import { dateLabel } from './dates';
 import { escapeHtml } from './html';
 import { archivePath, type ArchiveDay, type ArchiveReference } from './archives';
 import type { ImageMetadataMap } from './image-metadata';
@@ -14,21 +15,20 @@ export { recentDates, TIME_ZONE } from './feed';
 const template = withThemeHead(rawTemplate);
 
 const markdown = new MarkdownIt({ html: false, linkify: false, typographer: false });
-interface ImageContext extends Record<PropertyKey, unknown> { origin: string; images: ImageMetadataMap; count: number }
+interface ImageContext { origin: string; images: ImageMetadataMap; counter: { value: number } }
 const defaultImage = markdown.renderer.rules.image!;
 markdown.renderer.rules.image = (tokens, index, options, environment, renderer) => {
-  const env = environment as unknown as ImageContext;
+  const env = (environment as { imageContext: ImageContext }).imageContext;
   const token = tokens[index];
   let url = String(token.attrGet('src') ?? '');
   try { url = new URL(url, `${env.origin}/`).href; } catch { /* Markdown retains safe authored text. */ }
   if (markdown.validateLink(url)) token.attrSet('src', url);
   const size = env.images[url];
   if (size) { token.attrSet('width', String(size.width)); token.attrSet('height', String(size.height)); }
-  token.attrSet('loading', env.count++ === 0 ? 'eager' : 'lazy');
+  token.attrSet('loading', env.counter.value++ === 0 ? 'eager' : 'lazy');
   token.attrSet('decoding', 'async');
-  return defaultImage(tokens, index, options, env, renderer);
+  return defaultImage(tokens, index, options, environment, renderer);
 };
-const dayFormat = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 const timeFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
 const fullTimeFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });
 const emptyContent = template.match(/<!-- digests:start -->([\s\S]*?)<!-- digests:end -->/)![1].trim();
@@ -56,7 +56,9 @@ function removeEmptiedWrappers(tokens: Token[], affected: Set<Token>, preserveWh
   return result;
 }
 
-function renderBody(item: DigestItem, env: ImageContext): string {
+function renderBody(item: DigestItem, context: ImageContext): string {
+  // Reference definitions belong to one Markdown document, not the whole feed.
+  const env = { imageContext: context };
   const tokens = markdown.parse(item.body, env);
   let thumbnail: Token | undefined;
   const blocks: Token[] = [];
@@ -139,13 +141,10 @@ function renderTime(value: string): string {
 }
 
 function renderItem({ item }: { item: StoredItem }, context: ImageContext): string {
-  const postedAt = new Date(item.posted_at);
   const updates = orderedUpdates(item);
-  const exactTime = escapeHtml(fullTimeFormat.format(postedAt));
-  const displayTime = escapeHtml(timeFormat.format(postedAt));
   return `<article class="digest-item">
     <div class="item-meta"><a class="item-group" href="${escapeHtml(item.group_url)}" rel="noopener noreferrer">${escapeHtml(item.group)}</a>
-      <time class="post-time" datetime="${escapeHtml(item.posted_at)}" title="${exactTime}">${displayTime}</time>
+      ${renderTime(item.posted_at)}
       ${item.category ? `<span class="category">${escapeHtml(item.category)}</span>` : ''}</div>
     <h3><a class="headline-link" href="${escapeHtml(item.post_url)}" rel="noopener noreferrer">${escapeHtml(item.headline)}</a></h3>
     <div class="markdown">${renderBody(item, context)}</div>${updates.length ? `
@@ -169,7 +168,7 @@ function renderFeed(items: ReturnType<typeof selectFeedItems>, context: ImageCon
   }
   return [...days].map(([date, items]) => `<section class="digest" aria-labelledby="day-${date}">
     <header class="digest-header">
-      <h2 id="day-${date}"><a href="${archivePath(date)}"><time datetime="${date}">${dayFormat.format(new Date(`${date}T12:00:00Z`))}</time></a></h2>
+      <h2 id="day-${date}"><a href="${archivePath(date)}"><time datetime="${date}">${dateLabel(date)}</time></a></h2>
     </header>
     ${items.map(entry => renderItem(entry, context)).join('\n')}
   </section>`).join('\n') || emptyContent;
@@ -179,9 +178,9 @@ export function renderPage(digests: StoredPost[], options: { origin: string; pub
   const snapshot = options.publication;
   const dates = snapshotDates(snapshot);
   const metadata = snapshot?.published_at && dates.length
-    ? `<p class="snapshot-meta">Posts from ${escapeHtml(dayFormat.format(new Date(`${dates[6]}T12:00:00Z`)))} through ${escapeHtml(dayFormat.format(new Date(`${dates[0]}T12:00:00Z`)))}. Last published <time datetime="${escapeHtml(snapshot.published_at)}">${escapeHtml(timeFormat.format(new Date(snapshot.published_at)))}</time>.</p>` : '';
+    ? `<p class="snapshot-meta">Posts from ${escapeHtml(dateLabel(dates[6]))} through ${escapeHtml(dateLabel(dates[0]))}. Last published <time datetime="${escapeHtml(snapshot.published_at)}">${escapeHtml(timeFormat.format(new Date(snapshot.published_at)))}</time>.</p>` : '';
   const items = selectFeedItems(digests, snapshot);
-  const content = renderFeed(items, { origin: options.origin, images: options.images ?? {}, count: 0 });
+  const content = renderFeed(items, { origin: options.origin, images: options.images ?? {}, counter: { value: 0 } });
   return template
     .replace('<!-- page-meta -->', () => renderMetadata(options.origin, items.map(({ item }) => item), snapshot?.published_at))
     .replace('<!-- snapshot-meta -->', () => metadata)
@@ -196,7 +195,7 @@ export function renderContentPage(origin: string, page: PageMetadata, heading: s
 }
 
 export function renderArchivePage(origin: string, day: ArchiveDay, ref: ArchiveReference): string {
-  const label = dayFormat.format(new Date(`${day.date}T12:00:00Z`));
+  const label = dateLabel(day.date);
   const title = `Lake Arrowhead news — ${label}`;
   const headline = day.stories[0]?.item.headline;
   const description = `${label}: ${headline ?? 'Community news and local updates from Lake Arrowhead, California.'}`.slice(0, 200);
@@ -205,5 +204,5 @@ export function renderArchivePage(origin: string, day: ArchiveDay, ref: ArchiveR
       path: archivePath(day.date), title, description, image: ref.image, imageAlt: `${label}: ${headline ?? 'Lake Arrowhead news'}`,
     }))
     .replace('<!-- snapshot-meta -->', () => `<p class="snapshot-meta">News archive for ${escapeHtml(label)}.${ref.modified ? ` Last published <time datetime="${escapeHtml(ref.modified)}">${escapeHtml(timeFormat.format(new Date(ref.modified)))}</time>.` : ''}</p>`)
-    .replace(/<!-- digests:start -->[\s\S]*?<!-- digests:end -->/, () => `<!-- digests:start -->${renderFeed(day.stories, { origin, images: day.images, count: 0 })}<!-- digests:end -->`);
+    .replace(/<!-- digests:start -->[\s\S]*?<!-- digests:end -->/, () => `<!-- digests:start -->${renderFeed(day.stories, { origin, images: day.images, counter: { value: 0 } })}<!-- digests:end -->`);
 }

@@ -31,30 +31,62 @@ export const metadataKey = (hash: string) => `image-metadata/${hash}.json`;
 export const validImageMetadata = (value: ImageMetadata): boolean => !!value && Number.isSafeInteger(value.width) && value.width > 0
   && Number.isSafeInteger(value.height) && value.height > 0 && ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(value.type);
 
-// Only read owned objects from R2. Authored external image URLs are never fetched.
-export async function resolveImages(bucket: ContentBucket, items: StoredItem[], origin: string): Promise<ImageMetadataMap> {
-  const urls = new Set(items.flatMap(item => [item.body, ...(item.updates ?? []).map(update => update.body)].flatMap(body => bodyImages(body, origin))));
-  const result: ImageMetadataMap = {};
-  for (const url of urls) {
-    const parsed = new URL(url);
-    const match = /^\/images\/([a-f0-9]{64})\.(jpg|png|gif|webp)$/.exec(parsed.pathname);
-    if (parsed.origin !== origin || !match) continue;
-    const key = metadataKey(match[1]);
+export type ImageResolver = (items: StoredItem[]) => Promise<ImageMetadataMap>;
+
+// One resolver belongs to one publication, including its archive seed and homepage.
+export function createImageResolver(bucket: ContentBucket, origin: string): ImageResolver {
+  const cache = new Map<string, Promise<ImageMetadata | undefined>>();
+  let active = 0;
+  const waiting: Array<() => void> = [];
+  async function limited<T>(action: () => Promise<T>): Promise<T> {
+    if (active < 2) active++;
+    else await new Promise<void>(resolve => waiting.push(resolve));
+    try { return await action(); }
+    finally {
+      const next = waiting.shift();
+      if (next) next();
+      else active--;
+    }
+  }
+  async function read(path: string, hash: string): Promise<ImageMetadata | undefined> {
+    const key = metadataKey(hash);
     const saved = await boundary('storage', () => bucket.get(key));
     if (saved) {
       let value: ImageMetadata | undefined;
       try { value = JSON.parse(await boundary('storage', () => saved.text())); }
       catch (error) { if (!(error instanceof SyntaxError)) throw error; }
-      if (value && validImageMetadata(value)) { result[url] = value; continue; }
+      if (value && validImageMetadata(value)) return value;
     }
-    const object = await boundary('storage', () => bucket.get(parsed.pathname.slice(1)));
-    if (!object) continue;
+    const object = await boundary('storage', () => bucket.get(path));
+    if (!object) return;
     const bytes = new Uint8Array(await boundary('storage', () => object.arrayBuffer()));
     let value: ImageMetadata;
     try { value = dimensions(bytes); }
-    catch { continue; } // Older signature-only uploads can be malformed; retain their existing rendering.
+    catch { return; } // Malformed legacy uploads keep their existing rendering.
     await boundary('storage', () => bucket.put(key, JSON.stringify(value), { httpMetadata: { contentType: 'application/json' } }));
-    result[url] = value;
+    return value;
   }
-  return result;
+  return async items => {
+    const urls = new Set(items.flatMap(item => [item.body, ...(item.updates ?? []).map(update => update.body)].flatMap(body => bodyImages(body, origin))));
+    const result: ImageMetadataMap = {};
+    const resolved = await Promise.allSettled([...urls].map(async url => {
+      const parsed = new URL(url);
+      const match = /^\/images\/([a-f0-9]{64})\.(jpg|png|gif|webp)$/.exec(parsed.pathname);
+      if (parsed.origin !== origin || !match) return;
+      const path = parsed.pathname.slice(1);
+      let pending = cache.get(path);
+      if (!pending) {
+        pending = limited(() => read(path, match[1]));
+        cache.set(path, pending);
+      }
+      const value = await pending;
+      if (value) result[url] = value;
+    }));
+    for (const value of resolved) if (value.status === 'rejected') throw value.reason;
+    return result;
+  };
 }
+
+// Standalone callers still get a fresh, bounded resolver.
+export const resolveImages = (bucket: ContentBucket, items: StoredItem[], origin: string): Promise<ImageMetadataMap> =>
+  createImageResolver(bucket, origin)(items);

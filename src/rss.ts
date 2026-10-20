@@ -2,6 +2,7 @@ import MarkdownIt from 'markdown-it';
 import { fingerprint } from './diagnostics';
 import { orderedUpdates, selectFeedItems } from './feed';
 import { escapeHtml } from './html';
+import { xmlText as xml } from './xml';
 import { bodyImages, type ImageMetadataMap } from './image-metadata';
 import { ASSETS, SITE } from './site';
 import type { Publication, StoredPost } from './types';
@@ -23,12 +24,6 @@ for (const [rule, attribute] of [['link_open', 'href'], ['image', 'src']] as con
     }
     return render(tokens, index, options, env, renderer);
   };
-}
-
-// XML 1.0 permits tabs/newlines and valid Unicode scalar values, but not lone surrogates.
-function xml(text: string): string {
-  // Normalize explicitly to the LF text that XML consumers receive.
-  return escapeHtml(text.replace(/\r\n?/g, '\n').replace(/[^\u0009\u000a\u0020-\ud7ff\ue000-\ufffd\u{10000}-\u{10ffff}]/gu, '\ufffd'));
 }
 
 export function renderRss(posts: StoredPost[], options: { origin: string; publication?: Publication; images?: ImageMetadataMap }): string {
