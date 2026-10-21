@@ -7,6 +7,8 @@ import { HTML_CACHE } from './publishing';
 import { htmlResponse } from './html-response';
 import { renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
+import { currentAlertViews, isAlertsReply, validateAlertInput } from './alerts';
+import { renderAlertBanner } from './alert-banner';
 import { isPostsReply } from './posts';
 import { isRepairReply, validateRepair, type RepairInput } from './publication-repair';
 import { publicationOperation } from './operations';
@@ -108,6 +110,43 @@ async function publicObject(request: Request, env: Env, key: string, type: 'html
   return new Response(body, { headers });
 }
 
+async function homepageResponse(request: Request, env: Env, context: OperationContext): Promise<Response> {
+  const banner = await currentAlertViews(env.SITE_BUCKET).then(alerts => ({ html: renderAlertBanner(alerts), healthy: true })).catch(error => {
+    emit('alerts_banner_failed', context, { error_code: asHttpError(error).code, ...safeError(error) }, 'error');
+    return { html: '', healthy: false };
+  });
+  // Preserve R2's body-free conditional reads when there is no banner to compose.
+  if (banner.healthy && !banner.html) return publicObject(request, env, 'pages/index.html');
+  // A story-only conditional read can incorrectly return 304 after an alert changes.
+  const baseHeaders = new Headers(request.headers);
+  baseHeaders.delete('if-none-match');
+  const condition = parseIfNoneMatch(request.headers.get('if-none-match'));
+  const preflight = banner.healthy && !!condition && request.method === 'GET';
+  let base = await publicObject(new Request(request, { method: preflight ? 'HEAD' : request.method, headers: baseHeaders }), env, 'pages/index.html');
+  const representationEtag = async (response: Response) => banner.html
+    ? `W/"${await hashBytes(new TextEncoder().encode(`${response.headers.get('etag')}\n${banner.html}`))}"` : response.headers.get('etag')!;
+  let etag = await representationEtag(base);
+  if (preflight && !matchesEtag(condition, etag)) {
+    base = await publicObject(new Request(request, { headers: baseHeaders }), env, 'pages/index.html');
+    etag = await representationEtag(base);
+  }
+  const headers = new Headers(base.headers);
+  if (banner.healthy) headers.set('ETag', etag);
+  else {
+    headers.delete('ETag');
+    for (const name of ['Cache-Control', 'Cloudflare-CDN-Cache-Control', 'CDN-Cache-Control', 'Surrogate-Control']) headers.set(name, 'no-store');
+  }
+  if (banner.healthy && matchesEtag(condition, etag)) {
+    if (base.body) await base.body.cancel();
+    return new Response(null, { status: 304, headers });
+  }
+  if (request.method === 'HEAD' || !banner.html) return new Response(base.body, { headers });
+  // The marker also exists in previously published pages and the empty fallback.
+  return new HTMLRewriter().on('main', {
+    comments(comment) { if (comment.text.trim() === 'digests:start') comment.before(banner.html, { html: true }); },
+  }).transform(new Response(base.body, { headers }));
+}
+
 interface RequestState {
   context: OperationContext;
   trace: OperationTrace;
@@ -131,6 +170,45 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
   let publicationAttempted = false;
   const reply = (value: Record<string, unknown>, status = 200, headers: HeadersInit = {}) => json({ ...value, ...(isApi ? { request_id: context.request_id } : {}) }, status, headers);
   try {
+    const alertRetraction = /^\/api\/alerts\/([^/]+)\/entries\/([^/]+)\/retract$/.exec(path);
+    if (path === '/api/alerts' || alertRetraction) {
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      const reading = !alertRetraction && ['GET', 'HEAD'].includes(request.method);
+      if (!reading && request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: alertRetraction ? 'POST' : 'GET, HEAD, POST' });
+      if (reading) context.operation = 'alerts_read';
+      if (alertRetraction && query.has('dry_run')) throw new HttpError(400, 'dry_run is not supported for retraction.', {}, { code: 'invalid_dry_run' });
+      let payload;
+      if (!reading && !alertRetraction) {
+        if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
+        state.dry_run = query.get('dry_run') === 'true';
+        if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json');
+        state.bytes_received = 0; state.body_complete = false;
+        state.declared_body_bytes = declaredBodyBytes(request);
+        const bytes = await trace.run('body_reading', () => readLimited(request, 1024 * 1024, bytes => { state.bytes_received = bytes; }));
+        state.bytes_received = bytes.byteLength; state.body_complete = true; state.body_sha256 = fingerprint(new Uint8Array(bytes));
+        payload = await trace.run('validation', () => validateAlertInput(parseDigestJson(bytes)));
+      }
+      const publisher = await publisherFor(env, trace);
+      publicationAttempted = !reading && !state.dry_run;
+      if (!reading) state.publication_status = state.dry_run ? 'not_attempted' : 'unknown';
+      const received: unknown = await trace.run('alerts_rpc', () => boundary('rpc', async () => reading
+        ? await publisher.readAlertsV1(query.toString(), context)
+        : alertRetraction ? await publisher.retractAlertEntryV1(alertRetraction[1], alertRetraction[2], fingerprint(env.API_SECRET!), context)
+        : await publisher.submitAlertV1(payload!, fingerprint(env.API_SECRET!), context, state.dry_run)));
+      if (!isAlertsReply(received)) throw new OperationFailure('rpc', new Error('Invalid alerts reply'));
+      if (!received.ok) {
+        const f = received.failure;
+        throw new HttpError(f.status, f.error, {}, { code: f.code, retryable: f.retryable, publication_status: f.publication_status,
+          details: f.details ?? { stage: f.stage }, details_truncated: f.details_truncated });
+      }
+      if (!reading) {
+        if (!('status' in received.result)) throw new OperationFailure('rpc', new Error('Invalid alert mutation reply'));
+        if (state.dry_run && (received.result.dry_run !== true || received.result.committed !== false || !isTimestamp(received.result.checked_at))) throw new OperationFailure('rpc', new Error('Invalid alert preview reply'));
+        state.publication_outcome = state.dry_run ? 'preview' : received.result.status === 'duplicate' ? 'duplicate' : received.result.status === 'already_retracted' ? 'already_retracted' : alertRetraction ? 'retracted' : 'published';
+        state.publication_status = state.dry_run ? 'not_attempted' : ['duplicate', 'already_retracted'].includes(received.result.status) ? undefined : 'committed';
+      }
+      return reply({ ok: true, ...received.result });
+    }
     if (path === '/api/publication/repair') {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       if (!['GET', 'HEAD', 'POST'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD, POST' });
@@ -314,7 +392,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         if (!key || !/^publications\/[a-f0-9-]{36}\.rss\.xml$/.test(key)) throw rssUnavailable();
         return publicObject(request, env, key, 'rss');
       }
-      if (path === '/' || path === '/index.html') return publicObject(request, env, 'pages/index.html');
+      if (path === '/' || path === '/index.html') return homepageResponse(request, env, context);
       if (/^\/assets\/daily\/[a-f0-9]{64}\.png$/.test(path)) return publicObject(request, env, path.slice(1), 'image');
       if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return publicObject(request, env, path.slice(1), 'image');
       throw new HttpError(404, 'Not found');
@@ -324,13 +402,13 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     let failure = asHttpError(error);
     const detailStage = !Array.isArray(failure.details) && typeof failure.details.stage === 'string' ? failure.details.stage : undefined;
     const stage = detailStage ?? trace.failed_stage ?? trace.stage ?? 'request_processing';
-    if (publicationOperation(context.operation) || context.operation === 'publication_repair') {
+    if (publicationOperation(context.operation) || ['alert', 'alert_retract'].includes(context.operation) || context.operation === 'publication_repair') {
       state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
       state.publication_outcome = state.dry_run ? 'preview_failed' : 'failed';
       if (state.dry_run) state.publication_status = 'not_attempted';
-      if (publicationAttempted && publicationOperation(context.operation)) {
+      if (publicationAttempted && (publicationOperation(context.operation) || ['alert', 'alert_retract'].includes(context.operation))) {
         const f = publicationFailure(error, stage, state.publication_status, context.operation);
-        failure = new HttpError(f.status, f.error, failure.headers, { code: f.code, details: failure.details, retryable: f.retryable, publication_status: f.publication_status, retry_at: f.retry_at });
+        failure = new HttpError(f.status, f.error, failure.headers, { code: f.code, details: failure.details, details_truncated: failure.details_truncated, retryable: f.retryable, publication_status: f.publication_status, retry_at: f.retry_at });
       }
     }
     state.error_code = failure.code;
@@ -345,11 +423,13 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     }
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
     return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable, state.dry_run, context.operation, state.publication_status), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
-      diagnostics, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}), ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(publicationOperation(context.operation) || context.operation === 'publication_repair' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
+      diagnostics, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}), ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(publicationOperation(context.operation) || ['alert', 'alert_retract'].includes(context.operation) || context.operation === 'publication_repair' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
   }
 }
 
 function routeFor(path: string): { route: string; operation: string } {
+  if (path === '/api/alerts') return { route: path, operation: 'alert' };
+  if (/^\/api\/alerts\/[^/]+\/entries\/[^/]+\/retract$/.test(path)) return { route: '/api/alerts/:id/entries/:entry/retract', operation: 'alert_retract' };
   if (path === '/api/publication/repair') return { route: path, operation: 'publication_repair' };
   if (path === '/api/digests') return { route: path, operation: 'digest' };
   if (path === '/api/images') return { route: path, operation: 'image' };

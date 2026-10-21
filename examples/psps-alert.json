@@ -1,0 +1,14 @@
+{
+  "client_ref": "power-2026-10-21-psps-watch-01",
+  "phase": "open",
+  "category": "power",
+  "kind": "psps",
+  "area": "San Bernardino Mountains",
+  "headline": "Example PSPS watch",
+  "detail": "Example only: a watch describes a possible shutoff, not a confirmed loss of service. Replace with a verified provider notice.",
+  "power": { "stage": "watch", "customer_count": 500 },
+  "source_event_id": "EXAMPLE-PSPS-456",
+  "source": "sce",
+  "source_url": "https://www.sce.com/outages-safety/outage-center/check-outage-status",
+  "observed_at": "2026-10-21T10:00:00-07:00"
+}

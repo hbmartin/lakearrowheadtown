@@ -4,6 +4,7 @@ import { findBatch, loadHistoryIndex } from './history-index';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { committedSnapshot, requireCommittedManifest, type CommittedSnapshot } from './committed';
 import { asHttpError, boundary, HttpError, publicationFailure } from './errors';
+import { alertRpcFailure, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type AlertsReply } from './alerts';
 import { readPosts, type PostsReply } from './posts';
 import { indexNotFound, publicationHead, validateRepair, validateRepairTargets, type RepairReply } from './publication-repair';
 import { prepareWrites } from './prepared-writes';
@@ -78,6 +79,29 @@ export class DigestPublisher extends DurableObject<Env> {
 
   async publishV2(digest: Digest, origin: string, context?: OperationContext, publisherFingerprint?: string): Promise<PublishReply> {
     return this.mutation('publish', context, (complete, executing, snapshot) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing, { publisherFingerprint, snapshot }));
+  }
+
+  async submitAlertV1(input: AlertInput, owner: string, context?: OperationContext, dryRun = false): Promise<AlertsReply> {
+    context = this.executingContext(context);
+    return this.serialize(async () => {
+      try { return { ok: true, result: await submitAlert(this.env.SITE_BUCKET, input, owner, new Date(), context, dryRun) }; }
+      catch (error) { return alertRpcFailure(error, context); }
+    }, context);
+  }
+
+  async retractAlertEntryV1(alertId: string, entryId: string, owner: string, context?: OperationContext): Promise<AlertsReply> {
+    context = this.executingContext(context);
+    return this.serialize(async () => {
+      try { return { ok: true, result: await retractAlertEntry(this.env.SITE_BUCKET, alertId, entryId, owner, new Date(), context) }; }
+      catch (error) { return alertRpcFailure(error, context); }
+    }, context);
+  }
+
+  async readAlertsV1(query: string, context?: OperationContext): Promise<AlertsReply> {
+    context = this.executingContext(context);
+    try {
+      return { ok: true, result: await readAlerts(this.env.SITE_BUCKET, new URLSearchParams(query), await this.getCursorKey()) };
+    } catch (error) { return alertRpcFailure(error, context); }
   }
 
   async previewDigestV1(digest: Digest, origin: string, context?: OperationContext): Promise<PublishReply> {

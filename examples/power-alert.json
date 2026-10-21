@@ -1,0 +1,16 @@
+{
+  "client_ref": "power-2026-10-21-village-planned-01",
+  "phase": "open",
+  "category": "power",
+  "kind": "planned-outage",
+  "area": "Lake Arrowhead Village",
+  "headline": "Example planned power interruption in the Village",
+  "detail": "Example only: replace the area, times, and provider reference with a verified SCE notice before submitting.",
+  "power": { "stage": "scheduled", "customer_count": 125 },
+  "source_event_id": "EXAMPLE-SCE-123",
+  "source": "sce",
+  "source_url": "https://www.sce.com/outages-safety/outage-center/check-outage-status",
+  "observed_at": "2026-10-21T10:00:00-07:00",
+  "starts_at": "2026-10-22T09:00:00-07:00",
+  "expected_end": "2026-10-22T13:00:00-07:00"
+}

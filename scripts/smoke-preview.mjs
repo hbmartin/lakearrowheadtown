@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { SaxesParser } from 'saxes';
 import { readCredential, validateCredential } from './credentials.mjs';
+import { smokeAlerts } from './smoke-alerts.mjs';
 import { maintenance, maintenanceTarget } from './maintenance.mjs';
 
 export function checkHtmlHeaders(response) {
@@ -267,6 +268,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   new SaxesParser({ xmlns: true }).write(feed).close();
   assert(feed.includes('<ttl>15</ttl>')); assert(feed.includes('<image>')); assert(feed.includes('<dc:creator>'));
   assert(feed.includes('<media:content '));
+  await smokeAlerts(origin, fetch, headers);
   const job = await maintenance('start', 'preview', undefined, { secret, origin, request: fetch });
   (options.log ?? console.log)(`Preview smoke checks passed: ${origin}. Rebuild ${job.id} queued; check its status manually.`);
   return { origin, job, request_ids: requestIds, worker_version: workerVersion };

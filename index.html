@@ -8,6 +8,22 @@
   <style>
     .resource-nav { display: flex; flex-wrap: wrap; gap: .5rem 1.25rem; margin: 0 0 1.5rem; font-size: .875rem; }
     .resource-nav a, .digest-header a { color: inherit; }
+    .alerts-banner { margin-bottom: 2rem; border: 1px solid var(--muted); border-radius: .65rem; overflow: hidden; background: var(--page-bg); }
+    .alert-group + .alert-group { border-top: 1px solid var(--muted); }
+    .alert-group > h2 { padding: .65rem 1rem; color: var(--primary); font: 600 .875rem var(--body-font); letter-spacing: .04em; text-transform: uppercase; }
+    .alert-row { border-top: 1px solid color-mix(in srgb, var(--muted) 25%, transparent); }
+    .alert-row > summary { padding: .65rem 1rem; cursor: pointer; }
+    .alert-summary { display: inline; }
+    .alert-location { font-weight: 600; margin-right: .65rem; }
+    .alert-headline { overflow-wrap: anywhere; }
+    .alert-status { display: block; margin-top: .15rem; color: var(--muted); font-size: .8125rem; }
+    .alert-details { padding: .25rem 1rem 1rem; font-size: .9375rem; }
+    .alert-details .markdown > :first-child { margin-top: 0; }
+    .alert-facts { display: grid; gap: .4rem; margin-top: .75rem; }
+    .alert-facts > div { display: flex; flex-wrap: wrap; gap: .15rem .65rem; }
+    .alert-facts dt { color: var(--muted); }
+    .alert-facts dd { overflow-wrap: anywhere; }
+    .alert-source { margin-top: .75rem; }
     .resource-page { max-width: 48rem; }
     .resource-page h2 { margin-bottom: 1rem; }
     .resource-page p, .resource-page ul { margin: 1rem 0; }
