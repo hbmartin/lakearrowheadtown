@@ -459,10 +459,10 @@ describe('execution failure versus failure-state persistence', () => {
     expect(JSON.stringify(events)).not.toMatch(/private start failure|private record failure/);
   });
 
-  it.each(['rebuild_start', 'source_loading', 'rebuild_finalize'] as const)('logs both failures and recovers after %s plus failed state persistence', async stage => {
+  it.each(['rebuild_start', 'publication_loading', 'rebuild_finalize'] as const)('logs both failures and recovers after %s plus failed state persistence', async stage => {
     await seed('queued', [id], true);
     const manifest = 'publications/private-damaged.json';
-    if (stage === 'source_loading') {
+    if (stage === 'publication_loading') {
       await bindings.SITE_BUCKET.put(manifest, 'private malformed manifest');
       await bindings.SITE_BUCKET.put('pages/index.html', 'old homepage', { customMetadata: { manifest } });
     }
@@ -482,7 +482,7 @@ describe('execution failure versus failure-state persistence', () => {
     try { await expect(runDurableObjectAlarm(publisher())).rejects.toMatchObject({ kind: 'storage' }); }
     finally { restore(); }
     const certainty = stage === 'rebuild_finalize' ? 'committed' : 'not_committed';
-    const originalCode = stage === 'source_loading' ? 'manifest_damaged' : 'storage_error';
+    const originalCode = stage === 'publication_loading' ? 'manifest_damaged' : 'storage_error';
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_failed', job_id: id, request_id: context.request_id, stage, error_code: originalCode, publication_status: certainty }));
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_failure_record_failed', job_id: id, request_id: context.request_id,
       worker_version: expect.any(String), environment: expect.any(String), stage: 'rebuild_failure_record', error_code: 'storage_error', failure_kind: 'storage',
@@ -492,7 +492,7 @@ describe('execution failure versus failure-state persistence', () => {
     expect(await publisher().jobStatus(id)).toMatchObject({ status: stage === 'rebuild_start' ? 'queued' : 'running' });
     expect(await runDurableObjectAlarm(publisher())).toBe(false);
     expect(JSON.stringify(events)).not.toMatch(/private transaction error|private start error|private malformed manifest/);
-    if (stage === 'source_loading') {
+    if (stage === 'publication_loading') {
       // Explicitly simulate platform redelivery: the helper does not schedule retries.
       await inPublisher(publisher(), async (_instance, state) => { await state.storage.setAlarm(Date.now() + 1000); });
       await runDurableObjectAlarm(publisher());

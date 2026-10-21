@@ -2,7 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { appendUpdate, currentPublication, initialMigration, migrateBatch, PublicationError, publishDigest, rebuildHomepage, retractPost } from './publishing';
 import { findBatch, loadHistoryIndex } from './history-index';
 import { emit, OperationTrace, safeError } from './diagnostics';
-import { committedSnapshot, legacyRecoveryRequired, type CommittedSnapshot } from './committed';
+import { committedSnapshot, requireCommittedManifest, type CommittedSnapshot } from './committed';
 import { asHttpError, boundary, publicationFailure } from './errors';
 import { readPosts, type PostsReply } from './posts';
 import type { AppendReply, BatchReply, Digest, Env, Migration, OperationContext, PublishFailure, PublishReply, RebuildJob, RetractReply, StoryUpdate } from './types';
@@ -56,11 +56,11 @@ export class DigestPublisher extends DurableObject<Env> {
         // completion establishes that losing its manifest requires operator repair.
         if (migration?.complete) {
           try {
-            await new OperationTrace(context).run('source_loading', async () => {
+            await new OperationTrace(context).run('committed_snapshot_loading', async () => {
               snapshot = await committedSnapshot(this.env.SITE_BUCKET);
-              if (!snapshot.index?.customMetadata?.manifest) throw legacyRecoveryRequired();
+              requireCommittedManifest(snapshot);
             });
-          } catch (error) { throw new PublicationError('not_committed', 'source_loading', error); }
+          } catch (error) { throw new PublicationError('not_committed', 'committed_snapshot_loading', error); }
         }
         return { ok: true, result: await action(migration?.complete, context, snapshot) };
       } catch (error) {
@@ -248,10 +248,10 @@ export class DigestPublisher extends DurableObject<Env> {
         // Capture any legacy bootstrap selection before confirming migration
         // completion; later operations must not discover raw sources again.
         let bootstrap = false;
-        const previous = migration.complete ? await trace.run('source_loading', async () => {
+        const baseline = migration.complete ? await trace.run('publication_loading', async () => {
           const snapshot = await committedSnapshot(this.env.SITE_BUCKET);
           bootstrap = !snapshot.index?.customMetadata?.manifest;
-          return currentPublication(this.env.SITE_BUCKET, migrationBefore.complete ? async () => [] : undefined, snapshot, migrationBefore.complete);
+          return { snapshot, publication: await currentPublication(this.env.SITE_BUCKET, migrationBefore.complete ? async () => [] : undefined, snapshot, migrationBefore.complete) };
         }) : undefined;
         job.processed = migration.processed;
         job.phase = migration.complete ? 'render' : 'migration';
@@ -264,15 +264,22 @@ export class DigestPublisher extends DurableObject<Env> {
         })));
         if (!migration.complete) return;
         const checkpoint = await trace.run('rebuild_archive_state', () => boundary('storage', () => this.ctx.storage.get<string>(`rebuild:${job.id}`)));
-        const rebuilt = await rebuildHomepage(this.env.SITE_BUCKET, job.origin, trace, migration.complete, previous, { jobId: job.id, checkpoint });
-        if ('progress' in rebuilt) job.archive_progress = rebuilt.progress;
-        if (!rebuilt.complete) {
-          await trace.run('rebuild_archive_progress', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
-            if ('checkpoint' in rebuilt) await storage.put(`rebuild:${job.id}`, rebuilt.checkpoint);
-            await storage.put(`job:${job.id}`, job);
-            await storage.setAlarm(Date.now() + 1000);
-          })));
-          return;
+        const rebuilt = await rebuildHomepage(this.env.SITE_BUCKET, job.origin, trace, migration.complete, baseline, { jobId: job.id, checkpoint });
+        if (rebuilt.progress) job.archive_progress = rebuilt.progress;
+        switch (rebuilt.kind) {
+          case 'pending':
+          case 'reconcile':
+            await trace.run('rebuild_archive_progress', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
+              if (rebuilt.kind === 'pending') await storage.put(`rebuild:${job.id}`, rebuilt.checkpoint);
+              await storage.put(`job:${job.id}`, job);
+              await storage.setAlarm(Date.now() + 1000);
+            })));
+            return;
+          case 'committed': break;
+          default: {
+            const unexpected: never = rebuilt;
+            throw new Error(`Unexpected rebuild result: ${unexpected}`);
+          }
         }
         job.status = 'completed';
         job.finished_at = new Date().toISOString();

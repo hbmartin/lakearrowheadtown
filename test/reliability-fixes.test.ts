@@ -7,6 +7,7 @@ import { loadCatalog, loadArchiveDay, stableJson, type ArchiveCatalog, type Arch
 import { fingerprint, OperationTrace } from '../src/diagnostics';
 import { prepareWrites } from '../src/prepared-writes';
 import * as social from '../src/social';
+import * as rendering from '../src/render';
 import type { ContentBucket, Digest, Env, PublishResult } from '../src/types';
 
 const bindings = env as unknown as Env;
@@ -204,6 +205,52 @@ describe('safe requests and repair contracts', () => {
 });
 
 describe('bounded resumable archive rebuilds', () => {
+  it('returns explicit pending and committed results and writes aggregate checkpoints only for pending work', async () => {
+    await seedArchives(12);
+    const work = { jobId: crypto.randomUUID() };
+    const pending = await rebuildHomepage(bindings.SITE_BUCKET, origin, undefined, true, undefined, work);
+    expect(pending).toMatchObject({ kind: 'pending', progress: { completed_days: 10, total_days: 13 } });
+    if (pending.kind !== 'pending') throw new Error('Expected pending archive work');
+    expect(await bindings.SITE_BUCKET.head(pending.checkpoint)).not.toBeNull();
+    const committed = await rebuildHomepage(bindings.SITE_BUCKET, origin, undefined, true, undefined, { ...work, checkpoint: pending.checkpoint });
+    expect(committed).toEqual({ kind: 'committed', progress: { completed_days: 13, total_days: 13 } });
+    expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${work.jobId}/checkpoints/` })).objects).toHaveLength(1);
+  });
+
+  it('ties the final index check to the alarm snapshot even if the index changes before helper entry', async () => {
+    await publishDigest(bindings.SITE_BUCKET, digest('Older'), origin, at, true);
+    const older = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
+    const olderHtml = await older.text();
+    await publishDigest(bindings.SITE_BUCKET, digest('Newer'), origin, new Date(at.getTime() + 3600000), true);
+    const newer = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
+    const newerHtml = await newer.text();
+    await bindings.SITE_BUCKET.put('pages/index.html', olderHtml, { customMetadata: older.customMetadata });
+    await inPublisher(publisher(), async (_instance, state) => state.storage.put('migration', { complete: true, processed: 2 }));
+    const job = await publisher().enqueueRebuild(origin, context);
+    let restore!: () => void;
+    await inPublisher(publisher(), async instance => {
+      const bucket = instance.env.SITE_BUCKET; const head = bucket.head.bind(bucket);
+      let changed = false;
+      const spy = vi.spyOn(bucket, 'head').mockImplementation(async (key: any) => {
+        const result = await head(key);
+        if (key === 'pages/index.html' && !changed) {
+          changed = true;
+          await bucket.put(key, newerHtml, { customMetadata: newer.customMetadata });
+        }
+        return result;
+      });
+      restore = () => spy.mockRestore();
+    });
+    try { await runDurableObjectAlarm(publisher()); } finally { restore(); }
+    expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.customMetadata).toEqual(newer.customMetadata);
+    expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'running', phase: 'render', archive_progress: { completed_days: 1, total_days: 1 } });
+    expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${job.id}/checkpoints/` })).objects).toEqual([]);
+    expect(await finish(job.id)).toMatchObject({ status: 'completed' });
+    const html = await (await bindings.SITE_BUCKET.get('pages/index.html'))!.text();
+    expect(html).toContain('Newer'); expect(html).toContain('Older');
+    expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${job.id}/checkpoints/` })).objects).toEqual([]);
+  });
+
   it('renders one day at a time and persists its image, JSON, and receipt before starting the next day', async () => {
     await seedArchives(12, true);
     const order: string[] = []; let active = 0; let peak = 0;
@@ -255,7 +302,7 @@ describe('bounded resumable archive rebuilds', () => {
         writeHttpMetadata: headers => object!.writeHttpMetadata(headers) };
       return object;
     } }), origin, new OperationTrace(context), true, undefined, { jobId: crypto.randomUUID() });
-    expect(result.complete).toBe(false);
+    expect(result).toMatchObject({ kind: 'reconcile', progress: { completed_days: 1, total_days: 1 } });
     expect(put.mock.calls.some(([key]) => key === 'pages/index.html')).toBe(false);
     expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.customMetadata).toEqual(original.customMetadata);
   });
@@ -269,6 +316,7 @@ describe('bounded resumable archive rebuilds', () => {
     await runDurableObjectAlarm(publisher());
     expect(render).toHaveBeenCalledTimes(10);
     expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'running', archive_progress: { completed_days: 10, total_days: 24 } });
+    expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${job.id}/checkpoints/` })).objects).toHaveLength(1);
     expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.etag).toBe(before);
     await evictDurableObject(publisher());
     const newer = await request('/api/digests', digest('Newer'));
@@ -283,6 +331,7 @@ describe('bounded resumable archive rebuilds', () => {
     expect(render).toHaveBeenCalledTimes(rendersBeforeNextAlarm + 10);
     expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.etag).toBe(latest);
     expect(await finish(job.id)).toMatchObject({ status: 'completed', archive_progress: { completed_days: 24, total_days: 24 } });
+    expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${job.id}/checkpoints/` })).objects).toHaveLength(2);
     expect(render).toHaveBeenCalledTimes(rendersBeforeNextAlarm + 13);
     const html = await (await request('/')).text();
     expect(html).toContain('Newer'); expect(html).not.toContain('>Original</a>'); expect(html).toContain(update.body);
@@ -326,6 +375,62 @@ describe('bounded resumable archive rebuilds', () => {
     expect((await loadArchiveDay(bindings.SITE_BUCKET, '2026-08-01', final.days['2026-08-01'])).stories[0].item.headline).toBe('Corrected historical headline');
     expect(render.mock.calls.filter(([date]) => date === '2026-08-01')).toHaveLength(2);
     expect(render.mock.calls.filter(([date]) => date === '2026-08-03')).toHaveLength(1);
+  });
+
+  it('reloads same-key source corrections between archive alarms', async () => {
+    const original = await seedArchives(12);
+    const job = await publisher().enqueueRebuild(origin);
+    await runDurableObjectAlarm(publisher());
+    const publication = await currentPublication(bindings.SITE_BUCKET);
+    const ref = publication.posts.find(post => post.id === original.post!.id)!;
+    const post = await loadPost(bindings.SITE_BUCKET, ref);
+    post.items[0].body = 'Corrected body between alarms'; post.items[0].headline = 'Corrected headline';
+    await bindings.SITE_BUCKET.put(ref.key, JSON.stringify(post));
+    expect(await finish(job.id)).toMatchObject({ status: 'completed' });
+    const html = await (await bindings.SITE_BUCKET.get('pages/index.html'))!.text();
+    expect(html).toContain(post.items[0].body); expect(html).toContain(post.items[0].headline);
+    const value = await catalog();
+    expect((await loadArchiveDay(bindings.SITE_BUCKET, '2026-10-20', value.days['2026-10-20'])).stories[0].item.body).toBe(post.items[0].body);
+  });
+
+  it.each(['rendering', 'rebuild_finalize'] as const)('reuses completed day receipts after %s fails on the terminal alarm', async stage => {
+    await seedArchives(12);
+    const render = vi.spyOn(social, 'dailyCard').mockImplementation(async (date, headline) => new TextEncoder().encode(date + headline));
+    const job = await publisher().enqueueRebuild(origin, context);
+    await runDurableObjectAlarm(publisher());
+    const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!.customMetadata;
+    let injected = false; let restore!: () => void;
+    if (stage === 'rendering') {
+      const spy = vi.spyOn(rendering, 'renderPage').mockImplementationOnce(() => { injected = true; throw new Error('Injected final rendering failure'); });
+      restore = () => spy.mockRestore();
+    } else {
+      await inPublisher(publisher(), async (_instance, state) => {
+        const transaction = state.storage.transaction.bind(state.storage);
+        const spy = vi.spyOn(state.storage, 'transaction').mockImplementation(callback => transaction(storage => callback(new Proxy(storage, {
+          get(target, property) {
+            if (property === 'delete') return (key: string) => {
+              if (key === `rebuild:${job.id}` && !injected) { injected = true; throw new Error('Injected finalization failure'); }
+              return target.delete(key);
+            };
+            const value = Reflect.get(target, property);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        }))));
+        restore = () => spy.mockRestore();
+      });
+    }
+    try { await runDurableObjectAlarm(publisher()); } finally { restore(); }
+    expect(injected).toBe(true);
+    expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'failed', failed_stage: stage });
+    expect(render).toHaveBeenCalledTimes(12);
+    const after = (await bindings.SITE_BUCKET.head('pages/index.html'))!.customMetadata;
+    if (stage === 'rendering') expect(after).toEqual(before);
+    else expect(after!.manifest).not.toBe(before!.manifest);
+    expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${job.id}/checkpoints/` })).objects).toHaveLength(1);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_failed', stage, publication_status: stage === 'rendering' ? 'not_committed' : 'committed' }));
+    await publisher().resumeRebuild(job.id); await evictDurableObject(publisher());
+    expect(await finish(job.id)).toMatchObject({ status: 'completed' });
+    expect(render).toHaveBeenCalledTimes(12);
   });
 
   it.each(['archive_image_write', 'rebuild_archive_checkpoint'])('retains completed repair work after failure at %s', async stage => {
@@ -427,18 +532,23 @@ describe('publication I/O', () => {
       }));
     });
     const update = { group: 'Group', body: 'Surviving update', post_url: `${origin}/rpc-update`, posted_at: at.toISOString() };
+    const rpcContext = { ...context, request_id: `rpc-${operation}`, operation };
     try {
       const reply = await ({
-        publish: () => stub.publishV2({ ...digest('Next'), client_ref: 'rpc-next' }, origin),
-        append: () => stub.appendUpdateV1(first.post!.id, 0, update, origin),
-        retract: () => stub.retractPostV1(first.post!.id, owner, origin),
-        preview_digest: () => stub.previewDigestV1({ ...digest('Next'), client_ref: 'rpc-next' }, origin),
-        preview_append: () => stub.previewAppendV1(first.post!.id, 0, update, origin),
+        publish: () => stub.publishV2({ ...digest('Next'), client_ref: 'rpc-next' }, origin, rpcContext),
+        append: () => stub.appendUpdateV1(first.post!.id, 0, update, origin, rpcContext),
+        retract: () => stub.retractPostV1(first.post!.id, owner, origin, rpcContext),
+        preview_digest: () => stub.previewDigestV1({ ...digest('Next'), client_ref: 'rpc-next' }, origin, rpcContext),
+        preview_append: () => stub.previewAppendV1(first.post!.id, 0, update, origin, rpcContext),
       })[operation]();
       expect(reply.ok).toBe(true);
       expect(heads.get('pages/index.html')).toBe(1);
       expect([...reads.keys()].some(key => key.startsWith('publications/'))).toBe(true);
       for (const [key, count] of reads) if (/^(publications|posts|post-revisions|history-index)\//.test(key)) expect(count, key).toBe(1);
+      const stages = events.filter(event => event.event === 'operation_stage' && event.request_id === rpcContext.request_id);
+      expect(stages.filter(event => event.stage === 'committed_snapshot_loading')).toHaveLength(1);
+      expect(stages.filter(event => event.stage === 'source_loading')).toHaveLength(1);
+      expect(stages.filter(event => event.stage === 'publication_loading')).toHaveLength(operation === 'retract' ? 1 : 0);
     } finally { for (const spy of spies) spy.mockRestore(); }
   });
 

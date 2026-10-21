@@ -2,7 +2,7 @@ import { boundary } from './errors';
 import { archiveUnavailable, validArchiveKey } from './committed';
 import { latestActivity, localDate, selectFeedItems, snapshotDates } from './feed';
 import { hashBytes, IMAGE_CACHE } from './images';
-import { createImageResolver, validImageMetadata, type ImageMetadataMap, type ImageResolver } from './image-metadata';
+import { createImageResolutionCache, createImageResolver, validImageMetadata, type ImageMetadataMap, type ImageResolver, type ImageResolutionCache } from './image-metadata';
 import { dailyCard, DAILY_CARD_VERSION } from './social';
 import { isDate, isTimestamp, validateStoredDigest } from './validation';
 import type { ContentBucket, Publication, StoredPost } from './types';
@@ -115,9 +115,9 @@ async function prepareDay(bucket: ContentBucket, date: string, ref: ArchiveRefer
   const images = plan.affected.has(date) ? await trace.run('archive_images', () => resolve(ordered.map(story => story.item))) : {};
   const day: ArchiveDay = { date, stories: ordered, images: { ...old?.images, ...images } };
   const body = stableJson(day);
-  const key = `archive-days/${await hashBytes(new TextEncoder().encode(body))}.json`;
+  const key = `archive-days/${fingerprint(body)}.json`;
   const headline = ordered[0].item.headline;
-  const cardInputHash = await hashBytes(new TextEncoder().encode(stableJson([date, headline, DAILY_CARD_VERSION])));
+  const cardInputHash = fingerprint(stableJson([date, headline, DAILY_CARD_VERSION]));
   const reusable = ref?.cardVersion === DAILY_CARD_VERSION
     && await trace.run('archive_card_loading', () => cards.matches(ref.image, cardInputHash));
   if (key === ref?.key && reusable) return ref;
@@ -138,7 +138,7 @@ async function prepareDay(bucket: ContentBucket, date: string, ref: ArchiveRefer
 
 async function saveCatalog(bucket: ContentBucket, catalog: ArchiveCatalog, previous: string | undefined, trace: OperationTrace, phase?: 'commit'): Promise<string> {
   const body = stableJson(catalog);
-  const key = `archive-catalogs/${await hashBytes(new TextEncoder().encode(body))}.json`;
+  const key = `archive-catalogs/${fingerprint(body)}.json`;
   if (key !== previous) await trace.run('archive_catalog_write', () => boundary('storage', () => bucket.put(key, body, { httpMetadata: { contentType: 'application/json' } })), phase ? { phase } : {});
   return key;
 }
@@ -159,6 +159,9 @@ export async function prepareArchives(bucket: ContentBucket, posts: StoredPost[]
 }
 
 export const REBUILD_ARCHIVE_BATCH = 10;
+export interface ArchiveProgress { completed_days: number; total_days: number }
+type ArchiveRebuildResult = { kind: 'pending'; checkpoint: string; progress: ArchiveProgress }
+  | { kind: 'prepared'; archives: string; progress: ArchiveProgress };
 interface DayResult { input: string; reference: ArchiveReference | null }
 interface ArchiveWork { version: 1; days: Record<string, DayResult> }
 const validResult = (value: unknown): value is DayResult => record(value) && typeof value.input === 'string'
@@ -174,7 +177,7 @@ async function cachedJson(bucket: ContentBucket, key: string): Promise<unknown> 
 // Checkpoints contain references only, never image bytes. A per-day receipt also
 // survives failure between artifact persistence and the Durable Object checkpoint.
 export async function rebuildArchives(bucket: ContentBucket, posts: StoredPost[], publication: Publication, origin: string,
-  trace: OperationTrace, jobId: string, checkpoint?: string) {
+  trace: OperationTrace, jobId: string, checkpoint?: string, imageCache: ImageResolutionCache = createImageResolutionCache()): Promise<ArchiveRebuildResult> {
   const saved = checkpoint && checkpoint.startsWith(`rebuild-work/${jobId}/checkpoints/`)
     ? await trace.run('rebuild_archive_loading', () => cachedJson(bucket, checkpoint)) : undefined;
   const work: ArchiveWork = record(saved) && saved.version === 1 && record(saved.days)
@@ -197,7 +200,7 @@ export async function rebuildArchives(bucket: ContentBucket, posts: StoredPost[]
         const prepared = prepareWrites(bucket, trace);
         try {
           const reference = await prepareDay(prepared.bucket, date, base.days[date], plan, publication, trace,
-            createImageResolver(prepared.bucket, origin), createCardCache(prepared.bucket));
+            createImageResolver(prepared.bucket, origin, imageCache), createCardCache(prepared.bucket));
           await prepared.commit();
           result = { input, reference: reference ?? null };
         } finally { prepared.close(); }
@@ -209,9 +212,11 @@ export async function rebuildArchives(bucket: ContentBucket, posts: StoredPost[]
     else delete catalog.days[date];
   }
   const progress = { completed_days: Object.keys(next.days).length, total_days: plan.dates.length };
+  if (progress.completed_days === progress.total_days) {
+    return { kind: 'prepared', progress, archives: await saveCatalog(bucket, catalog, publication.archives, trace, 'commit') };
+  }
   const body = stableJson(next);
   const key = `rebuild-work/${jobId}/checkpoints/${fingerprint(body)}.json`;
   if (key !== checkpoint) await trace.run('rebuild_archive_checkpoint', () => boundary('storage', () => bucket.put(key, body, { httpMetadata: { contentType: 'application/json' } })), { phase: 'commit' });
-  const complete = progress.completed_days === progress.total_days;
-  return { complete, checkpoint: key, progress, archives: complete ? await saveCatalog(bucket, catalog, publication.archives, trace, 'commit') : undefined };
+  return { kind: 'pending', checkpoint: key, progress };
 }

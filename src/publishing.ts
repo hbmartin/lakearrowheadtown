@@ -1,7 +1,7 @@
-import { createCardCache, prepareArchives, rebuildArchives, stableJson } from './archives';
-import { committedSnapshot, isLegacyId, legacyRecoveryRequired, type CommittedSnapshot } from './committed';
+import { createCardCache, prepareArchives, rebuildArchives, stableJson, type ArchiveProgress } from './archives';
+import { committedSnapshot, isLegacyId, requireCommittedManifest, type CommittedSnapshot } from './committed';
 export { loadPublication } from './committed';
-import { createImageResolver } from './image-metadata';
+import { createImageResolutionCache, createImageResolver, type ImageResolutionCache } from './image-metadata';
 import { recentDates, renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
 import { HttpError, isDate, validateStoredDigest } from './validation';
@@ -66,7 +66,7 @@ export async function currentPublication(bucket: ContentBucket, discover = () =>
   const snapshot = pinned ?? await committedSnapshot(bucket);
   const publication = await snapshot.publication();
   if (publication) return publication;
-  if (requireManifest) throw legacyRecoveryRequired();
+  if (requireManifest) requireCommittedManifest(snapshot);
   // Bootstrap old deployments using server storage times, never client dates.
   const legacy = await discover();
   const anchor = snapshot.index?.uploaded ?? (legacy.length ? new Date([...legacy].sort(order)[0].received_at) : null);
@@ -85,14 +85,14 @@ function legacyReceipts(previous: Publication, additional: PostReference[] = [])
 }
 
 async function prepareHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, previous: Publication,
-  trace = new OperationTrace(), options: { migrationComplete?: boolean; allCards?: boolean; now?: Date; history?: HistoryIndex; sources?: Map<string, StoredPost>; archives?: string } = {}): Promise<void> {
+  trace = new OperationTrace(), options: { migrationComplete?: boolean; allCards?: boolean; now?: Date; history?: HistoryIndex; sources?: Map<string, StoredPost>; archives?: string; imageCache?: ImageResolutionCache } = {}): Promise<void> {
   publication = { ...publication, version: 3 };
   delete publication.legacy_receipts;
   if (!options.migrationComplete) {
     const receipts = legacyReceipts(previous, [...publication.posts, ...(publication.omitted_posts ?? [])]);
     if (Object.keys(receipts).length) publication.legacy_receipts = receipts;
   }
-  const resolve = createImageResolver(bucket, origin);
+  const resolve = createImageResolver(bucket, origin, options.imageCache);
   const cards = createCardCache(bucket);
   let archives = previous.archives;
   // A first new publication must also retain the previous saved visible week,
@@ -292,7 +292,7 @@ export async function retractPost(bucket: ContentBucket, postId: string, publish
   const prepared = prepareWrites(bucket, trace);
   bucket = prepared.bucket;
   try {
-    const previous = await trace.run('source_loading', () => currentPublication(bucket, undefined, snapshot));
+    const previous = await trace.run('publication_loading', () => currentPublication(bucket, undefined, snapshot));
     const index = await trace.run('history_index_loading', () => loadHistoryIndex(bucket, previous));
     const batch = retainedBatches(index.batches, now).find(batch => batch.id === postId);
     const ref = [...previous.posts, ...(previous.omitted_posts ?? [])].find(ref => ref.id === postId);
@@ -322,31 +322,47 @@ export async function retractPost(bucket: ContentBucket, postId: string, publish
   } finally { prepared.close(); }
 }
 
-export async function rebuildHomepage(bucket: ContentBucket, origin: string, trace = new OperationTrace(), migrationComplete = false, previous?: Publication,
-  work?: { jobId: string; checkpoint?: string }) {
+export interface RebuildBaseline { snapshot: CommittedSnapshot; publication: Publication }
+export type RebuildResult = { kind: 'pending'; checkpoint: string; progress: ArchiveProgress }
+  | { kind: 'reconcile'; progress: ArchiveProgress }
+  | { kind: 'committed'; progress?: ArchiveProgress };
+
+export async function rebuildHomepage(bucket: ContentBucket, origin: string, trace = new OperationTrace(), migrationComplete = false, baseline?: RebuildBaseline,
+  work?: { jobId: string; checkpoint?: string }): Promise<RebuildResult> {
   const durable = bucket;
   const prepared = prepareWrites(bucket, trace);
   bucket = prepared.bucket;
   try {
-    const snapshot = await committedSnapshot(bucket);
-    previous ??= await trace.run('source_loading', () => currentPublication(bucket, migrationComplete ? async () => [] : undefined, snapshot));
+    baseline ??= await trace.run('publication_loading', async () => {
+      const snapshot = await committedSnapshot(bucket);
+      return { snapshot, publication: await currentPublication(bucket, migrationComplete ? async () => [] : undefined, snapshot) };
+    });
+    const { snapshot, publication: previous } = baseline;
     // Migration finishes before rendering; imported sources now have canonical keys.
     const publication = { ...previous, posts: previous.posts.map(ref => ref.key.startsWith('digests/') ? { ...ref, key: postKey(ref) } : ref) };
     const posts: StoredPost[] = [];
     await trace.run('source_loading', async () => {
-      for (const ref of publication.posts) posts.push(await loadPost(bucket, ref));
+      for (let offset = 0; offset < publication.posts.length; offset += 4) {
+        const loaded = await Promise.allSettled(publication.posts.slice(offset, offset + 4).map(ref => loadPost(bucket, ref)));
+        for (const result of loaded) {
+          if (result.status === 'rejected') throw result.reason;
+          posts.push(result.value);
+        }
+      }
     });
-    const archives = work ? await rebuildArchives(durable, posts, publication, origin, trace, work.jobId, work.checkpoint) : undefined;
-    if (archives && !archives.complete) return archives;
-    await prepareHomepage(bucket, publication, posts, origin, previous, trace, { migrationComplete, allCards: true, archives: archives?.archives });
+    const imageCache = createImageResolutionCache();
+    const archives = work ? await rebuildArchives(durable, posts, publication, origin, trace, work.jobId, work.checkpoint, imageCache) : undefined;
+    if (archives?.kind === 'pending') return archives;
+    await prepareHomepage(bucket, publication, posts, origin, previous, trace,
+      { migrationComplete, imageCache, ...(archives ? { archives: archives.archives } : { allCards: true }) });
     if (work) {
       const current = await boundary('storage', () => durable.head('pages/index.html'));
       // R2 ETags describe bytes, so metadata-only pointer changes must also rebase.
       if (stableJson([current?.etag, current?.customMetadata]) !== stableJson([snapshot.index?.etag, snapshot.index?.customMetadata])) {
-        return { ...archives!, complete: false };
+        return { kind: 'reconcile', progress: archives!.progress };
       }
     }
     await prepared.commit();
-    return archives ?? { complete: true };
+    return { kind: 'committed', ...(archives ? { progress: archives.progress } : {}) };
   } finally { prepared.close(); }
 }
