@@ -1,8 +1,10 @@
 import type { AppendReply, BatchReply, PublicationStatus, PublishFailure, PublishReply, RetractReply } from './types';
 import { isTimestamp } from './validation';
+import { publicationOperation } from './operations';
 
 export interface ValidationIssue { path: string; code: string; message: string }
 interface ErrorOptions {
+  retry_at?: string;
   code?: string;
   details?: ValidationIssue[] | Record<string, unknown>;
   details_truncated?: boolean;
@@ -11,6 +13,7 @@ interface ErrorOptions {
 }
 
 export class HttpError extends Error {
+  readonly retry_at?: string;
   readonly code: string;
   readonly details: ValidationIssue[] | Record<string, unknown>;
   readonly details_truncated: boolean;
@@ -19,6 +22,7 @@ export class HttpError extends Error {
   constructor(public status: number, message: string, public headers: HeadersInit = {}, options: ErrorOptions = {}) {
     super(message);
     this.name = 'HttpError';
+    this.retry_at = options.retry_at;
     this.code = options.code ?? ({ 400: 'invalid_request', 401: 'unauthorized', 404: 'not_found', 405: 'method_not_allowed', 409: 'conflict', 413: 'body_too_large', 415: 'unsupported_media_type', 503: 'service_unavailable' } as Record<number, string>)[status] ?? 'internal_error';
     this.details = options.details ?? {};
     this.details_truncated = options.details_truncated ?? false;
@@ -73,7 +77,8 @@ export function asHttpError(error: unknown): HttpError {
 export const UNKNOWN_PUBLICATION = 'Unable to confirm publication; it may have completed. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.';
 
 export function committedFailureAdvice(retryable: boolean, operation?: string): string {
-  if (!retryable || (operation && !['publish', 'digest', 'append', 'retract'].includes(operation))) return 'Use the request ID to contact the operator.';
+  operation = publicationOperation(operation);
+  if (!retryable || !operation) return 'Use the request ID to contact the operator.';
   return operation === 'retract'
     ? 'Reconcile the original batch status. An unchanged retry with the original publishing token can confirm an already-retracted result while its record is retained. Contact the operator if subsequent processing still fails.'
     : 'Reconcile the committed stories. Retry only the unchanged payload within the original 30 Los Angeles receipt-date history window. Contact the operator if subsequent processing still fails.';
@@ -81,15 +86,16 @@ export function committedFailureAdvice(retryable: boolean, operation?: string): 
 
 export function publicationFailure(error: unknown, stage: string, publication_status: PublicationStatus, operation?: string): PublishFailure {
   const failure = asHttpError(error);
+  operation = publicationOperation(operation);
   const retryable = publication_status === 'unknown' || failure.retryable;
-  const message = publication_status === 'unknown' ? operation === 'retract'
+  const message = failure.code === 'publication_conflict' ? failure.message : publication_status === 'unknown' ? operation === 'retract'
     ? 'Unable to confirm retraction; it may have completed. Reconcile the batch status or retry promptly with the original token. A first retraction must commit within 24 hours of the original batch receipt.' : UNKNOWN_PUBLICATION
     : publication_status === 'committed' ? `${operation === 'retract' ? 'Retraction' : 'Publication'} committed, but subsequent processing failed. ${committedFailureAdvice(retryable, operation)}`
     : retryable ? operation === 'retract'
       ? 'Retraction did not commit. Retry promptly with the original token within 24 hours of the original batch receipt; after that deadline contact the operator.'
       : 'Publication did not commit. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.'
     : failure.message;
-  return { status: failure.status, code: failure.code, error: message, stage, publication_status, retryable };
+  return { status: failure.status, code: failure.code, error: message, stage, publication_status, retryable, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) };
 }
 
 export function declaredBodyBytes(request: Request): number | undefined {
@@ -108,7 +114,7 @@ export function isPublishReply(value: unknown): value is PublishReply {
     const f = reply.failure;
     return !!f && Number.isInteger(f.status) && f.status >= 400 && f.status <= 599
       && typeof f.code === 'string' && typeof f.error === 'string' && typeof f.stage === 'string'
-      && typeof f.retryable === 'boolean' && ['not_attempted', 'not_committed', 'committed', 'unknown'].includes(f.publication_status);
+      && typeof f.retryable === 'boolean' && (f.retry_at === undefined || isTimestamp(f.retry_at)) && ['not_attempted', 'not_committed', 'committed', 'unknown'].includes(f.publication_status);
   }
   const r = reply.result;
   if (reply.ok !== true || !r || !r.counts || !Array.isArray(r.items)) return false;
@@ -147,4 +153,8 @@ export function isBatchReply(value: unknown): value is BatchReply {
   return reply.ok === true && !!r && typeof r.client_ref === 'string' && !!r.post && typeof r.post.id === 'string'
     && typeof r.post.date === 'string' && isTimestamp(r.post.received_at) && ['published', 'retracted'].includes(r.status)
     && (r.status !== 'retracted' || isTimestamp(r.retracted_at));
+}
+
+export function retryHeaders(retryAt?: string): HeadersInit {
+  return retryAt ? { 'Retry-After': String(Math.max(1, Math.ceil((Date.parse(retryAt) - Date.now()) / 1000))) } : {};
 }

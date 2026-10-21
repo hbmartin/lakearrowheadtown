@@ -12,6 +12,7 @@ import { emit, fingerprint, OperationTrace } from './diagnostics';
 import { boundary, DamagedSource } from './errors';
 import { batchRecord, indexPost, loadHistoryIndex, retainedBatches } from './history-index';
 import { prepareWrites } from './prepared-writes';
+import { PublicationConflict } from './publication-conflict';
 import { digestItemWarnings, postedAtWarnings } from './warnings';
 import type { AppendResult, ArchiveProgress, ContentBucket, Digest, HistoryIndex, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishOptions, PublishResult, RetractResult, StoredPost, StoryIdentity, StoryUpdate } from './types';
 
@@ -128,17 +129,22 @@ async function prepareHomepage(bucket: ContentBucket, publication: Publication, 
   await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest, rss, archives: publication.archives! } })));
 }
 
-async function retainedSources(bucket: ContentBucket, now: Date, migrationComplete: boolean, trace: OperationTrace, context?: OperationContext, provided?: Publication, snapshot?: CommittedSnapshot) {
+async function retainedSources(bucket: ContentBucket, now: Date, migrationComplete: boolean, trace: OperationTrace, context?: OperationContext, provided?: Publication, snapshot?: CommittedSnapshot, requiredPostId?: string) {
   const posts: StoredPost[] = [];
   const selected: PostReference[] = [];
   const omitted: PostReference[] = [];
   const days = recentDates(now, 30);
+  const legacyDays = recentDates(now);
   let discovery: Promise<PostReference[]> | undefined;
   const discover = () => discovery ??= migrationComplete ? Promise.resolve([]) : trace.run('legacy_discovery', () => legacyReferences(bucket));
-  const previous = provided ?? await trace.run('publication_loading', () => currentPublication(bucket, discover, snapshot));
+  let pinned = snapshot;
+  const previous = provided ?? await trace.run('publication_loading', async () => {
+    pinned ??= await committedSnapshot(bucket);
+    return currentPublication(bucket, discover, pinned);
+  });
   // Preserve the established legacy migration window; never backfill old raw sources.
   const receipts = legacyReceipts(previous);
-  const legacy = (await discover()).filter(ref => recentDates(now).includes(ref.date) && !Object.hasOwn(receipts, ref.id));
+  const legacy = (await discover()).filter(ref => legacyDays.includes(ref.date) && !Object.hasOwn(receipts, ref.id));
   const candidates = [...legacy, ...(previous.omitted_posts ?? []), ...previous.posts];
   const refs = [...new Map(candidates.map(ref => [ref.id, ref])).values()]
     .filter(ref => days.includes(localDate(new Date(ref.last_received_at ?? ref.received_at)))).sort(order);
@@ -149,14 +155,14 @@ async function retainedSources(bucket: ContentBucket, now: Date, migrationComple
         selected.push(ref);
       } else {
         const error = result.reason;
-        if (!(error instanceof DamagedSource)) throw error;
+        if (!(error instanceof DamagedSource) || ref.id === requiredPostId) throw error;
         omitted.push(ref);
         console.warn('Omitted damaged post', { id: ref.id, key: ref.key, reason: error.reason });
         emit('source_omitted', context, { post_id: ref.id, source_key: ref.key, reason: error.reason }, 'warn');
       }
     }
   });
-  return { posts, selected, omitted, days, previous, sources: new Map(selected.map((ref, i) => [ref.key, posts[i]])) };
+  return { posts, selected, omitted, days, previous, snapshot: pinned!, sources: new Map(selected.map((ref, i) => [ref.key, posts[i]])) };
 }
 
 function knownSources(posts: StoredPost[], days: string[]): Map<string, StoryIdentity> {
@@ -186,7 +192,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
   bucket = prepared.bucket;
   try {
     const days = recentDates(now);
-    const { posts, selected, omitted, days: history, previous, sources } = await retainedSources(bucket, now, migrationComplete, trace, context, undefined, options.snapshot);
+    const { posts, selected, omitted, days: history, previous, sources, snapshot } = await retainedSources(bucket, now, migrationComplete, trace, context, undefined, options.snapshot);
     const post: StoredPost = { ...digest, items: [], id: crypto.randomUUID(), date: days[0], received_at: now.toISOString(),
       ...(options.publisherFingerprint ? { publisher_fingerprint: options.publisherFingerprint } : {}) };
     const items = await trace.run('duplicate_filtering', () => {
@@ -218,7 +224,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
       // Preserve the established newest-receipt ordering of historical stories.
       posts.sort((a, b) => order(reference(a), reference(b)));
       await prepareHomepage(bucket, { version: 3, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, history: previousIndex, sources });
-      if (!options.dryRun) await prepared.commit();
+      if (!options.dryRun) await prepared.commit(snapshot.index);
     }
     const result: PublishResult = {
       post: post.items.length ? { id: post.id, date: post.date, received_at: post.received_at } : null,
@@ -240,9 +246,7 @@ export async function appendUpdate(bucket: ContentBucket, postId: string, itemIn
   bucket = prepared.bucket;
   const preview = options.dryRun ? { dry_run: true as const, committed: false as const, checked_at: now.toISOString() } : {};
   try {
-    const { posts, selected, omitted, days, previous, sources } = await retainedSources(bucket, now, migrationComplete, trace, context, undefined, options.snapshot);
-    const damagedTarget = omitted.find(ref => ref.id === postId);
-    if (damagedTarget) await loadPost(bucket, damagedTarget);
+    const { posts, selected, omitted, days, previous, sources, snapshot } = await retainedSources(bucket, now, migrationComplete, trace, context, undefined, options.snapshot, postId);
     const post = posts.find(post => post.id === postId);
     const item = post?.items[itemIndex];
     if (!post || !item || !Number.isSafeInteger(itemIndex) || itemIndex < 0 || !days.includes(localDate(new Date(lastReceivedAt(post, item))))) {
@@ -264,7 +268,7 @@ export async function appendUpdate(bucket: ContentBucket, postId: string, itemIn
     posts[posts.indexOf(post)] = revision;
     posts.sort((a, b) => order(reference(a), reference(b)));
     await prepareHomepage(bucket, { version: 3, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, sources });
-    if (!options.dryRun) await prepared.commit();
+    if (!options.dryRun) await prepared.commit(snapshot.index);
     emit(options.dryRun ? 'preview_result' : 'append_result', context, { post_id: post.id, item_index: itemIndex, update_index: updateIndex, publication_outcome: options.dryRun ? 'preview' : 'published', ...(options.dryRun ? {} : { publication_status: trace.publication_status }) });
     return { status: 'appended', post_id: post.id, item_index: itemIndex, update_index: updateIndex, message: options.dryRun ? 'The source would be added to this story.' : 'The source was added to this story and the publication was updated.', ...(warnings.length ? { warnings } : {}), ...preview };
   } catch (error) {
@@ -293,7 +297,10 @@ export async function retractPost(bucket: ContentBucket, postId: string, publish
   const prepared = prepareWrites(bucket, trace);
   bucket = prepared.bucket;
   try {
-    const previous = await trace.run('publication_loading', () => currentPublication(bucket, undefined, snapshot, false, trace));
+    const previous = await trace.run('publication_loading', async () => {
+      snapshot ??= await committedSnapshot(bucket);
+      return currentPublication(bucket, undefined, snapshot, false, trace);
+    });
     const index = await trace.run('history_index_loading', () => loadHistoryIndex(bucket, previous));
     const batch = retainedBatches(index.batches, now).find(batch => batch.id === postId);
     const ref = [...previous.posts, ...(previous.omitted_posts ?? [])].find(ref => ref.id === postId);
@@ -305,7 +312,7 @@ export async function retractPost(bucket: ContentBucket, postId: string, publish
     if (now.getTime() - Date.parse(batch.received_at) >= 24 * 60 * 60 * 1000) {
       throw new HttpError(409, 'The 24-hour self-retraction window has expired.', {}, { code: 'retract_window_expired' });
     }
-    const retained = await retainedSources(bucket, now, migrationComplete, trace, context, previous);
+    const retained = await retainedSources(bucket, now, migrationComplete, trace, context, previous, snapshot);
     const original = retained.posts.find(post => post.id === postId);
     const post: StoredPost = { ...(original ?? { ...batch, title: 'Retracted batch', source: 'retraction' }), items: [], retracted_at: now.toISOString() };
     const key = `post-revisions/${postId}/${crypto.randomUUID()}.json`;
@@ -315,7 +322,7 @@ export async function retractPost(bucket: ContentBucket, postId: string, publish
     const omitted = retained.omitted.filter(ref => ref.id !== postId);
     await prepareHomepage(bucket, { version: 3, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}),
       snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, history: index, sources: retained.sources });
-    await prepared.commit();
+    await prepared.commit(snapshot!.index);
     emit('retract_result', context, { post_id: postId, publication_status: trace.publication_status, publication_outcome: 'retracted' });
     return { post_id: postId, status: 'retracted', retracted_at: post.retracted_at! };
   } catch (error) {
@@ -356,13 +363,17 @@ export async function rebuildHomepage(bucket: ContentBucket, origin: string, tra
     if (work) {
       const current = await boundary('storage', () => durable.head('pages/index.html'));
       // The publisher queue prevents mutations between this check and commit.
-      // Direct operator writes require paused publishing. R2 ETags describe
-      // bytes, so metadata-only pointer changes observed here must also rebase.
+      // Metadata repairs share this queue; raw metadata edits are unsupported.
+      // R2 ETags describe bytes, so observed pointer changes must also rebase.
       if (stableJson([current?.etag, current?.customMetadata]) !== stableJson([snapshot.index?.etag, snapshot.index?.customMetadata])) {
         return { kind: 'reconcile', progress: archives!.progress };
       }
     }
-    await prepared.commit();
+    try { await prepared.commit(snapshot.index); }
+    catch (error) {
+      if (work && error instanceof PublicationConflict) return { kind: 'reconcile', progress: archives!.progress };
+      throw error;
+    }
     return { kind: 'committed', ...(archives ? { progress: archives.progress } : {}) };
   } finally { prepared.close(); }
 }

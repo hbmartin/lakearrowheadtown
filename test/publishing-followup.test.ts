@@ -217,39 +217,51 @@ it.each(['publish', 'append', 'retract'] as const)('preserves committed certaint
   }
 });
 
-it('keeps a supported mutation queued between the rebuild final check and index replacement', async () => {
+it.each([false, true])('proves queue ordering with explicit barriers (bypass=%s)', async bypass => {
   await seed(1);
   await inPublisher(publisher(), async instance => {
     const job = await instance.enqueueRebuild(origin, contextFor('rebuild'));
-    const original = instance.env; const reached = deferred(); const release = deferred();
-    let heads = 0; let finalChecked = false; let blocked = false; let published = false;
+    const original = instance.env;
+    const reached = deferred(); const release = deferred(); const admitted = deferred(); const entered = deferred();
+    const order: string[] = []; let blocked = false;
     instance.env = { ...original, SITE_BUCKET: {
       get: (key: string) => original.SITE_BUCKET.get(key), list: (options: R2ListOptions) => original.SITE_BUCKET.list(options),
-      head: async (key: string) => {
-        const result = await original.SITE_BUCKET.head(key);
-        if (key === 'pages/index.html' && ++heads === 2) finalChecked = true;
-        return result;
-      },
+      head: (key: string) => original.SITE_BUCKET.head(key),
       put: async (key: string, body: any, options: R2PutOptions) => {
-        if (finalChecked && !blocked && /^publications\/.*\.json$/.test(key)) { blocked = true; reached.resolve(); await release.promise; }
-        return original.SITE_BUCKET.put(key, body, options);
+        const finalIndex = key === 'pages/index.html' && !blocked;
+        if (finalIndex) { blocked = true; reached.resolve(); await release.promise; }
+        const result = await original.SITE_BUCKET.put(key, body, options);
+        if (finalIndex) order.push('rebuild_index_written');
+        return result;
       },
     } };
     const rebuilding = instance.alarm();
+    await reached.promise;
+    const serialize = instance.serialize.bind(instance);
+    const spy = vi.spyOn(instance, 'serialize').mockImplementation((action: any, context: any) => {
+      if (context?.operation !== 'publish') return serialize(action, context);
+      const wrapped = () => { order.push('mutation_entered'); entered.resolve(); return action(); };
+      const result = bypass ? wrapped() : serialize(wrapped, context);
+      admitted.resolve(); return result;
+    });
     let mutation: Promise<any> | undefined;
     try {
-      await reached.promise;
-      mutation = instance.publishV2(digest('Queued-next'), origin, contextFor('publish')).then((reply: any) => { published = true; return reply; });
-      await new Promise(resolve => setTimeout(resolve, 10));
-      expect(published).toBe(false); expect(heads).toBe(2);
+      mutation = instance.publishV2(digest('Queued-next'), origin, contextFor('publish'));
+      await admitted.promise;
+      if (bypass) await entered.promise;
     } finally {
       release.resolve();
-      try { await rebuilding; if (mutation) expect((await mutation).ok).toBe(true); }
-      finally { instance.env = original; }
+      try { await rebuilding; if (mutation) await mutation; }
+      finally { spy.mockRestore(); instance.env = original; }
     }
-    expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'completed' });
-    expect((await publishing.currentPublication(bindings.SITE_BUCKET)).posts).toHaveLength(2);
-    const html = await (await bindings.SITE_BUCKET.get('pages/index.html'))!.text();
-    expect(html).toContain('Source-0'); expect(html).toContain('Queued-next');
+    const assertSerialized = () => expect(order.indexOf('mutation_entered')).toBeGreaterThan(order.indexOf('rebuild_index_written'));
+    if (bypass) expect(assertSerialized).toThrow();
+    else {
+      assertSerialized(); expect((await mutation!).ok).toBe(true);
+      expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'completed' });
+      expect((await publishing.currentPublication(bindings.SITE_BUCKET)).posts).toHaveLength(2);
+      const html = await (await bindings.SITE_BUCKET.get('pages/index.html'))!.text();
+      expect(html).toContain('Source-0'); expect(html).toContain('Queued-next');
+    }
   });
 });

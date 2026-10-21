@@ -8,12 +8,14 @@ import { htmlResponse } from './html-response';
 import { renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
 import { isPostsReply } from './posts';
+import { isRepairReply, validateRepair, type RepairInput } from './publication-repair';
+import { publicationOperation } from './operations';
 import { errorSuggestion } from './suggestions';
 import { isIndexable, metadataResource } from './public-metadata';
 import type { AppendReply, Digest, Env, OperationContext, PublicationStatus, PublishReply, PublishResult, RebuildJob, StoryUpdate } from './types';
 import { emit, fingerprint, OperationTrace, safeError } from './diagnostics';
 import { HttpError, isTimestamp, parseDigestJson, readLimited, validateClientRef, validateDigest, validateUpdate } from './validation';
-import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isBatchReply, isPublishReply, isRetractReply, OperationFailure, publicationFailure } from './errors';
+import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isBatchReply, isPublishReply, isRetractReply, OperationFailure, publicationFailure, retryHeaders } from './errors';
 import notFoundPage from './not-found';
 import { noStoreHeaders } from './responses';
 export { DigestPublisher } from './publisher';
@@ -129,6 +131,30 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
   let publicationAttempted = false;
   const reply = (value: Record<string, unknown>, status = 200, headers: HeadersInit = {}) => json({ ...value, ...(isApi ? { request_id: context.request_id } : {}) }, status, headers);
   try {
+    if (path === '/api/publication/repair') {
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      if (!['GET', 'HEAD', 'POST'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD, POST' });
+      if (query.has('dry_run')) throw new HttpError(400, 'dry_run is not supported for publication repair.', {}, { code: 'invalid_dry_run' });
+      let input: RepairInput | undefined;
+      const origin = await trace.run('configuration', () => originFor(request, env));
+      if (request.method === 'POST') {
+        if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json');
+        state.bytes_received = 0; state.body_complete = false; state.declared_body_bytes = declaredBodyBytes(request);
+        const bytes = await trace.run('body_reading', () => readLimited(request, 16384, count => { state.bytes_received = count; }));
+        state.body_complete = true;
+        input = await trace.run('validation', () => validateRepair(parseDigestJson(bytes)));
+      }
+      const publisher = await publisherFor(env, trace);
+      state.publication_status = input === undefined ? 'not_attempted' : 'unknown';
+      const received: unknown = await trace.run('repair_rpc', () => boundary('rpc', async () => await publisher.publicationRepairV1(input, origin, context)));
+      if (!isRepairReply(received)) throw new OperationFailure('rpc', new Error('Invalid publication repair reply'));
+      if (!received.ok) {
+        const f = received.failure;
+        throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { code: f.code, retryable: f.retryable,
+          retry_at: f.retry_at, publication_status: f.publication_status, details: { stage: f.stage } });
+      }
+      return reply({ ok: true, ...received.result });
+    }
     if (path === '/api/digests' && ['GET', 'HEAD'].includes(request.method)) {
       context.operation = 'batch_lookup';
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
@@ -139,7 +165,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (!isBatchReply(received)) throw new OperationFailure('rpc', new Error('Invalid batch reply'));
       if (!received.ok) {
         const f = received.failure;
-        throw new HttpError(f.status, f.error, {}, { code: f.code, retryable: f.retryable, details: { stage: f.stage } });
+        throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { retry_at: f.retry_at, code: f.code, retryable: f.retryable, details: { stage: f.stage } });
       }
       return reply({ ok: true, ...received.result });
     }
@@ -151,7 +177,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (!isPostsReply(received)) throw new OperationFailure('rpc', new Error('Invalid posts reply'));
       if (!received.ok) {
         const f = received.failure;
-        throw new HttpError(f.status, f.error, {}, { code: f.code, retryable: f.retryable, details: { stage: f.stage } });
+        throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { retry_at: f.retry_at, code: f.code, retryable: f.retryable, details: { stage: f.stage } });
       }
       return reply({ ok: true, ...received.result });
     }
@@ -169,7 +195,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (!isRetractReply(received)) throw new OperationFailure('rpc', new Error('Invalid retract reply'));
       if (!received.ok) {
         const f = received.failure;
-        throw new HttpError(f.status, f.error, {}, { code: f.code, retryable: f.retryable, publication_status: f.publication_status, details: { stage: f.stage } });
+        throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { retry_at: f.retry_at, code: f.code, retryable: f.retryable, publication_status: f.publication_status, details: { stage: f.stage } });
       }
       state.post_id = received.result.post_id;
       state.publication_status = received.result.status === 'retracted' ? 'committed' : undefined;
@@ -241,7 +267,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
           const receivedReply = received as AppendReply | PublishReply;
           if (!receivedReply.ok) {
             const f = receivedReply.failure;
-            throw new HttpError(f.status, f.error, {}, { code: f.code, details: { stage: f.stage }, retryable: f.retryable, publication_status: f.publication_status });
+            throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { retry_at: f.retry_at, code: f.code, details: { stage: f.stage }, retryable: f.retryable, publication_status: f.publication_status });
           }
           if (state.dry_run && (receivedReply.result.dry_run !== true || receivedReply.result.committed !== false || !isTimestamp(receivedReply.result.checked_at))) {
             throw new OperationFailure('rpc', new Error('Invalid preview reply'));
@@ -298,13 +324,13 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     let failure = asHttpError(error);
     const detailStage = !Array.isArray(failure.details) && typeof failure.details.stage === 'string' ? failure.details.stage : undefined;
     const stage = detailStage ?? trace.failed_stage ?? trace.stage ?? 'request_processing';
-    if (['digest', 'append', 'retract'].includes(context.operation)) {
+    if (publicationOperation(context.operation) || context.operation === 'publication_repair') {
       state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
       state.publication_outcome = state.dry_run ? 'preview_failed' : 'failed';
       if (state.dry_run) state.publication_status = 'not_attempted';
-      if (publicationAttempted) {
+      if (publicationAttempted && publicationOperation(context.operation)) {
         const f = publicationFailure(error, stage, state.publication_status, context.operation);
-        failure = new HttpError(f.status, f.error, failure.headers, { code: f.code, details: failure.details, retryable: f.retryable, publication_status: f.publication_status });
+        failure = new HttpError(f.status, f.error, failure.headers, { code: f.code, details: failure.details, retryable: f.retryable, publication_status: f.publication_status, retry_at: f.retry_at });
       }
     }
     state.error_code = failure.code;
@@ -319,11 +345,12 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     }
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
     return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable, state.dry_run, context.operation, state.publication_status), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
-      diagnostics, ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(['digest', 'append', 'retract'].includes(context.operation) ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
+      diagnostics, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}), ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(publicationOperation(context.operation) || context.operation === 'publication_repair' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
   }
 }
 
 function routeFor(path: string): { route: string; operation: string } {
+  if (path === '/api/publication/repair') return { route: path, operation: 'publication_repair' };
   if (path === '/api/digests') return { route: path, operation: 'digest' };
   if (path === '/api/images') return { route: path, operation: 'image' };
   if (path === '/api/posts') return { route: path, operation: 'posts_read' };

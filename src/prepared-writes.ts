@@ -1,4 +1,5 @@
 import { boundary } from './errors';
+import { indexCondition, PublicationConflict } from './publication-conflict';
 import { OperationTrace } from './diagnostics';
 import type { ContentBucket } from './types';
 
@@ -29,12 +30,20 @@ export function prepareWrites(bucket: ContentBucket, trace: OperationTrace) {
   return {
     bucket: view,
     close() { trace.phase = previousPhase; },
-    async commit() {
+    async commit(index: R2Object | null = null) {
+      let committedIndex: R2Object | undefined;
       // A child trace per write avoids concurrent stage-stack mutation.
       const persist = async (write: typeof writes[number]) => {
         const child = new OperationTrace(trace.context);
         child.phase = 'commit';
-        try { await child.run(write.stage, () => boundary('storage', () => bucket.put(write.key, write.bytes, write.options))); }
+        try {
+          return await child.run(write.stage, () => boundary('storage', async () => {
+            const result = await bucket.put(write.key, write.bytes, write.key === 'pages/index.html'
+              ? { ...write.options, onlyIf: indexCondition(index) } : write.options);
+            if (write.key === 'pages/index.html' && result === null) throw new PublicationConflict();
+            return result;
+          }));
+        }
         catch (error) { trace.failed_stage ??= child.failed_stage; throw error; }
       };
       try {
@@ -62,9 +71,11 @@ export function prepareWrites(bucket: ContentBucket, trace: OperationTrace) {
         if (failed) throw failure;
         for (const write of writes.filter(write => write.key === 'pages/index.html')) {
           trace.publication_status = 'unknown';
-          await persist(write);
+          try { committedIndex = (await persist(write))!; }
+          catch (error) { if (error instanceof PublicationConflict) trace.publication_status = 'not_committed'; throw error; }
           trace.publication_status = 'committed';
         }
+        return committedIndex;
       } finally {
         trace.phase = previousPhase;
         writes.length = 0;
