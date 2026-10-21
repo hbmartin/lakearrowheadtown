@@ -1,10 +1,15 @@
-import type { Suggestion } from './types';
+import type { PublicationStatus, Suggestion } from './types';
+import { committedFailureAdvice } from './errors';
 
 export const reviewStory: Suggestion = { action: 'review_existing_story', message: 'Read the 30-day history and inspect the returned post_id and item_index before choosing another source.', method: 'GET', path: '/api/posts?days=30' };
 export const duplicateMessage = 'This exact source URL already belongs to a retained story. No content was changed.';
 
-export function errorSuggestion(code: string, retryable: boolean, dryRun = false, operation?: string): Suggestion {
+export function errorSuggestion(code: string, retryable: boolean, dryRun = false, operation?: string, publicationStatus?: PublicationStatus): Suggestion {
   if (dryRun && retryable) return { action: 'retry_preview', message: 'Retry the unchanged preview. No publication was attempted.' };
+  if (publicationStatus === 'committed' && ['digest', 'append', 'retract'].includes(operation ?? '')) {
+    return { action: retryable ? operation === 'retract' ? 'reconcile_or_retry_retraction' : 'retry_unchanged' : 'contact_operator',
+      message: `The ${operation === 'retract' ? 'retraction' : 'publication'} is confirmed committed. ${committedFailureAdvice(retryable, operation)}` };
+  }
   if (code === 'invalid_dry_run' && ['image', 'retract', 'rebuild'].includes(operation ?? '')) return { action: 'remove_dry_run', message: 'Remove the dry_run parameter; this endpoint does not support previews.' };
   if (operation === 'retract' && retryable) return { action: 'reconcile_or_retry_retraction', message: 'Reconcile the original batch status or retry promptly with its publishing token. A first retraction must commit within 24 hours of the original receipt; otherwise contact the operator.' };
   if (code === 'client_ref_conflict') return { action: 'look_up_batch', message: 'Look up the committed batch with GET /api/digests?client_ref=YOUR_REFERENCE, or choose a new client_ref for a new batch.', method: 'GET', path: '/api/digests' };

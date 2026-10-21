@@ -5,6 +5,7 @@ import { localDate, recentDates } from './feed';
 import { currentPublication, loadPost, loadPublication } from './publishing';
 import { isTimestamp } from './validation';
 import { indexPost, loadHistoryIndex } from './history-index';
+import { READ_BATCH_SIZE, settledInOrder } from './batches';
 import type { ContentBucket, DigestItem, IndexPost, PostReference, PublishFailure, StoryUpdate } from './types';
 
 interface Cursor { snapshot: string; as_of: string; days: number; offset: number; fields?: 'full' | 'index' }
@@ -61,12 +62,12 @@ export async function readPosts(bucket: ContentBucket, query: URLSearchParams, s
   while (offset < publication.posts.length && posts.length < 20) {
     const refs: PostReference[] = [];
     // Never prefetch beyond the number of remaining response slots.
-    const capacity = Math.min(4, 20 - posts.length);
+    const capacity = Math.min(READ_BATCH_SIZE, 20 - posts.length);
     while (offset < publication.posts.length && refs.length < capacity) {
       const ref = publication.posts[offset++];
       if (dates.includes(localDate(new Date(ref.last_received_at ?? ref.received_at)))) refs.push(ref);
     }
-    const loaded = await Promise.allSettled(refs.map(async (ref): Promise<ReadPost> => {
+    for await (const { result } of settledInOrder(refs, async (ref): Promise<ReadPost> => {
       if (compact) return indexed.get(ref.id)!;
       const post = await loadPost(bucket, ref);
       const metadata = indexPost(post);
@@ -74,8 +75,7 @@ export async function readPosts(bucket: ContentBucket, query: URLSearchParams, s
       return { ...metadata, title: post.title, source: post.source,
         items: post.items.map((item, i) => ({ ...item, ...metadata.items[i],
           updates: (item.updates ?? []).map((update, j) => ({ ...update, ...metadata.items[i].updates[j] })) })) };
-    }));
-    for (const result of loaded) {
+    })) {
       // Completion order must not change source or failure ordering.
       if (result.status === 'rejected') throw result.reason;
       const post = result.value;

@@ -79,9 +79,14 @@ describe('authenticated story reads and updates', () => {
     const current = await snapshot();
     expect(current.html).toContain('Road <strong>reopened</strong>');
     expect(current.html).toContain('Additional source');
-    expect(current.html).toContain('Updated <time');
+    expect(current.html).not.toContain('story-updated');
+    expect(current.html).not.toContain('View source post');
+    expect(current.html).toContain('<a href="https://example.com/followup" rel="noopener noreferrer">Other group</a>');
+    expect(current.html).toContain('<a href="https://example.com/link-only" rel="noopener noreferrer">Community</a>');
+    expect(current.html).not.toContain('href="https://example.com/group2"');
     expect(current.html!.match(/<article class="digest-item"/g)).toHaveLength(1);
     expect(current.rss).toContain('reopened'); expect(current.rss).toContain('link-only');
+    expect(current.rss).toContain('View source post');
     await rebuildHomepage(bindings.SITE_BUCKET, origin);
     expect(await snapshot()).toMatchObject({ publication: current.publication, html: current.html, rss: current.rss });
   });
@@ -281,7 +286,8 @@ describe('retention and source activity', () => {
     const html = renderPage(posts, { origin, publication });
     expect(html.indexOf('>Old</a>')).toBeLessThan(html.indexOf('>New</a>'));
     expect(html).toContain('datetime="2026-10-01T20:00:00Z"');
-    expect(html).toContain('story-updated">Updated <time class="post-time" datetime="2026-10-25T20:00:00Z"');
+    expect(html).not.toContain('story-updated');
+    expect(html).toContain('<span>Update</span><time class="post-time" datetime="2026-10-25T20:00:00Z"');
     expect(recentDates(new Date('2026-11-02T08:00:00Z'), 30)).toHaveLength(30);
   });
 });

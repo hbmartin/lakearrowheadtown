@@ -7,7 +7,7 @@ import { loadHistoryIndex } from '../src/history-index';
 import { createImageResolutionCache, createImageResolver, metadataKey } from '../src/image-metadata';
 import { OperationTrace } from '../src/diagnostics';
 import { prepareWrites } from '../src/prepared-writes';
-import { publicationFailure } from '../src/errors';
+import { HttpError, publicationFailure } from '../src/errors';
 import type { ContentBucket, Digest, Env, Publication, StoredPost } from '../src/types';
 
 const bindings = env as unknown as Env;
@@ -144,13 +144,16 @@ it.each([['a', 'b'], ['b', 'a']])('keeps stage and error attribution together wh
 
 it('uses retraction wording for committed failures without changing certainty or retryability', async () => {
   for (const retryable of [true, false]) {
-    const failure = publicationFailure(new Error('private error'), 'after_commit', 'committed', 'retract');
-    expect(failure).toMatchObject({ publication_status: 'committed', retryable: false });
-    expect(failure.error).toBe('Retraction committed, but subsequent processing failed. Use the request ID to contact the operator.');
+    const failure = publicationFailure(new HttpError(500, 'private error', {}, { code: 'storage_error', retryable }), 'after_commit', 'committed', 'retract');
+    expect(failure).toMatchObject({ publication_status: 'committed', retryable });
+    expect(failure.error).toContain('Retraction committed, but subsequent processing failed.');
+    expect(failure.error).toContain(retryable ? 'Reconcile the original batch status.' : 'Use the request ID to contact the operator.');
     const response = await worker.fetch(new Request(`${origin}/api/posts/owned/retract`, { method: 'POST', headers: { Authorization: `Bearer ${secret}` } }), {
       ...bindings, PUBLISHER: { getByName: () => ({ retractPostV1: async () => ({ ok: false, failure: { status: 500, code: 'storage_error',
         error: 'Publication committed', stage: 'after_commit', publication_status: 'committed', retryable } }) }) } as unknown as Env['PUBLISHER'],
     });
-    expect(await response.json()).toMatchObject({ publication_status: 'committed', retryable, message: failure.error });
+    const result = await response.json<any>();
+    expect(result).toMatchObject({ publication_status: 'committed', retryable, message: failure.error });
+    expect(result.suggestion.message).not.toContain('24 hours');
   }
 });

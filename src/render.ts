@@ -148,11 +148,10 @@ function renderItem({ item }: { item: StoredItem }, context: ImageContext): stri
       ${item.category ? `<span class="category">${escapeHtml(item.category)}</span>` : ''}</div>
     <h3><a class="headline-link" href="${escapeHtml(item.post_url)}" rel="noopener noreferrer">${escapeHtml(item.headline)}</a></h3>
     <div class="markdown">${renderBody(item, context)}</div>${updates.length ? `
-    <p class="item-meta story-updated">Updated ${renderTime(updates.at(-1)!.posted_at)}</p>
     <div class="story-updates" aria-label="Story updates">${updates.map(update => `
       <div class="story-update">
         <div class="item-meta"><span>${update.body.trim() ? 'Update' : 'Additional source'}</span>${renderTime(update.posted_at)}
-          <span>${update.group_url ? `<a href="${escapeHtml(update.group_url)}" rel="noopener noreferrer">${escapeHtml(update.group)}</a>` : escapeHtml(update.group)} · <a href="${escapeHtml(update.post_url)}" rel="noopener noreferrer">View source post</a></span></div>
+          <span><a href="${escapeHtml(update.post_url)}" rel="noopener noreferrer">${escapeHtml(update.group)}</a></span></div>
         ${update.body ? `<div class="markdown">${renderBody({ ...item, ...update, group_url: update.group_url ?? '' }, context)}</div>` : ''}
       </div>`).join('\n')}
     </div>` : ''}

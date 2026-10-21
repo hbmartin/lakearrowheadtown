@@ -317,7 +317,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       return new Response(notFoundPage, { status: 404, headers });
     }
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
-    return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable, state.dry_run, context.operation), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
+    return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable, state.dry_run, context.operation, state.publication_status), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
       diagnostics, ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(['digest', 'append', 'retract'].includes(context.operation) ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
   }
 }

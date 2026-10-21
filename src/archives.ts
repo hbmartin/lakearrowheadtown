@@ -5,7 +5,7 @@ import { hashBytes, IMAGE_CACHE } from './images';
 import { createImageResolutionCache, createImageResolver, validImageMetadata, type ImageMetadataMap, type ImageResolver, type ImageResolutionCache } from './image-metadata';
 import { dailyCard, DAILY_CARD_VERSION } from './social';
 import { isDate, isTimestamp, validateStoredDigest } from './validation';
-import type { ContentBucket, Publication, StoredPost } from './types';
+import type { ArchiveProgress, ContentBucket, Publication, StoredPost } from './types';
 import type { OperationTrace } from './diagnostics';
 import { fingerprint, record } from './primitives';
 import { prepareWrites } from './prepared-writes';
@@ -159,8 +159,8 @@ export async function prepareArchives(bucket: ContentBucket, posts: StoredPost[]
 }
 
 export const REBUILD_ARCHIVE_BATCH = 10;
-export interface ArchiveProgress { completed_days: number; total_days: number }
-type ArchiveRebuildResult = { kind: 'pending'; checkpoint: string; progress: ArchiveProgress }
+export type PendingArchiveRebuild = { kind: 'pending'; checkpoint: string; progress: ArchiveProgress };
+type ArchiveRebuildResult = PendingArchiveRebuild
   | { kind: 'prepared'; archives: string; progress: ArchiveProgress };
 interface DayResult { input: string; reference: ArchiveReference | null }
 interface ArchiveWork { version: 1; days: Record<string, DayResult> }

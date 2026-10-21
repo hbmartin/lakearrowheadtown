@@ -307,6 +307,30 @@ describe('bounded resumable archive rebuilds', () => {
     expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.customMetadata).toEqual(original.customMetadata);
   });
 
+  it('reuses terminal receipts after reconciliation from an older aggregate checkpoint', async () => {
+    await seedArchives(12, true);
+    const render = vi.spyOn(social, 'dailyCard').mockImplementation(async (date, headline) => new TextEncoder().encode(date + headline));
+    const work = { jobId: crypto.randomUUID() };
+    const pending = await rebuildHomepage(bindings.SITE_BUCKET, origin, undefined, true, undefined, work);
+    if (pending.kind !== 'pending') throw new Error('Expected incomplete archive pass');
+    expect(pending.progress).toEqual({ completed_days: 10, total_days: 13 });
+    const before = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
+    const html = await before.text(); let reads = 0;
+    const revised = { ...before.customMetadata, operator_revision: 'corrected' };
+    const stale = await rebuildHomepage(store({ head: async key => {
+      if (key === 'pages/index.html' && ++reads === 2) await bindings.SITE_BUCKET.put(key, html, { customMetadata: revised });
+      return bindings.SITE_BUCKET.head(key);
+    } }), origin, undefined, true, undefined, { ...work, checkpoint: pending.checkpoint });
+    expect(stale).toEqual({ kind: 'reconcile', progress: { completed_days: 13, total_days: 13 } });
+    expect(render).toHaveBeenCalledTimes(12);
+    expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.customMetadata).toEqual(revised);
+    expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${work.jobId}/checkpoints/` })).objects).toHaveLength(1);
+    const repaired = await rebuildHomepage(bindings.SITE_BUCKET, origin, undefined, true, undefined, { ...work, checkpoint: pending.checkpoint });
+    expect(repaired).toEqual({ kind: 'committed', progress: { completed_days: 13, total_days: 13 } });
+    expect(render).toHaveBeenCalledTimes(12);
+    expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${work.jobId}/checkpoints/` })).objects).toHaveLength(1);
+  });
+
   it('checkpoints ten days per alarm, survives eviction, and preserves interleaved publications and retractions', async () => {
     const first = await seedArchives();
     const survivor = await publishDigest(bindings.SITE_BUCKET, digest('Survivor'), origin, at, true);
@@ -548,7 +572,7 @@ describe('publication I/O', () => {
       const stages = events.filter(event => event.event === 'operation_stage' && event.request_id === rpcContext.request_id);
       expect(stages.filter(event => event.stage === 'committed_snapshot_loading')).toHaveLength(1);
       expect(stages.filter(event => event.stage === 'source_loading')).toHaveLength(1);
-      expect(stages.filter(event => event.stage === 'publication_loading')).toHaveLength(operation === 'retract' ? 1 : 0);
+      expect(stages.filter(event => event.stage === 'publication_loading')).toHaveLength(1);
     } finally { for (const spy of spies) spy.mockRestore(); }
   });
 
