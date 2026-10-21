@@ -1,11 +1,12 @@
 import { boundary } from './errors';
-import type { OperationTrace } from './diagnostics';
+import { OperationTrace } from './diagnostics';
 import type { ContentBucket } from './types';
 
 // All source, renderer-cache, archive, and snapshot writes first land here.
 // Reads see staged objects so archive seeding can feed the next preparation.
 // Only commit() reaches durable storage; the homepage remains the last write.
 export function prepareWrites(bucket: ContentBucket, trace: OperationTrace) {
+  const previousPhase = trace.phase;
   trace.phase = 'preparation';
   const writes: { key: string; bytes: Uint8Array; options?: R2PutOptions; stage: string }[] = [];
   const staged = new Map<string, R2ObjectBody>();
@@ -27,12 +28,47 @@ export function prepareWrites(bucket: ContentBucket, trace: OperationTrace) {
   };
   return {
     bucket: view,
+    close() { trace.phase = previousPhase; },
     async commit() {
-      trace.phase = 'commit';
-      for (const write of writes) {
-        if (write.key === 'pages/index.html') trace.publication_status = 'unknown';
-        await trace.run(write.stage, () => boundary('storage', () => bucket.put(write.key, write.bytes, write.options)));
-        if (write.key === 'pages/index.html') trace.publication_status = 'committed';
+      // A child trace per write avoids concurrent stage-stack mutation.
+      const persist = async (write: typeof writes[number]) => {
+        const child = new OperationTrace(trace.context);
+        child.phase = 'commit';
+        try { await child.run(write.stage, () => boundary('storage', () => bucket.put(write.key, write.bytes, write.options))); }
+        catch (error) { trace.failed_stage ??= child.failed_stage; throw error; }
+      };
+      try {
+        const groups = new Map<string, typeof writes>();
+        for (const write of writes) {
+          if (write.key === 'pages/index.html') continue;
+          if (!groups.has(write.key)) groups.set(write.key, []);
+          groups.get(write.key)!.push(write);
+        }
+        const pending = [...groups.values()];
+        let next = 0;
+        let failed = false;
+        let failure: unknown;
+        await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => {
+          while (!failed && next < pending.length) {
+            const group = pending[next++];
+            try {
+              for (const write of group) {
+                if (failed) break;
+                await persist(write);
+              }
+            } catch (error) { if (!failed) failure = error; failed = true; }
+          }
+        }));
+        if (failed) throw failure;
+        for (const write of writes.filter(write => write.key === 'pages/index.html')) {
+          trace.publication_status = 'unknown';
+          await persist(write);
+          trace.publication_status = 'committed';
+        }
+      } finally {
+        trace.phase = previousPhase;
+        writes.length = 0;
+        staged.clear();
       }
     },
   };

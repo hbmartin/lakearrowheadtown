@@ -99,7 +99,7 @@ describe('rebuild storage diagnostics', () => {
     const job: RebuildJob = { id, origin, status: 'queued', phase: 'render', processed: 0, created_at: new Date().toISOString(), context };
     let restore!: () => void;
     await inPublisher(publisher, async (_instance, state) => {
-      await state.storage.put({ jobs: [id], [`job:${id}`]: job, migration: { complete: true, processed: 0 } });
+      await state.storage.put({ jobs: [id], [`job:${id}`]: job, migration: { complete: false, processed: 0 } });
       await state.storage.setAlarm(Date.now() + 1000);
       const get = state.storage.get.bind(state.storage) as (key: any) => Promise<any>;
       const spy = vi.spyOn(state.storage, 'get').mockImplementation(async (key: any) => {

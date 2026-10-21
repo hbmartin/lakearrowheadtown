@@ -23,6 +23,12 @@ const store = (overrides: Partial<ContentBucket> = {}): ContentBucket => ({
   put: (key, body, options) => bindings.SITE_BUCKET.put(key, body, options), list: options => bindings.SITE_BUCKET.list(options), ...overrides,
 });
 const catalog = async () => loadCatalog(bindings.SITE_BUCKET, (await currentPublication(bindings.SITE_BUCKET)).archives);
+async function historicalDay(ref: import('../src/archives').ArchiveReference) {
+  const day = await (await bindings.SITE_BUCKET.get(ref.key))!.json<ArchiveDay>();
+  const date = '2026-09-01'; const activity = `${date}T18:00:00Z`;
+  return { date, images: {}, stories: day.stories.map(story => ({ ...story, postId: 'historical', date, activity,
+    timestamp: Date.parse(activity), item: { ...story.item, posted_at: activity } })) };
+}
 async function saveJson(prefix: string, value: unknown) {
   const body = stableJson(value);
   const key = `${prefix}/${await hashBytes(new TextEncoder().encode(body))}.json`;
@@ -112,7 +118,7 @@ it('repairs a manually changed historical headline and later a lost historical P
 it.each(['publish', 'rebuild'] as const)('uses a divergent direct pointer as authority during %s', async operation => {
   await publishDigest(bindings.SITE_BUCKET, digest(), origin, now, true);
   const value = await catalog();
-  value.days['2026-09-01'] = { ...value.days['2026-10-20'], key: await saveJson('archive-days', { date: '2026-09-01', stories: [], images: {} }), identities: [] };
+  value.days['2026-09-01'] = { ...value.days['2026-10-20'], key: await saveJson('archive-days', await historicalDay(value.days['2026-10-20'])), identities: ['historical:0'] };
   const direct = await commitCatalog(value, true);
   expect((await currentPublication(bindings.SITE_BUCKET)).archives).toBe(direct);
   expect(await (await pageResource(new Request(origin + '/archive/'), bindings.SITE_BUCKET, origin))!.text()).toContain('/2026/09/01/');
@@ -129,7 +135,7 @@ it.each(['publish', 'rebuild'] as const)('uses a divergent direct pointer as aut
 it('keeps failed pointer reconciliation and card repairs behind the index commit', async () => {
   await publishDigest(bindings.SITE_BUCKET, digest(), origin, now, true);
   const value = await catalog();
-  value.days['2026-09-01'] = { ...value.days['2026-10-20'], key: await saveJson('archive-days', { date: '2026-09-01', stories: [], images: {} }), identities: [] };
+  value.days['2026-09-01'] = { ...value.days['2026-10-20'], key: await saveJson('archive-days', await historicalDay(value.days['2026-10-20'])), identities: ['historical:0'] };
   const direct = await commitCatalog(value, true);
   const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
   const failing = store({ put: async (key, body, options) => {
@@ -154,10 +160,10 @@ it.each([null, 'not JSON', '{}', '{"version":2,"posts":"broken"}'])('returns con
   for (const path of ['/archive/', '/2026/10/20/', '/sitemap.xml']) for (const method of ['GET', 'HEAD']) {
     const response = await worker.fetch(new Request(origin + path, { method, headers: { 'If-None-Match': '*' } }), bindings);
     expect(response.status).toBe(503);
-    expect(response.headers.get('Retry-After')).toBe('60');
+    expect(response.headers.get('Retry-After')).toBeNull();
     expect(response.headers.get('Cache-Control')).toBe('no-store');
     if (method === 'HEAD') expect(await response.text()).toBe('');
-    else expect(await response.json()).toEqual({ ok: false, error: 'News archives are temporarily unavailable. Please try again later.' });
+    else expect(await response.json()).toEqual({ ok: false, error: 'News archives are damaged. An operator must repair them before retrying.' });
   }
 });
 

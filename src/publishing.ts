@@ -1,5 +1,5 @@
-import { createCardCache, prepareArchives, stableJson } from './archives';
-import { committedSnapshot, isLegacyId } from './committed';
+import { createCardCache, prepareArchives, rebuildArchives, stableJson } from './archives';
+import { committedSnapshot, isLegacyId, legacyRecoveryRequired } from './committed';
 export { loadPublication } from './committed';
 import { createImageResolver } from './image-metadata';
 import { recentDates, renderPage } from './render';
@@ -12,7 +12,7 @@ import { boundary, DamagedSource } from './errors';
 import { batchRecord, indexPost, loadHistoryIndex, retainedBatches } from './history-index';
 import { prepareWrites } from './prepared-writes';
 import { digestItemWarnings, postedAtWarnings } from './warnings';
-import type { AppendResult, ContentBucket, Digest, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishOptions, PublishResult, RetractResult, StoredPost, StoryIdentity, StoryUpdate } from './types';
+import type { AppendResult, ContentBucket, Digest, HistoryIndex, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishOptions, PublishResult, RetractResult, StoredPost, StoryIdentity, StoryUpdate } from './types';
 
 export const HTML_CACHE = 'public, max-age=0, must-revalidate';
 export const initialMigration = (): Migration => ({ processed: 0, complete: false });
@@ -60,10 +60,11 @@ export async function loadPost(bucket: ContentBucket, ref: PostReference): Promi
   return { ...digest, id: ref.id, date: ref.date, received_at: ref.received_at };
 }
 
-export async function currentPublication(bucket: ContentBucket, discover = () => legacyReferences(bucket), pinned?: Awaited<ReturnType<typeof committedSnapshot>>): Promise<Publication> {
+export async function currentPublication(bucket: ContentBucket, discover = () => legacyReferences(bucket), pinned?: Awaited<ReturnType<typeof committedSnapshot>>, requireManifest = false): Promise<Publication> {
   const snapshot = pinned ?? await committedSnapshot(bucket);
   const publication = await snapshot.publication();
   if (publication) return publication;
+  if (requireManifest) throw legacyRecoveryRequired();
   // Bootstrap old deployments using server storage times, never client dates.
   const legacy = await discover();
   const anchor = snapshot.index?.uploaded ?? (legacy.length ? new Date([...legacy].sort(order)[0].received_at) : null);
@@ -82,7 +83,7 @@ function legacyReceipts(previous: Publication, additional: PostReference[] = [])
 }
 
 async function prepareHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, previous: Publication,
-  trace = new OperationTrace(), options: { migrationComplete?: boolean; allCards?: boolean; now?: Date } = {}): Promise<void> {
+  trace = new OperationTrace(), options: { migrationComplete?: boolean; allCards?: boolean; now?: Date; history?: HistoryIndex; sources?: Map<string, StoredPost>; archives?: string } = {}): Promise<void> {
   publication = { ...publication, version: 3 };
   delete publication.legacy_receipts;
   if (!options.migrationComplete) {
@@ -94,21 +95,21 @@ async function prepareHomepage(bucket: ContentBucket, publication: Publication, 
   let archives = previous.archives;
   // A first new publication must also retain the previous saved visible week,
   // even if that snapshot is now older than the incoming history window.
-  if (!archives && previous.snapshot_date && previous.published_at !== publication.published_at) {
+  if (options.archives === undefined && !archives && previous.snapshot_date && previous.published_at !== publication.published_at) {
     const seed: StoredPost[] = [];
     for (const ref of previous.posts) {
-      try { seed.push(await loadPost(bucket, ref)); }
+      try { seed.push(options.sources?.get(ref.key) ?? await loadPost(bucket, ref)); }
       catch (error) { if (!(error instanceof DamagedSource)) throw error; }
     }
     archives = await prepareArchives(bucket, seed, previous, origin, undefined, trace, resolve, { cards });
   }
-  publication.archives = await prepareArchives(bucket, posts, publication, origin, archives, trace, resolve, { cards, allCards: options.allCards });
+  publication.archives = options.archives ?? await prepareArchives(bucket, posts, publication, origin, archives, trace, resolve, { cards, allCards: options.allCards });
   const images = await trace.run('image_metadata', () => resolve(posts.flatMap(post => post.items)));
   const html = await trace.run('rendering', () => boundary('rendering', () => renderPage(posts, { origin, publication, images })));
   const feed = await trace.run('rss_rendering', () => boundary('rendering', () => renderRss(posts, { origin, publication, images })));
   const manifest = `publications/${crypto.randomUUID()}.json`;
   const rss = manifest.replace(/\.json$/, '.rss.xml');
-  const previousIndex = await trace.run('history_index_loading', () => loadHistoryIndex(bucket, previous));
+  const previousIndex = options.history ?? await trace.run('history_index_loading', () => loadHistoryIndex(bucket, previous));
   const batches = new Map(previousIndex.batches.map(batch => [batch.id, batch]));
   for (const post of posts) batches.set(post.id, batchRecord(post));
   const byId = new Map(posts.map(post => [post.id, post]));
@@ -124,7 +125,7 @@ async function prepareHomepage(bucket: ContentBucket, publication: Publication, 
   await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest, rss, archives: publication.archives! } })));
 }
 
-async function retainedSources(bucket: ContentBucket, now: Date, migrationComplete: boolean, trace: OperationTrace, context?: OperationContext) {
+async function retainedSources(bucket: ContentBucket, now: Date, migrationComplete: boolean, trace: OperationTrace, context?: OperationContext, provided?: Publication) {
   const posts: StoredPost[] = [];
   const selected: PostReference[] = [];
   const omitted: PostReference[] = [];
@@ -132,7 +133,7 @@ async function retainedSources(bucket: ContentBucket, now: Date, migrationComple
   let discovery: Promise<PostReference[]> | undefined;
   const discover = () => discovery ??= migrationComplete ? Promise.resolve([]) : legacyReferences(bucket);
   const previous = await trace.run('source_loading', async () => {
-    const previous = await currentPublication(bucket, discover);
+    const previous = provided ?? await currentPublication(bucket, discover);
     // Preserve the established legacy migration window; never backfill old raw sources.
     const receipts = legacyReceipts(previous);
     const legacy = (await discover()).filter(ref => recentDates(now).includes(ref.date) && !Object.hasOwn(receipts, ref.id));
@@ -152,7 +153,7 @@ async function retainedSources(bucket: ContentBucket, now: Date, migrationComple
     }
     return previous;
   });
-  return { posts, selected, omitted, days, previous };
+  return { posts, selected, omitted, days, previous, sources: new Map(selected.map((ref, i) => [ref.key, posts[i]])) };
 }
 
 function knownSources(posts: StoredPost[], days: string[]): Map<string, StoryIdentity> {
@@ -182,7 +183,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
   bucket = prepared.bucket;
   try {
     const days = recentDates(now);
-    const { posts, selected, omitted, days: history, previous } = await retainedSources(bucket, now, migrationComplete, trace, context);
+    const { posts, selected, omitted, days: history, previous, sources } = await retainedSources(bucket, now, migrationComplete, trace, context);
     const post: StoredPost = { ...digest, items: [], id: crypto.randomUUID(), date: days[0], received_at: now.toISOString(),
       ...(options.publisherFingerprint ? { publisher_fingerprint: options.publisherFingerprint } : {}) };
     const items = await trace.run('duplicate_filtering', () => {
@@ -198,10 +199,11 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
     });
     const counts = { submitted: items.length, published: post.items.length, duplicates: items.length - post.items.length };
     const warnings = items.flatMap(item => item.status === 'published' ? digestItemWarnings(digest.items[item.index], item.index, now) : []);
+    let previousIndex: HistoryIndex | undefined;
     if (post.items.length) {
       if (digest.client_ref !== undefined) {
-        const index = await trace.run('history_index_loading', () => loadHistoryIndex(bucket, previous));
-        if (retainedBatches(index.batches, now).some(batch => batch.client_ref === digest.client_ref)) {
+        previousIndex = await trace.run('history_index_loading', () => loadHistoryIndex(bucket, previous));
+        if (retainedBatches(previousIndex.batches, now).some(batch => batch.client_ref === digest.client_ref)) {
           throw new HttpError(409, 'client_ref already identifies a committed batch. Choose a new reference.', {}, { code: 'client_ref_conflict' });
         }
       }
@@ -212,7 +214,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
       selected.sort(order);
       // Preserve the established newest-receipt ordering of historical stories.
       posts.sort((a, b) => order(reference(a), reference(b)));
-      await prepareHomepage(bucket, { version: 3, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now });
+      await prepareHomepage(bucket, { version: 3, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, history: previousIndex, sources });
       if (!options.dryRun) await prepared.commit();
     }
     const result: PublishResult = {
@@ -226,7 +228,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
     return result;
   } catch (error) {
     throw new PublicationError(options.dryRun ? 'not_attempted' : trace.publication_status, trace.failed_stage ?? trace.stage ?? 'publication_processing', error);
-  }
+  } finally { prepared.close(); }
 }
 
 export async function appendUpdate(bucket: ContentBucket, postId: string, itemIndex: number, update: StoryUpdate, origin: string, now = new Date(), migrationComplete = false, context?: OperationContext, options: PublishOptions = {}): Promise<AppendResult> {
@@ -235,7 +237,7 @@ export async function appendUpdate(bucket: ContentBucket, postId: string, itemIn
   bucket = prepared.bucket;
   const preview = options.dryRun ? { dry_run: true as const, committed: false as const, checked_at: now.toISOString() } : {};
   try {
-    const { posts, selected, omitted, days, previous } = await retainedSources(bucket, now, migrationComplete, trace, context);
+    const { posts, selected, omitted, days, previous, sources } = await retainedSources(bucket, now, migrationComplete, trace, context);
     const damagedTarget = omitted.find(ref => ref.id === postId);
     if (damagedTarget) await loadPost(bucket, damagedTarget);
     const post = posts.find(post => post.id === postId);
@@ -250,18 +252,21 @@ export async function appendUpdate(bucket: ContentBucket, postId: string, itemIn
     }
     const warnings = postedAtWarnings(update.posted_at, now);
     const updateIndex = item.updates?.length ?? 0;
-    item.updates = [...(item.updates ?? []), { ...update, received_at: now.toISOString() }];
+    // Preserve the loaded committed source for any saved-week archive seed.
+    const revision: StoredPost = { ...post, items: post.items.map((source, index) => index === itemIndex
+      ? { ...source, updates: [...(source.updates ?? []), { ...update, received_at: now.toISOString() }] } : source) };
     const key = `post-revisions/${post.id}/${crypto.randomUUID()}.json`;
-    await trace.run('source_write', () => boundary('storage', () => bucket.put(key, JSON.stringify(post), { httpMetadata: { contentType: 'application/json' } })));
-    const refs = selected.map(ref => ref.id === post.id ? { ...reference(post), key } : ref).sort(order);
+    await trace.run('source_write', () => boundary('storage', () => bucket.put(key, JSON.stringify(revision), { httpMetadata: { contentType: 'application/json' } })));
+    const refs = selected.map(ref => ref.id === post.id ? { ...reference(revision), key } : ref).sort(order);
+    posts[posts.indexOf(post)] = revision;
     posts.sort((a, b) => order(reference(a), reference(b)));
-    await prepareHomepage(bucket, { version: 3, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now });
+    await prepareHomepage(bucket, { version: 3, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, sources });
     if (!options.dryRun) await prepared.commit();
     emit(options.dryRun ? 'preview_result' : 'append_result', context, { post_id: post.id, item_index: itemIndex, update_index: updateIndex, publication_outcome: options.dryRun ? 'preview' : 'published', ...(options.dryRun ? {} : { publication_status: trace.publication_status }) });
     return { status: 'appended', post_id: post.id, item_index: itemIndex, update_index: updateIndex, message: options.dryRun ? 'The source would be added to this story.' : 'The source was added to this story and the publication was updated.', ...(warnings.length ? { warnings } : {}), ...preview };
   } catch (error) {
     throw new PublicationError(options.dryRun ? 'not_attempted' : trace.publication_status, trace.failed_stage ?? trace.stage ?? 'append_processing', error);
-  }
+  } finally { prepared.close(); }
 }
 
 export async function migrateBatch(bucket: ContentBucket, migration: Migration): Promise<Migration> {
@@ -297,7 +302,7 @@ export async function retractPost(bucket: ContentBucket, postId: string, publish
     if (now.getTime() - Date.parse(batch.received_at) >= 24 * 60 * 60 * 1000) {
       throw new HttpError(409, 'The 24-hour self-retraction window has expired.', {}, { code: 'retract_window_expired' });
     }
-    const retained = await retainedSources(bucket, now, migrationComplete, trace, context);
+    const retained = await retainedSources(bucket, now, migrationComplete, trace, context, previous);
     const original = retained.posts.find(post => post.id === postId);
     const post: StoredPost = { ...(original ?? { ...batch, title: 'Retracted batch', source: 'retraction' }), items: [], retracted_at: now.toISOString() };
     const key = `post-revisions/${postId}/${crypto.randomUUID()}.json`;
@@ -306,25 +311,40 @@ export async function retractPost(bucket: ContentBucket, postId: string, publish
     const posts = [...retained.posts.filter(post => post.id !== postId), post].sort((a, b) => order(reference(a), reference(b)));
     const omitted = retained.omitted.filter(ref => ref.id !== postId);
     await prepareHomepage(bucket, { version: 3, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}),
-      snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now });
+      snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, history: index, sources: retained.sources });
     await prepared.commit();
     emit('retract_result', context, { post_id: postId, publication_status: trace.publication_status, publication_outcome: 'retracted' });
     return { post_id: postId, status: 'retracted', retracted_at: post.retracted_at! };
   } catch (error) {
     throw new PublicationError(trace.publication_status, trace.failed_stage ?? trace.stage ?? 'retract_processing', error);
-  }
+  } finally { prepared.close(); }
 }
 
-export async function rebuildHomepage(bucket: ContentBucket, origin: string, trace = new OperationTrace(), migrationComplete = false, previous?: Publication): Promise<void> {
+export async function rebuildHomepage(bucket: ContentBucket, origin: string, trace = new OperationTrace(), migrationComplete = false, previous?: Publication,
+  work?: { jobId: string; checkpoint?: string }) {
+  const durable = bucket;
   const prepared = prepareWrites(bucket, trace);
   bucket = prepared.bucket;
-  previous ??= await trace.run('source_loading', () => currentPublication(bucket, migrationComplete ? async () => [] : undefined));
-  // Migration finishes before rendering; imported sources now have canonical keys.
-  const publication = { ...previous, posts: previous.posts.map(ref => ref.key.startsWith('digests/') ? { ...ref, key: postKey(ref) } : ref) };
-  const posts: StoredPost[] = [];
-  await trace.run('source_loading', async () => {
-    for (const ref of publication.posts) posts.push(await loadPost(bucket, ref));
-  });
-  await prepareHomepage(bucket, publication, posts, origin, previous, trace, { migrationComplete, allCards: true });
-  await prepared.commit();
+  try {
+    const snapshot = await committedSnapshot(bucket);
+    previous ??= await trace.run('source_loading', () => currentPublication(bucket, migrationComplete ? async () => [] : undefined, snapshot));
+    // Migration finishes before rendering; imported sources now have canonical keys.
+    const publication = { ...previous, posts: previous.posts.map(ref => ref.key.startsWith('digests/') ? { ...ref, key: postKey(ref) } : ref) };
+    const posts: StoredPost[] = [];
+    await trace.run('source_loading', async () => {
+      for (const ref of publication.posts) posts.push(await loadPost(bucket, ref));
+    });
+    const archives = work ? await rebuildArchives(durable, posts, publication, origin, trace, work.jobId, work.checkpoint) : undefined;
+    if (archives && !archives.complete) return archives;
+    await prepareHomepage(bucket, publication, posts, origin, previous, trace, { migrationComplete, allCards: true, archives: archives?.archives });
+    if (work) {
+      const current = await boundary('storage', () => durable.head('pages/index.html'));
+      // R2 ETags describe bytes, so metadata-only pointer changes must also rebase.
+      if (stableJson([current?.etag, current?.customMetadata]) !== stableJson([snapshot.index?.etag, snapshot.index?.customMetadata])) {
+        return { ...archives!, complete: false };
+      }
+    }
+    await prepared.commit();
+    return archives ?? { complete: true };
+  } finally { prepared.close(); }
 }

@@ -6,7 +6,7 @@ import { appendUpdate, currentPublication, loadPost, postKey, publishDigest, reb
 import { findBatch, loadHistoryIndex } from '../src/history-index';
 import { readPosts } from '../src/posts';
 import { fingerprint } from '../src/diagnostics';
-import { loadArchiveDay, loadCatalog } from '../src/archives';
+import { loadCatalog } from '../src/archives';
 import { localDate } from '../src/feed';
 import * as rendering from '../src/render';
 import type { AppendResult, ContentBucket, Digest, Env, PublishResult, StoredPost } from '../src/types';
@@ -220,9 +220,7 @@ describe('caller-scoped whole-batch retraction', () => {
     for (const path of ['/', '/rss.xml']) expect(await (await request(path)).text()).not.toContain('retract-me');
     for (const fields of ['full', 'index']) expect(await (await request(`/api/posts?days=30&fields=${fields}`)).json()).toMatchObject({ posts: [] });
     const publication = await currentPublication(bindings.SITE_BUCKET);
-    for (const [date, ref] of Object.entries((await loadCatalog(bindings.SITE_BUCKET, publication.archives)).days)) {
-      expect((await loadArchiveDay(bindings.SITE_BUCKET, date, ref)).stories).toEqual([]);
-    }
+    expect((await loadCatalog(bindings.SITE_BUCKET, publication.archives)).days).toEqual({});
     expect(await (await bindings.SITE_BUCKET.get(postKey(first.post!)))!.text()).toBe(original);
     expect((await loadPost(bindings.SITE_BUCKET, publication.posts[0])).items).toEqual([]);
     expect(await (await lookup('batch')).json()).toMatchObject({ post: first.post, status: 'retracted' });
@@ -285,12 +283,12 @@ describe('caller-scoped whole-batch retraction', () => {
     expect((await submit('race', 'corrected')).duplicate).toBe(false);
   });
 
-  it.each(['source_write', 'archive_day_write', 'history_index_write', 'manifest_write', 'rss_write', 'index_write'])('preserves the previous public batch after failed retraction at %s', async stage => {
+  it.each(['source_write', 'archive_catalog_write', 'history_index_write', 'manifest_write', 'rss_write', 'index_write'])('preserves the previous public batch after failed retraction at %s', async stage => {
     const first = await submit('atomic', 'atomic');
     const before = await currentPublication(bindings.SITE_BUCKET);
     const beforePage = await bindings.SITE_BUCKET.head('pages/index.html');
     const broken = wrap({ put: async (key, value, options) => {
-      if (stage === 'source_write' && key.startsWith('post-revisions/') || stage === 'archive_day_write' && key.startsWith('archive-days/')
+      if (stage === 'source_write' && key.startsWith('post-revisions/') || stage === 'archive_catalog_write' && key.startsWith('archive-catalogs/')
         || stage === 'history_index_write' && key.startsWith('history-index/') || stage === 'manifest_write' && key.startsWith('publications/') && key.endsWith('.json')
         || stage === 'rss_write' && key.endsWith('.rss.xml') || stage === 'index_write' && key === 'pages/index.html') throw new Error('injected retraction failure');
       return bindings.SITE_BUCKET.put(key, value, options);
@@ -341,7 +339,6 @@ describe('compact snapshots and atomic recovery', () => {
   });
 
   it.each(['source_write', 'history_index_write', 'manifest_write', 'rss_write', 'index_write'])('keeps failed publications private and leaves references retryable after %s', async stage => {
-    const before = await snapshot();
     const broken = wrap({ put: async (key, value, options) => {
       if (stage === 'source_write' && key.startsWith('posts/') || stage === 'history_index_write' && key.startsWith('history-index/')
         || stage === 'manifest_write' && key.startsWith('publications/') && key.endsWith('.json')
@@ -351,7 +348,7 @@ describe('compact snapshots and atomic recovery', () => {
     await expect(publishDigest(broken, input('failure', 'retry'), origin, new Date(), true)).rejects.toMatchObject({ stage, publication_status: stage === 'index_write' ? 'unknown' : 'not_committed' });
     expect((await lookup('retry')).status).toBe(404);
     expect((await currentPublication(bindings.SITE_BUCKET)).posts).toEqual([]);
-    if (stage === 'source_write') expect(await snapshot()).toEqual(before);
+    expect(await bindings.SITE_BUCKET.head('pages/index.html')).toBeNull();
     expect((await submit('failure', 'retry')).post).not.toBeNull();
   });
 

@@ -168,6 +168,7 @@ export interface RebuildJob {
   status: 'queued' | 'running' | 'completed' | 'failed';
   phase: 'migration' | 'render';
   processed: number;
+  archive_progress?: { completed_days: number; total_days: number };
   created_at: string;
   started_at?: string;
   finished_at?: string;

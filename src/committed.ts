@@ -1,14 +1,14 @@
 import { boundary, DamagedManifest, HttpError } from './errors';
 import { isDate, isTimestamp } from './validation';
+import { record, text } from './primitives';
 import type { ContentBucket, Publication } from './types';
 
-export const archiveUnavailable = () => new HttpError(503, 'News archives are temporarily unavailable. Please try again later.', { 'Retry-After': '60' });
+export const archiveUnavailable = () => new HttpError(503, 'News archives are damaged. An operator must repair them before retrying.', {}, { code: 'archive_damaged', retryable: false });
+export const legacyRecoveryRequired = () => new HttpError(503, 'Migration is complete but no committed manifest exists. An operator must restore or explicitly reconstruct the bootstrap manifest before retrying.', {}, { code: 'legacy_recovery_required', retryable: false });
 export const validArchiveKey = (key: unknown): key is string => typeof key === 'string' && /^archive-catalogs\/[a-f0-9]{64}\.json$/.test(key);
 export const isLegacyId = (id: string) => /^legacy-\d{4}-\d{2}-\d{2}$/.test(id) && isDate(id.slice(7));
-const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 
 function isPublication(value: unknown): value is Publication {
-  const text = (value: unknown): value is string => typeof value === 'string' && !!value.trim();
   const date = (value: unknown) => typeof value === 'string' && isDate(value);
   const refs = (value: unknown) => Array.isArray(value) && value.every(ref => record(ref)
     && text(ref.id) && text(ref.key) && date(ref.date) && isTimestamp(ref.received_at)
@@ -46,10 +46,10 @@ export async function committedSnapshot(bucket: ContentBucket) {
   const index = await boundary('storage', () => bucket.head('pages/index.html'));
   const key = index?.customMetadata?.manifest;
   const direct = index?.customMetadata?.archives;
-  if (direct !== undefined && !validArchiveKey(direct)) throw archiveUnavailable();
   let pending: Promise<unknown> | undefined;
   const read = () => pending ??= readManifest(bucket, key!);
   const archives = async (): Promise<string | undefined> => {
+    if (direct !== undefined && !validArchiveKey(direct)) throw archiveUnavailable();
     if (direct !== undefined || !key) return direct;
     try {
       const value = await read();
@@ -64,11 +64,12 @@ export async function committedSnapshot(bucket: ContentBucket) {
   return {
     index,
     archives,
-    async publication(): Promise<Publication | undefined> {
+    async publication(options: { archives?: boolean } = {}): Promise<Publication | undefined> {
+      if (options.archives !== false && direct !== undefined && !validArchiveKey(direct)) throw archiveUnavailable();
       if (!key) return;
       const value = await read();
       if (!isPublication(value)) throw new DamagedManifest(key, 'invalid_manifest');
-      return direct === undefined ? value : { ...value, archives: direct };
+      return direct === undefined || options.archives === false ? value : { ...value, archives: direct };
     },
     async metadata(): Promise<{ publishedAt?: string; archives?: string }> {
       const pointer = await archives();

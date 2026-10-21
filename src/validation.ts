@@ -1,5 +1,6 @@
 import type { Digest, DigestItem, StoredItem, StoryUpdate } from './types';
 import { boundary, declaredBodyBytes, HttpError, type ValidationIssue } from './errors';
+import { httpUrl as isHttpUrl } from './primitives';
 export { HttpError } from './errors';
 
 export function isDate(value: string): boolean {
@@ -48,10 +49,7 @@ function fields(message: string) {
   function httpUrl(input: unknown, path: string): string {
     const text = string(input, path);
     if (typeof input !== 'string' || !text.trim()) return text;
-    try {
-      const url = new URL(text);
-      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error();
-    } catch { invalid(path, 'invalid_url', 'Expected an absolute HTTP(S) URL without credentials.'); }
+    if (!isHttpUrl(text)) invalid(path, 'invalid_url', 'Expected an absolute HTTP(S) URL without credentials.');
     return text;
   }
   function timestamp(input: unknown, path: string): string {
