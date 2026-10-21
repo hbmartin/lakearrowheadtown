@@ -6,10 +6,10 @@ import { appendUpdate, currentPublication, loadPost, postKey, publishDigest, reb
 import { findBatch, loadHistoryIndex } from '../src/history-index';
 import { readPosts } from '../src/posts';
 import { fingerprint } from '../src/diagnostics';
-import { loadCatalog } from '../src/archives';
+import { loadCatalog, stableJson } from '../src/archives';
 import { localDate } from '../src/feed';
 import * as rendering from '../src/render';
-import type { AppendResult, ContentBucket, Digest, Env, PublishResult, StoredPost } from '../src/types';
+import type { AppendResult, ContentBucket, Digest, Env, Publication, PublishResult, StoredPost } from '../src/types';
 
 const bindings = env as unknown as Env;
 const origin = 'https://lakearrowhead.town';
@@ -147,6 +147,29 @@ describe('production-state previews', () => {
     }
     expect(publish).not.toHaveBeenCalled();
     expect(await snapshot()).toEqual([]);
+  });
+
+  it.each(['missing_rpc', 'missing_dry_run', 'missing_committed', 'invalid_checked_at', 'committed', 'unknown', 'not_committed'] as const)('keeps append preview boundaries safe for a %s reply', async scenario => {
+    const first = await submit();
+    const before = await snapshot(); const stateBefore = await durableState();
+    const appendUpdateV1 = vi.fn(); const publishV2 = vi.fn();
+    const result: Record<string, unknown> = { status: 'appended', post_id: first.post!.id, item_index: 0, update_index: 0,
+      message: 'Proposed update', dry_run: true, committed: false, checked_at: at.toISOString() };
+    if (scenario === 'missing_dry_run') delete result.dry_run;
+    if (scenario === 'missing_committed') delete result.committed;
+    if (scenario === 'invalid_checked_at') result.checked_at = 'not a timestamp';
+    const failure = ['committed', 'unknown', 'not_committed'].includes(scenario);
+    const previewAppendV1 = scenario === 'missing_rpc' ? undefined : vi.fn(async () => failure
+      ? { ok: false, failure: { status: 500, code: 'storage_error', error: 'Injected preview failure', retryable: true,
+        stage: 'source_loading', publication_status: scenario } }
+      : { ok: true, result });
+    const response = await request(`/api/posts/${first.post!.id}/items/0/updates?dry_run=true`, { method: 'POST', body: JSON.stringify(update()) }, {
+      PUBLISHER: { getByName: () => ({ appendUpdateV1, publishV2, previewAppendV1 }) } as unknown as Env['PUBLISHER'],
+    });
+    expect(response.status).toBe(failure ? 500 : 503);
+    expect(await response.json()).toMatchObject({ publication_status: 'not_attempted', dry_run: true, committed: false });
+    expect(appendUpdateV1).not.toHaveBeenCalled(); expect(publishV2).not.toHaveBeenCalled();
+    expect(await snapshot()).toEqual(before); expect(await durableState()).toEqual(stateBefore);
   });
 });
 
@@ -302,6 +325,21 @@ describe('caller-scoped whole-batch retraction', () => {
 });
 
 describe('compact snapshots and atomic recovery', () => {
+  it('reads fixed pre-refactor history bytes without changing their hash, URL acceptance, or serialization', async () => {
+    // History-index bytes in the pre-refactor 0ef1b33 format. Keep these bytes and
+    // the independently calculated SHA-256 literal; do not regenerate in the test.
+    const body = '{"batches":[{"client_ref":"Historical: café / A","date":"2026-10-19","id":"historical-v3","received_at":"2026-10-19T18:00:00.000Z"}],"posts":[{"client_ref":"Historical: café / A","date":"2026-10-19","items":[{"item_index":0,"last_received_at":"2026-10-20T18:00:00.000Z","latest_activity_at":"2026-10-20T10:00:00-07:00","post_url":"https://example.com/story?x=1&y=2","posted_at":"2026-10-19T10:30:00-07:00","updates":[{"post_url":"http://example.com/update#one","posted_at":"2026-10-20T10:00:00-07:00","received_at":"2026-10-20T18:00:00.000Z","update_index":0}]}],"post_id":"historical-v3","received_at":"2026-10-19T18:00:00.000Z"}],"version":1}';
+    const key = 'history-index/9cef83c97d8ea13224ad2d900a434bd8a34897753776802480f4bba7348c1e9c.json';
+    await bindings.SITE_BUCKET.put(key, body);
+    const publication: Publication = { version: 3, history_index: key, posts: [{ id: 'historical-v3', date: '2026-10-19',
+      key: 'posts/2026-10-19/historical-v3.json', received_at: '2026-10-19T18:00:00.000Z' }], snapshot_date: '2026-10-20', published_at: at.toISOString() };
+    const index = await loadHistoryIndex(bindings.SITE_BUCKET, publication);
+    expect(stableJson(index)).toBe(body);
+    expect(index.posts[0].items[0]).toMatchObject({ item_index: 0, post_url: 'https://example.com/story?x=1&y=2',
+      updates: [{ update_index: 0, post_url: 'http://example.com/update#one', posted_at: '2026-10-20T10:00:00-07:00' }] });
+    expect(findBatch(index, 'Historical: café / A', at)).toMatchObject({ status: 'published', post: { id: 'historical-v3', received_at: '2026-10-19T18:00:00.000Z' } });
+  });
+
   it('reads v3 compact indexes and references without fetching source bodies or exposing ownership', async () => {
     const first = await submit('story', 'compact'); await append(first.post!.id);
     const noSources = wrap({ get: async key => {

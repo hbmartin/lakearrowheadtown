@@ -2,7 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { appendUpdate, currentPublication, initialMigration, migrateBatch, PublicationError, publishDigest, rebuildHomepage, retractPost } from './publishing';
 import { findBatch, loadHistoryIndex } from './history-index';
 import { emit, OperationTrace, safeError } from './diagnostics';
-import { committedSnapshot, legacyRecoveryRequired } from './committed';
+import { committedSnapshot, legacyRecoveryRequired, type CommittedSnapshot } from './committed';
 import { asHttpError, boundary, publicationFailure } from './errors';
 import { readPosts, type PostsReply } from './posts';
 import type { AppendReply, BatchReply, Digest, Env, Migration, OperationContext, PublishFailure, PublishReply, RebuildJob, RetractReply, StoryUpdate } from './types';
@@ -46,21 +46,23 @@ export class DigestPublisher extends DurableObject<Env> {
   }
 
   private mutation<T>(operation: 'publish' | 'append' | 'retract' | 'preview', context: OperationContext | undefined,
-    action: (complete: boolean | undefined, context: OperationContext | undefined) => Promise<T>): Promise<{ ok: true; result: T } | { ok: false; failure: PublishFailure }> {
+    action: (complete: boolean | undefined, context: OperationContext | undefined, snapshot?: CommittedSnapshot) => Promise<T>): Promise<{ ok: true; result: T } | { ok: false; failure: PublishFailure }> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
         const migration = await new OperationTrace(context).run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
+        let snapshot: CommittedSnapshot | undefined;
         // Internal publishing helpers may bootstrap a new bucket; only persisted
         // completion establishes that losing its manifest requires operator repair.
         if (migration?.complete) {
           try {
             await new OperationTrace(context).run('source_loading', async () => {
-              if (!(await committedSnapshot(this.env.SITE_BUCKET)).index?.customMetadata?.manifest) throw legacyRecoveryRequired();
+              snapshot = await committedSnapshot(this.env.SITE_BUCKET);
+              if (!snapshot.index?.customMetadata?.manifest) throw legacyRecoveryRequired();
             });
           } catch (error) { throw new PublicationError('not_committed', 'source_loading', error); }
         }
-        return { ok: true, result: await action(migration?.complete, context) };
+        return { ok: true, result: await action(migration?.complete, context, snapshot) };
       } catch (error) {
         const stage = error instanceof PublicationError ? error.stage : 'migration_state';
         const publication_status = operation === 'preview' ? 'not_attempted' : error instanceof PublicationError ? error.publication_status : 'not_committed';
@@ -73,19 +75,19 @@ export class DigestPublisher extends DurableObject<Env> {
   }
 
   async publishV2(digest: Digest, origin: string, context?: OperationContext, publisherFingerprint?: string): Promise<PublishReply> {
-    return this.mutation('publish', context, (complete, executing) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing, { publisherFingerprint }));
+    return this.mutation('publish', context, (complete, executing, snapshot) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing, { publisherFingerprint, snapshot }));
   }
 
   async previewDigestV1(digest: Digest, origin: string, context?: OperationContext): Promise<PublishReply> {
-    return this.mutation('preview', context, (complete, executing) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing, { dryRun: true }));
+    return this.mutation('preview', context, (complete, executing, snapshot) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing, { dryRun: true, snapshot }));
   }
 
   async previewAppendV1(postId: string, itemIndex: number, update: StoryUpdate, origin: string, context?: OperationContext): Promise<AppendReply> {
-    return this.mutation('preview', context, (complete, executing) => appendUpdate(this.env.SITE_BUCKET, postId, itemIndex, update, origin, new Date(), complete, executing, { dryRun: true }));
+    return this.mutation('preview', context, (complete, executing, snapshot) => appendUpdate(this.env.SITE_BUCKET, postId, itemIndex, update, origin, new Date(), complete, executing, { dryRun: true, snapshot }));
   }
 
   async retractPostV1(postId: string, publisherFingerprint: string, origin: string, context?: OperationContext): Promise<RetractReply> {
-    return this.mutation('retract', context, (complete, executing) => retractPost(this.env.SITE_BUCKET, postId, publisherFingerprint, origin, new Date(), complete, executing));
+    return this.mutation('retract', context, (complete, executing, snapshot) => retractPost(this.env.SITE_BUCKET, postId, publisherFingerprint, origin, new Date(), complete, executing, snapshot));
   }
 
   async findBatchV1(clientRef: string, context?: OperationContext): Promise<BatchReply> {
@@ -104,7 +106,7 @@ export class DigestPublisher extends DurableObject<Env> {
   }
 
   async appendUpdateV1(postId: string, itemIndex: number, update: StoryUpdate, origin: string, context?: OperationContext): Promise<AppendReply> {
-    return this.mutation('append', context, (complete, executing) => appendUpdate(this.env.SITE_BUCKET, postId, itemIndex, update, origin, new Date(), complete, executing));
+    return this.mutation('append', context, (complete, executing, snapshot) => appendUpdate(this.env.SITE_BUCKET, postId, itemIndex, update, origin, new Date(), complete, executing, { snapshot }));
   }
 
   private cursorKey?: Promise<string>;

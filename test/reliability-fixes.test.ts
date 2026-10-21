@@ -27,8 +27,8 @@ const request = (path: string, body?: unknown) => worker.fetch(new Request(origi
 const store = (overrides: Partial<ContentBucket> = {}): ContentBucket => ({ get: key => bindings.SITE_BUCKET.get(key), head: key => bindings.SITE_BUCKET.head(key),
   put: (key, body, options) => bindings.SITE_BUCKET.put(key, body, options), list: options => bindings.SITE_BUCKET.list(options), ...overrides });
 const catalog = async () => loadCatalog(bindings.SITE_BUCKET, (await currentPublication(bindings.SITE_BUCKET)).archives);
-async function jsonObject(prefix: string, value: unknown) {
-  const body = stableJson(value); const key = `${prefix}/${fingerprint(body)}.json`;
+async function jsonObject(prefix: string, value: unknown, pretty = false) {
+  const body = pretty ? JSON.stringify(value, null, 2) : stableJson(value); const key = `${prefix}/${fingerprint(body)}.json`;
   await bindings.SITE_BUCKET.put(key, body); return key;
 }
 async function commitCatalog(value: ArchiveCatalog) {
@@ -39,7 +39,7 @@ async function commitCatalog(value: ArchiveCatalog) {
   await bindings.SITE_BUCKET.put(manifest, JSON.stringify({ ...publication, archives }));
   await bindings.SITE_BUCKET.put('pages/index.html', await page.text(), { httpMetadata: page.httpMetadata, customMetadata: { ...page.customMetadata, manifest, archives } });
 }
-async function seedArchives(count = 23) {
+async function seedArchives(count = 23, pretty = false) {
   const first = await publishDigest(bindings.SITE_BUCKET, digest(), origin, at, true, undefined, { publisherFingerprint: owner });
   const value = await catalog();
   const png = await (await bindings.SITE_BUCKET.get(value.days['2026-10-20'].image.slice(1)))!.arrayBuffer();
@@ -49,7 +49,7 @@ async function seedArchives(count = 23) {
     const day: ArchiveDay = { date, images: {}, stories: [{ postId, itemIndex: 0, date, activity, timestamp: Date.parse(activity), item: digest(postId, activity).items[0] }] };
     const image = `/assets/daily/${fingerprint(date)}.png`;
     await bindings.SITE_BUCKET.put(image.slice(1), png); // Legacy card without cardInputHash.
-    value.days[date] = { key: await jsonObject('archive-days', day), image, cardVersion: social.DAILY_CARD_VERSION, identities: [`${postId}:0`], modified: activity };
+    value.days[date] = { key: await jsonObject('archive-days', day, pretty), image, cardVersion: social.DAILY_CARD_VERSION, identities: [`${postId}:0`], modified: activity };
   }
   await commitCatalog(value);
   return first;
@@ -103,6 +103,36 @@ describe('safe requests and repair contracts', () => {
     await publisher().resumeRebuild(job.id);
     expect(await finish(job.id)).toMatchObject({ status: 'completed' });
     expect((await currentPublication(bindings.SITE_BUCKET)).posts[0].id).toBe(first.post!.id);
+  });
+
+  it.each(['publish', 'append', 'retract', 'preview_digest', 'preview_append'] as const)('blocks %s without reads, discovery, or writes when a completed migration loses its manifest', async operation => {
+    const first = await (await request('/api/digests', digest())).json<PublishResult>();
+    const page = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
+    const { manifest: _manifest, ...metadata } = page.customMetadata!;
+    await bindings.SITE_BUCKET.put('pages/index.html', await page.text(), { customMetadata: metadata });
+    const spies: { mockRestore(): void }[] = [];
+    const forbidden = vi.fn();
+    await inPublisher(publisher(), async (instance, state) => {
+      await state.storage.put('migration', { complete: true, processed: 1 });
+      for (const method of ['get', 'list', 'put'] as const) {
+        const original = instance.env.SITE_BUCKET[method].bind(instance.env.SITE_BUCKET);
+        spies.push(vi.spyOn(instance.env.SITE_BUCKET, method).mockImplementation((...args: any[]) => { forbidden(); return original(...args); }));
+      }
+      const put = state.storage.put.bind(state.storage);
+      spies.push(vi.spyOn(state.storage, 'put').mockImplementation((...args: any[]) => { forbidden(); return (put as any)(...args); }));
+    });
+    const preview = operation.startsWith('preview');
+    const path = operation === 'publish' || operation === 'preview_digest' ? '/api/digests'
+      : operation === 'retract' ? `/api/posts/${first.post!.id}/retract` : `/api/posts/${first.post!.id}/items/0/updates`;
+    const payload = operation === 'publish' || operation === 'preview_digest' ? digest('Blocked')
+      : { group: 'Group', body: 'Blocked update', post_url: `${origin}/blocked-update`, posted_at: at.toISOString() };
+    try {
+      const response = await request(path + (preview ? '?dry_run=true' : ''), payload);
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ code: 'legacy_recovery_required', retryable: false,
+        publication_status: preview ? 'not_attempted' : 'not_committed', ...(preview ? { dry_run: true, committed: false } : {}) });
+      expect(forbidden).not.toHaveBeenCalled();
+    } finally { for (const spy of spies) spy.mockRestore(); }
   });
 
   it('isolates batch lookup from a damaged direct archive pointer, but keeps mutations and archive reads closed', async () => {
@@ -174,6 +204,46 @@ describe('safe requests and repair contracts', () => {
 });
 
 describe('bounded resumable archive rebuilds', () => {
+  it('renders one day at a time and persists its image, JSON, and receipt before starting the next day', async () => {
+    await seedArchives(12, true);
+    const order: string[] = []; let active = 0; let peak = 0;
+    const render = vi.spyOn(social, 'dailyCard').mockImplementation(async (date, headline) => {
+      order.push(`render:${date}`); active++; peak = Math.max(peak, active);
+      try {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        return new TextEncoder().encode(date + headline);
+      } finally { active--; }
+    });
+    const job = await publisher().enqueueRebuild(origin);
+    let restore!: () => void;
+    const receipts = new Map<string, { key: string; image: string }>();
+    await inPublisher(publisher(), async instance => {
+      const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+      const spy = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation(async (key: any, body: any, options: any) => {
+        const result = await put(key, body, options);
+        order.push(`saved:${key}`);
+        const date = /\/days\/(\d{4}-\d{2}-\d{2})\//.exec(key)?.[1];
+        if (date) receipts.set(date, JSON.parse(body).result.reference);
+        return result;
+      });
+      restore = () => spy.mockRestore();
+    });
+    try { await runDurableObjectAlarm(publisher()); } finally { restore(); }
+    expect(peak).toBe(1); expect(active).toBe(0);
+    expect(render).toHaveBeenCalledTimes(10); expect(receipts.size).toBe(10);
+    expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'running', archive_progress: { completed_days: 10, total_days: 13 } });
+    for (const [i, [date]] of render.mock.calls.entries()) {
+      const ref = receipts.get(date)!;
+      const imageSaved = order.indexOf(`saved:${ref.image.slice(1)}`);
+      const daySaved = order.indexOf(`saved:${ref.key}`);
+      const receiptSaved = order.findIndex(entry => entry.startsWith('saved:rebuild-work/') && entry.includes(`/days/${date}/`));
+      expect(imageSaved).toBeGreaterThan(order.indexOf(`render:${date}`));
+      expect(daySaved).toBeGreaterThan(order.indexOf(`render:${date}`));
+      expect(receiptSaved).toBeGreaterThan(Math.max(imageSaved, daySaved));
+      if (i + 1 < render.mock.calls.length) expect(receiptSaved).toBeLessThan(order.indexOf(`render:${render.mock.calls[i + 1][0]}`));
+    }
+  });
+
   it('rechecks metadata-only snapshot changes after rendering and before committing', async () => {
     await publishDigest(bindings.SITE_BUCKET, digest(), origin, at, true);
     const original = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
@@ -192,6 +262,7 @@ describe('bounded resumable archive rebuilds', () => {
 
   it('checkpoints ten days per alarm, survives eviction, and preserves interleaved publications and retractions', async () => {
     const first = await seedArchives();
+    const survivor = await publishDigest(bindings.SITE_BUCKET, digest('Survivor'), origin, at, true);
     const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!.etag;
     const render = vi.spyOn(social, 'dailyCard').mockImplementation(async (date, headline) => new TextEncoder().encode(date + headline));
     const job = await publisher().enqueueRebuild(origin, context);
@@ -200,8 +271,11 @@ describe('bounded resumable archive rebuilds', () => {
     expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'running', archive_progress: { completed_days: 10, total_days: 24 } });
     expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.etag).toBe(before);
     await evictDurableObject(publisher());
-    expect((await request('/api/digests', digest('Newer'))).status).toBe(200);
-    expect((await request(`/api/posts/${first.post!.id}/items/0/updates`, { group: 'Group', post_url: `${origin}/update`, body: 'New update', posted_at: at.toISOString() })).status).toBe(200);
+    const newer = await request('/api/digests', digest('Newer'));
+    expect(newer.status).toBe(200);
+    const newerPost = await newer.json<PublishResult>();
+    const update = { group: 'Group', post_url: `${origin}/surviving-update`, body: 'Surviving update', posted_at: at.toISOString() };
+    expect((await request(`/api/posts/${survivor.post!.id}/items/0/updates`, update)).status).toBe(200);
     expect((await request(`/api/posts/${first.post!.id}/retract`, {})).status).toBe(200);
     const latest = (await bindings.SITE_BUCKET.head('pages/index.html'))!.etag;
     const rendersBeforeNextAlarm = render.mock.calls.length;
@@ -211,9 +285,26 @@ describe('bounded resumable archive rebuilds', () => {
     expect(await finish(job.id)).toMatchObject({ status: 'completed', archive_progress: { completed_days: 24, total_days: 24 } });
     expect(render).toHaveBeenCalledTimes(rendersBeforeNextAlarm + 13);
     const html = await (await request('/')).text();
-    expect(html).toContain('Newer'); expect(html).not.toContain('>Original</a>'); expect(html).not.toContain('New update');
+    expect(html).toContain('Newer'); expect(html).not.toContain('>Original</a>'); expect(html).toContain(update.body);
     const publication = await currentPublication(bindings.SITE_BUCKET);
     expect((await loadPost(bindings.SITE_BUCKET, publication.posts.find(post => post.id === first.post!.id)!)).retracted_at).toBeTruthy();
+    const stored = await loadPost(bindings.SITE_BUCKET, publication.posts.find(post => post.id === survivor.post!.id)!);
+    expect(stored.items[0].updates).toMatchObject([update]);
+    const value = await catalog();
+    const day = await loadArchiveDay(bindings.SITE_BUCKET, '2026-10-20', value.days['2026-10-20']);
+    expect(day.stories.find(story => story.postId === survivor.post!.id)!.item.updates).toMatchObject([update]);
+    expect(day.stories.some(story => story.postId === newerPost.post!.id)).toBe(true);
+    expect(day.stories.some(story => story.postId === first.post!.id)).toBe(false);
+    expect(await (await request('/rss.xml')).text()).toContain(update.body);
+    for (const fields of ['full', 'index']) {
+      const read = await (await request(`/api/posts?days=30&fields=${fields}`)).json<any>();
+      const story = read.posts.find((post: any) => post.post_id === survivor.post!.id).items[0];
+      expect(story).toMatchObject({ item_index: 0, updates: [{ update_index: 0, post_url: update.post_url, posted_at: update.posted_at }] });
+      if (fields === 'full') expect(story.updates[0].body).toBe(update.body);
+      else expect(story.updates[0]).not.toHaveProperty('body');
+      expect(read.posts.some((post: any) => post.post_id === newerPost.post!.id)).toBe(true);
+      expect(read.posts.some((post: any) => post.post_id === first.post!.id)).toBe(false);
+    }
     expect(events.filter(event => event.event === 'operation_stage' && ['rebuild_finalize', 'rebuild_failure_record'].includes(event.stage)).every(event => event.phase === undefined)).toBe(true);
     expect(JSON.stringify(await publisher().jobStatus(job.id))).not.toContain('rebuild-work/');
   });
@@ -262,9 +353,95 @@ describe('bounded resumable archive rebuilds', () => {
     expect(render.mock.calls.length).toBe(stage === 'archive_image_write' ? 13 : 12);
     expect(events.filter(event => event.event === 'operation_stage' && event.stage === 'rebuild_failure_record').every(event => event.phase === undefined)).toBe(true);
   });
+
+  it.each(['archive_day_write', 'rebuild_day_checkpoint', 'rebuild_archive_progress', 'archive_catalog_write'] as const)('recovers after %s without losing completed work or committing partial results', async stage => {
+    await seedArchives(12, true);
+    const render = vi.spyOn(social, 'dailyCard').mockImplementation(async (date, headline) => new TextEncoder().encode(date + headline));
+    const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
+    const job = await publisher().enqueueRebuild(origin, context);
+    let injected = false; let restore!: () => void;
+    await inPublisher(publisher(), async (instance, state) => {
+      const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+      const putSpy = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation(async (key: any, body: any, options: any) => {
+        // Fail the second historical day so the first has a durable receipt.
+        const target = stage === 'archive_day_write' ? key.startsWith('archive-days/') && new TextDecoder().decode(body).includes('2026-08-02')
+          : stage === 'rebuild_day_checkpoint' ? key.includes('/days/2026-08-02/')
+          : stage === 'archive_catalog_write' && key.startsWith('archive-catalogs/');
+        if (target && !injected) { injected = true; throw new Error('Injected work persistence failure'); }
+        return put(key, body, options);
+      });
+      const transaction = state.storage.transaction.bind(state.storage);
+      const transactionSpy = vi.spyOn(state.storage, 'transaction').mockImplementation(callback => transaction(async storage => {
+        const proxy = new Proxy(storage, { get(target, property) {
+          if (property === 'put') return (...args: any[]) => {
+            if (stage === 'rebuild_archive_progress' && args[0] === `rebuild:${job.id}` && !injected) {
+              injected = true; throw new Error('Injected Durable Object checkpoint failure');
+            }
+            return (target.put as any)(...args);
+          };
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        } });
+        return callback(proxy);
+      }));
+      restore = () => { putSpy.mockRestore(); transactionSpy.mockRestore(); };
+    });
+    try {
+      await runDurableObjectAlarm(publisher());
+      if (stage === 'archive_catalog_write') await runDurableObjectAlarm(publisher());
+    } finally { restore(); }
+    expect(injected).toBe(true);
+    expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'failed', failed_stage: stage });
+    const unchanged = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
+    expect(unchanged.etag).toBe(before.etag); expect(unchanged.customMetadata).toEqual(before.customMetadata);
+    const previousRenders = render.mock.calls.map(([date]) => date);
+    expect(previousRenders.filter(date => date === '2026-08-01')).toHaveLength(1);
+    await publisher().resumeRebuild(job.id); await evictDurableObject(publisher());
+    expect(await finish(job.id)).toMatchObject({ status: 'completed' });
+    // Only the interrupted day can repeat; all days with receipts survive eviction.
+    const repeatedDay = stage === 'archive_day_write' || stage === 'rebuild_day_checkpoint';
+    expect(render).toHaveBeenCalledTimes(repeatedDay ? 13 : 12);
+    for (const date of new Set(previousRenders)) {
+      expect(render.mock.calls.filter(([rendered]) => rendered === date)).toHaveLength(repeatedDay && date === '2026-08-02' ? 2 : 1);
+    }
+    const committed = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
+    expect(committed.customMetadata!.manifest).not.toBe(before.customMetadata!.manifest);
+    expect(Object.keys((await catalog()).days)).toHaveLength(13);
+  });
 });
 
 describe('publication I/O', () => {
+  it.each(['publish', 'append', 'retract', 'preview_digest', 'preview_append'] as const)('shares the migration guard snapshot throughout the %s RPC', async operation => {
+    const first = await (await request('/api/digests', digest())).json<PublishResult>();
+    const stub = publisher();
+    await inPublisher(stub, async (_instance, state) => state.storage.put('migration', { complete: true, processed: 1 }));
+    const reads = new Map<string, number>(); const heads = new Map<string, number>();
+    const spies: { mockRestore(): void }[] = [];
+    await inPublisher(stub, async instance => {
+      const bucket = instance.env.SITE_BUCKET;
+      const get = bucket.get.bind(bucket); const head = bucket.head.bind(bucket);
+      spies.push(vi.spyOn(bucket, 'get').mockImplementation((key: any) => {
+        reads.set(key, (reads.get(key) ?? 0) + 1); return get(key);
+      }), vi.spyOn(bucket, 'head').mockImplementation((key: any) => {
+        heads.set(key, (heads.get(key) ?? 0) + 1); return head(key);
+      }));
+    });
+    const update = { group: 'Group', body: 'Surviving update', post_url: `${origin}/rpc-update`, posted_at: at.toISOString() };
+    try {
+      const reply = await ({
+        publish: () => stub.publishV2({ ...digest('Next'), client_ref: 'rpc-next' }, origin),
+        append: () => stub.appendUpdateV1(first.post!.id, 0, update, origin),
+        retract: () => stub.retractPostV1(first.post!.id, owner, origin),
+        preview_digest: () => stub.previewDigestV1({ ...digest('Next'), client_ref: 'rpc-next' }, origin),
+        preview_append: () => stub.previewAppendV1(first.post!.id, 0, update, origin),
+      })[operation]();
+      expect(reply.ok).toBe(true);
+      expect(heads.get('pages/index.html')).toBe(1);
+      expect([...reads.keys()].some(key => key.startsWith('publications/'))).toBe(true);
+      for (const [key, count] of reads) if (/^(publications|posts|post-revisions|history-index)\//.test(key)) expect(count, key).toBe(1);
+    } finally { for (const spy of spies) spy.mockRestore(); }
+  });
+
   it('loads each manifest, source and history index once for retraction and client_ref publishing', async () => {
     const first = await publishDigest(bindings.SITE_BUCKET, digest(), origin, at, true, undefined, { publisherFingerprint: owner });
     for (const action of [
