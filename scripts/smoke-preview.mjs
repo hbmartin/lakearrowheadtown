@@ -7,6 +7,12 @@ import { SaxesParser } from 'saxes';
 import { readCredential, validateCredential } from './credentials.mjs';
 import { maintenance, maintenanceTarget } from './maintenance.mjs';
 
+export function checkHtmlHeaders(response) {
+  assert(response.headers.get('ETag')?.startsWith('W/'), 'HTML must expose a weak ETag');
+  assert.equal(response.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate, no-transform');
+  assert(response.headers.get('Vary')?.split(',').some(value => value.trim().toLowerCase() === 'accept-encoding'), 'HTML must vary on Accept-Encoding');
+}
+
 export function checkRssHeaders(response) {
   const contentType = response.headers.get('Content-Type');
   if (response.status !== 304 || contentType !== null) assert.equal(contentType, 'application/rss+xml; charset=utf-8');
@@ -61,12 +67,16 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     if (attempt === 2) { input.items[0].post_url += '&followup=1'; input.client_ref += ':followup'; }
     const beforePreview = await fetch(origin, { method: 'HEAD' });
     assert.equal(beforePreview.status, 200);
+    checkHtmlHeaders(beforePreview);
     const preview = await fetch(`${origin}/api/digests?dry_run=true`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
     assert.equal(preview.status, 200, await preview.clone().text());
     const planned = await preview.json();
     assert.equal(planned.dry_run, true); assert.equal(planned.committed, false); assert(planned.checked_at);
     assert.equal(planned.counts.published, attempt === 1 ? 0 : 1);
-    assert.equal((await fetch(origin, { method: 'HEAD', headers: { 'If-None-Match': beforePreview.headers.get('etag') } })).status, 304);
+    const unchanged = await fetch(origin, { method: 'HEAD', headers: { 'If-None-Match': beforePreview.headers.get('etag') } });
+    assert.equal(unchanged.status, 304);
+    checkHtmlHeaders(unchanged);
+    assert.equal(unchanged.headers.get('ETag'), beforePreview.headers.get('ETag'));
     const response = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
     assert.equal(response.status, 200, await response.clone().text());
     const result = await response.json();
@@ -89,6 +99,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert.equal(batch.post.id, attempt === 1 ? story.post_id : result.post.id);
     const homepage = await fetch(origin, { headers: { 'Accept-Encoding': 'gzip', ...(previousTag ? { 'If-None-Match': previousTag } : {}) } });
     assert.equal(homepage.status, attempt === 1 ? 304 : 200, 'Duplicates must preserve the homepage and ETag');
+    checkHtmlHeaders(homepage);
     const rss = await fetch(`${origin}/rss.xml`, { headers: previousRssTag ? { 'If-None-Match': previousRssTag } : {} });
     assert.equal(rss.status, attempt === 1 ? 304 : 200, 'RSS must change with publications and remain unchanged for duplicates');
     checkRssHeaders(rss);
@@ -231,6 +242,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const dailyPath = seoHtml.match(/<h2 id="day-[^"]+"><a href="(\/\d{4}\/\d{2}\/\d{2}\/)"/)[1];
   const daily = await fetch(origin + dailyPath);
   assert.equal(daily.status, 200);
+  checkHtmlHeaders(daily);
   const dailyHtml = await daily.text();
   assert(dailyHtml.includes(`<link rel="canonical" href="${origin}${dailyPath}">`));
   assert.match(dailyHtml, /<title>Lake Arrowhead news — /);
@@ -241,10 +253,12 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const cardBytes = Buffer.from(await card.arrayBuffer());
   assert.equal(cardBytes.readUInt32BE(16), 1200); assert.equal(cardBytes.readUInt32BE(20), 630);
   const archive = await fetch(`${origin}/archive/`);
+  checkHtmlHeaders(archive);
   assert.equal(archive.status, 200); assert((await archive.text()).includes(dailyPath));
   for (const path of ['/road-conditions/', '/power-outages/', '/emergency-resources/']) {
     const page = await fetch(origin + path);
     assert.equal(page.status, 200); assert.equal(page.headers.get('X-Robots-Tag'), 'noindex');
+    checkHtmlHeaders(page);
     assert((await page.text()).includes(`<link rel="canonical" href="${origin}${path}">`));
   }
   const font = await fetch(`${origin}/assets/fonts/dm-sans-v1.woff2`);

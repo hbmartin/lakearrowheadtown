@@ -851,7 +851,9 @@ describe('images and public serving', () => {
     }
     await bindings.SITE_BUCKET.put('pages/index.html', 'old', { httpMetadata: { cacheControl: 'public, max-age=86400, no-transform' } });
     const updated = await fetch('/');
-    expect(updated.headers.get('Cache-Control')).toBe('public, max-age=0, must-revalidate');
+    expect(updated.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
+    expect(updated.headers.get('Cache-Control')).toBe('public, max-age=0, must-revalidate, no-transform');
+    expect(updated.headers.get('Vary')).toBe('Accept-Encoding');
     expect(updated.headers.get('Cloudflare-CDN-Cache-Control')).toBe('no-store');
     await updated.text();
   });

@@ -4,6 +4,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { matchesEtag, parseIfNoneMatch } from './conditions';
 import { hashBytes, IMAGE_CACHE, imageUpload, withImageUploadSlot } from './images';
 import { HTML_CACHE } from './publishing';
+import { htmlResponse } from './html-response';
 import { renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
 import { isPostsReply } from './posts';
@@ -90,7 +91,7 @@ async function publicObject(request: Request, env: Env, key: string, type: 'html
     return emptyResponse(request, originFor(request, env));
   }
   object.writeHttpMetadata(headers);
-  if (type === 'rss') headers.set('Content-Type', RSS_TYPE);
+  if (!image) headers.set('Content-Type', type === 'rss' ? RSS_TYPE : 'text/html; charset=utf-8');
   // Serving policy overrides metadata on older stored objects too.
   headers.set('Cache-Control', image ? IMAGE_CACHE : HTML_CACHE);
   const etag = image ? object.httpEtag : `W/"${object.etag}"`;
@@ -342,7 +343,7 @@ export default {
     const context: OperationContext = { request_id: crypto.randomUUID(), worker_version: env.CF_VERSION_METADATA?.id ?? 'local', environment: env.ENVIRONMENT ?? 'local', operation: route.operation,
       ...(ray && /^[a-f0-9]{16,32}(?:-[A-Z]{3})?$/.test(ray) ? { cf_ray: ray } : {}) };
     const state: RequestState = { context, trace: new OperationTrace(context) };
-    const response = await handle(request, env, state);
+    const response = htmlResponse(request, await handle(request, env, state));
     if (path === '/api' || path.startsWith('/api/')) {
       response.headers.set('X-Request-ID', context.request_id);
       response.headers.set('X-Worker-Version', context.worker_version);
