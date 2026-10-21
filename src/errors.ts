@@ -77,7 +77,7 @@ export function publicationFailure(error: unknown, stage: string, publication_st
   const retryable = publication_status === 'unknown' || failure.retryable;
   const message = publication_status === 'unknown' ? operation === 'retract'
     ? 'Unable to confirm retraction; it may have completed. Reconcile the batch status or retry promptly with the original token. A first retraction must commit within 24 hours of the original batch receipt.' : UNKNOWN_PUBLICATION
-    : publication_status === 'committed' ? 'Publication committed, but subsequent processing failed. Use the request ID to contact the operator.'
+    : publication_status === 'committed' ? `${operation === 'retract' ? 'Retraction' : 'Publication'} committed, but subsequent processing failed. Use the request ID to contact the operator.`
     : retryable ? operation === 'retract'
       ? 'Retraction did not commit. Retry promptly with the original token within 24 hours of the original batch receipt; after that deadline contact the operator.'
       : 'Publication did not commit. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.'

@@ -33,9 +33,10 @@ export const validImageMetadata = (value: ImageMetadata): boolean => !!value && 
 
 export type ImageResolver = (items: StoredItem[]) => Promise<ImageMetadataMap>;
 
-// One resolver belongs to one publication, including its archive seed and homepage.
-export function createImageResolver(bucket: ContentBucket, origin: string): ImageResolver {
-  const cache = new Map<string, Promise<ImageMetadata | undefined>>();
+// Share values and admission across staging views, never the views themselves.
+// The owner discards this state after one publication or rebuild alarm.
+export function createImageResolutionCache() {
+  const entries = new Map<string, Promise<ImageMetadata | undefined>>();
   let active = 0;
   const waiting: Array<() => void> = [];
   async function limited<T>(action: () => Promise<T>): Promise<T> {
@@ -48,6 +49,12 @@ export function createImageResolver(bucket: ContentBucket, origin: string): Imag
       else active--;
     }
   }
+  return { entries, limited };
+}
+export type ImageResolutionCache = ReturnType<typeof createImageResolutionCache>;
+
+// One cache belongs to one publication, including its archive seed and homepage.
+export function createImageResolver(bucket: ContentBucket, origin: string, cache = createImageResolutionCache()): ImageResolver {
   async function read(path: string, hash: string): Promise<ImageMetadata | undefined> {
     const key = metadataKey(hash);
     const saved = await boundary('storage', () => bucket.get(key));
@@ -74,10 +81,10 @@ export function createImageResolver(bucket: ContentBucket, origin: string): Imag
       const match = /^\/images\/([a-f0-9]{64})\.(jpg|png|gif|webp)$/.exec(parsed.pathname);
       if (parsed.origin !== origin || !match) return;
       const path = parsed.pathname.slice(1);
-      let pending = cache.get(path);
+      let pending = cache.entries.get(path);
       if (!pending) {
-        pending = limited(() => read(path, match[1]));
-        cache.set(path, pending);
+        pending = cache.limited(() => read(path, match[1]));
+        cache.entries.set(path, pending);
       }
       const value = await pending;
       if (value) result[url] = value;

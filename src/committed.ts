@@ -87,3 +87,7 @@ export async function committedSnapshot(bucket: ContentBucket) {
 }
 
 export type CommittedSnapshot = Awaited<ReturnType<typeof committedSnapshot>>;
+
+export function requireCommittedManifest(snapshot: CommittedSnapshot): void {
+  if (!snapshot.index?.customMetadata?.manifest) throw legacyRecoveryRequired();
+}

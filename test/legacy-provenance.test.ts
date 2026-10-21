@@ -74,11 +74,14 @@ it('shares one paginated bootstrap discovery and still discovers late arrivals o
   const list = vi.fn(async (options?: R2ListOptions): Promise<R2Objects> => ({
     objects: [all[options?.cursor ? 1 : 0]], truncated: !options?.cursor, cursor: options?.cursor ? undefined : 'next', delimitedPrefixes: [],
   } as R2Objects));
-  await publishDigest(store({ list }), digest('First'), origin, now);
+  // Legacy eligibility uses R2 receipt dates, not the fixed source-post dates.
+  const bootstrapTime = new Date(Math.max(...all.map(object => object.uploaded.getTime())));
+  await publishDigest(store({ list }), digest('First'), origin, bootstrapTime);
   expect(list).toHaveBeenCalledTimes(2); // One traversal, not one traversal per consumer.
   expect((await currentPublication(bindings.SITE_BUCKET)).posts).toHaveLength(3);
   await bindings.SITE_BUCKET.put('digests/2026-08-03.json', JSON.stringify(digest('Late')));
-  await publishDigest(bindings.SITE_BUCKET, digest('Next'), origin, now);
+  const lateReceipt = (await bindings.SITE_BUCKET.head('digests/2026-08-03.json'))!.uploaded;
+  await publishDigest(bindings.SITE_BUCKET, digest('Next'), origin, new Date(Math.max(bootstrapTime.getTime(), lateReceipt.getTime())));
   const publication = await currentPublication(bindings.SITE_BUCKET);
   expect(publication.version).toBe(3);
   expect(publication.posts.some(ref => ref.id === 'legacy-2026-08-03')).toBe(true);
