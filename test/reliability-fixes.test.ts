@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { evictDurableObject, reset, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import worker from '../src/worker';
 import { currentPublication, loadPost, publishDigest, rebuildHomepage, retractPost } from '../src/publishing';
 import { loadCatalog, loadArchiveDay, stableJson, type ArchiveCatalog, type ArchiveDay } from '../src/archives';
@@ -332,6 +332,11 @@ describe('bounded resumable archive rebuilds', () => {
   });
 
   it('checkpoints ten days per alarm, survives eviction, and preserves interleaved publications and retractions', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(at);
+    // Keep platform alarm scheduling on the real clock while requests use the fixture date.
+    vi.spyOn(Date, 'now').mockImplementation(vi.getRealSystemTime);
+    onTestFinished(() => { vi.useRealTimers(); });
     const first = await seedArchives();
     const survivor = await publishDigest(bindings.SITE_BUCKET, digest('Survivor'), origin, at, true);
     const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!.etag;
