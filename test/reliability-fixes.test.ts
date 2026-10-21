@@ -59,6 +59,7 @@ async function finish(id: string) {
   for (let i = 0; i < 12; i++) {
     const status = await publisher().jobStatus(id);
     if (status?.status === 'completed' || status?.status === 'failed') return status;
+    if (status?.next_retry_at) vi.setSystemTime(new Date(status.next_retry_at));
     await runDurableObjectAlarm(publisher());
   }
   throw new Error('Rebuild did not finish within the test budget');
@@ -600,7 +601,7 @@ describe('publication I/O', () => {
     const prepared = prepareWrites(store({ put: async (key, body) => {
       active++; peak = Math.max(peak, active); calls.push(`start:${key}:${new TextDecoder().decode(body as Uint8Array)}`);
       await gate;
-      calls.push(`end:${key}`); active--; return null;
+      calls.push(`end:${key}`); active--; return { key } as R2Object;
     } }), trace);
     for (let i = 0; i < 8; i++) await trace.run(`write_${i}`, () => prepared.bucket.put(i === 7 ? 'object-0' : `object-${i}`, String(i)));
     await trace.run('index_write', () => prepared.bucket.put('pages/index.html', 'index'));

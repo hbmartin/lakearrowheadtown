@@ -127,6 +127,7 @@ export interface PublishResult {
 }
 
 export interface PublishFailure {
+  retry_at?: string;
   status: number;
   code: string;
   error: string;
@@ -171,6 +172,8 @@ export interface RebuildJob {
   phase: 'migration' | 'render';
   processed: number;
   archive_progress?: ArchiveProgress;
+  conflict_count?: number;
+  next_retry_at?: string;
   created_at: string;
   started_at?: string;
   finished_at?: string;
