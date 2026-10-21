@@ -115,10 +115,10 @@ describe('permanent daily archives', () => {
     for (const method of ['GET', 'HEAD']) {
       const response = await fetch('/2026/10/20/', { method });
       expect(response.status).toBe(503);
-      expect(response.headers.get('Retry-After')).toBe('60');
+      expect(response.headers.get('Retry-After')).toBeNull();
       expect(response.headers.get('Cache-Control')).toBe('no-store');
       if (method === 'HEAD') expect(await response.text()).toBe('');
-      else expect(await response.json()).toEqual({ ok: false, error: 'News archives are temporarily unavailable. Please try again later.' });
+      else expect(await response.json()).toEqual({ ok: false, error: 'News archives are damaged. An operator must repair them before retrying.' });
     }
   });
 

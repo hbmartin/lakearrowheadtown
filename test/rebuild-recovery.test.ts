@@ -22,7 +22,7 @@ const digest = () => ({ title: 'Private title', source: 'Private source', items:
 const submit = () => request('/api/digests', { method: 'POST', headers, body: JSON.stringify(digest()) });
 async function seed(status: RebuildJob['status'], ids = [id], alarm = false) {
   await inPublisher(publisher(), async (_instance, state) => {
-    await state.storage.put({ jobs: ids, [`job:${id}`]: job(status), migration: { complete: true, processed: 0 } });
+    await state.storage.put({ jobs: ids, [`job:${id}`]: job(status), migration: { complete: false, processed: 0 } });
     if (alarm) await state.storage.setAlarm(Date.now() + 60_000);
   });
 }
@@ -470,7 +470,7 @@ describe('execution failure versus failure-state persistence', () => {
     await inPublisher(publisher(), async (_instance, state) => {
       const transaction = state.storage.transaction.bind(state.storage);
       let calls = 0;
-      const persistenceCall = stage === 'rebuild_start' ? 1 : stage === 'source_loading' ? 2 : 3;
+      const persistenceCall = stage === 'rebuild_finalize' ? 3 : 1;
       const transactionSpy = vi.spyOn(state.storage, 'transaction').mockImplementation((callback: any) => {
         calls++;
         if (calls === persistenceCall || (stage === 'rebuild_finalize' && calls === 2)) throw new Error('private transaction error');

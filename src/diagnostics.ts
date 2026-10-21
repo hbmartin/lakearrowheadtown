@@ -1,10 +1,6 @@
-import { createHash } from 'node:crypto';
+export { fingerprint } from './primitives';
 import type { OperationContext, PublicationStatus } from './types';
 import { DamagedManifest, DamagedSource, OperationFailure } from './errors';
-
-export function fingerprint(value: string | Uint8Array): string {
-  return createHash('sha256').update(value).digest('hex');
-}
 
 // Never log an exception message: parsers and upstream services can echo inputs.
 export function safeError(error: unknown): Record<string, unknown> {

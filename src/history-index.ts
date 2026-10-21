@@ -1,5 +1,5 @@
 import { boundary, DamagedManifest, HttpError } from './errors';
-import { createHash } from 'node:crypto';
+import { fingerprint, record, text as textField, httpUrl as url } from './primitives';
 import { lastReceivedAt, latestActivity, localDate, recentDates } from './feed';
 import { isClientRef, isDate, isTimestamp } from './validation';
 import type { BatchRecord, BatchResult, ContentBucket, HistoryIndex, IndexPost, Publication, StoredPost } from './types';
@@ -33,10 +33,7 @@ export async function loadHistoryIndex(bucket: ContentBucket, publication: Publi
   let value: HistoryIndex;
   try { value = JSON.parse(text); }
   catch { throw new DamagedManifest(key, 'invalid_json'); }
-  if (key !== `history-index/${createHash('sha256').update(text).digest('hex')}.json`) throw new DamagedManifest(key, 'invalid_manifest');
-  const record = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
-  const textField = (v: unknown): v is string => typeof v === 'string' && !!v.trim();
-  const url = (v: unknown) => { try { const u = new URL(v as string); return textField(v) && ['http:', 'https:'].includes(u.protocol) && !u.username && !u.password; } catch { return false; } };
+  if (key !== `history-index/${fingerprint(text)}.json`) throw new DamagedManifest(key, 'invalid_manifest');
   const dated = (v: unknown) => record(v) && typeof v.date === 'string' && isDate(v.date) && isTimestamp(v.received_at)
     && (v.client_ref === undefined || isClientRef(v.client_ref));
   if (!record(value) || value.version !== 1 || !Array.isArray(value.posts) || !Array.isArray(value.batches)

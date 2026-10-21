@@ -72,12 +72,15 @@ export function asHttpError(error: unknown): HttpError {
 
 export const UNKNOWN_PUBLICATION = 'Unable to confirm publication; it may have completed. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.';
 
-export function publicationFailure(error: unknown, stage: string, publication_status: PublicationStatus): PublishFailure {
+export function publicationFailure(error: unknown, stage: string, publication_status: PublicationStatus, operation?: string): PublishFailure {
   const failure = asHttpError(error);
   const retryable = publication_status === 'unknown' || failure.retryable;
-  const message = publication_status === 'unknown' ? UNKNOWN_PUBLICATION
+  const message = publication_status === 'unknown' ? operation === 'retract'
+    ? 'Unable to confirm retraction; it may have completed. Reconcile the batch status or retry promptly with the original token. A first retraction must commit within 24 hours of the original batch receipt.' : UNKNOWN_PUBLICATION
     : publication_status === 'committed' ? 'Publication committed, but subsequent processing failed. Use the request ID to contact the operator.'
-    : retryable ? 'Publication did not commit. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.'
+    : retryable ? operation === 'retract'
+      ? 'Retraction did not commit. Retry promptly with the original token within 24 hours of the original batch receipt; after that deadline contact the operator.'
+      : 'Publication did not commit. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.'
     : failure.message;
   return { status: failure.status, code: failure.code, error: message, stage, publication_status, retryable };
 }

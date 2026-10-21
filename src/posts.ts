@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { boundary, HttpError, isPublishReply } from './errors';
-import { lastReceivedAt, latestActivity, localDate, recentDates } from './feed';
+import { localDate, recentDates } from './feed';
 import { currentPublication, loadPost, loadPublication } from './publishing';
 import { isTimestamp } from './validation';
 import { indexPost, loadHistoryIndex } from './history-index';
@@ -69,11 +69,11 @@ export async function readPosts(bucket: ContentBucket, query: URLSearchParams, s
     const loaded = await Promise.allSettled(refs.map(async (ref): Promise<ReadPost> => {
       if (compact) return indexed.get(ref.id)!;
       const post = await loadPost(bucket, ref);
-      if (fields === 'index') return indexPost(post);
-      return { post_id: post.id, date: post.date, received_at: post.received_at, title: post.title, source: post.source,
-        ...(post.client_ref === undefined ? {} : { client_ref: post.client_ref }),
-        items: post.items.map((item, item_index) => ({ ...item, item_index, last_received_at: lastReceivedAt(post, item), latest_activity_at: latestActivity(item)!,
-          updates: (item.updates ?? []).map((update, update_index) => ({ ...update, update_index })) })) };
+      const metadata = indexPost(post);
+      if (fields === 'index') return metadata;
+      return { ...metadata, title: post.title, source: post.source,
+        items: post.items.map((item, i) => ({ ...item, ...metadata.items[i],
+          updates: (item.updates ?? []).map((update, j) => ({ ...update, ...metadata.items[i].updates[j] })) })) };
     }));
     for (const result of loaded) {
       // Completion order must not change source or failure ordering.

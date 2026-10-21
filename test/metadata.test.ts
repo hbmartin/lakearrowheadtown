@@ -246,7 +246,7 @@ describe('crawler resources and artwork', () => {
     if (value !== null) await bindings.SITE_BUCKET.put('publications/missing.json', value);
     const response = await fetch('/sitemap.xml');
     expect(response.status).toBe(503);
-    expect(response.headers.get('Retry-After')).toBe('60');
+    expect(response.headers.get('Retry-After')).toBeNull();
     expect(response.headers.get('Cache-Control')).toBe('no-store');
   });
 

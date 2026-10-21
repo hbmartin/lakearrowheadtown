@@ -116,7 +116,7 @@ interface RequestState {
   counts?: PublishResult['counts'];
   post_id?: string;
   publication_status?: PublicationStatus;
-  publication_outcome?: 'published' | 'duplicate' | 'failed' | 'preview' | 'preview_failed' | 'retracted';
+  publication_outcome?: 'published' | 'duplicate' | 'failed' | 'preview' | 'preview_failed' | 'retracted' | 'already_retracted';
   dry_run?: boolean;
 }
 
@@ -159,6 +159,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     if (retract) {
       if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      if (query.has('dry_run')) throw new HttpError(400, 'dry_run is not supported for retraction.', {}, { code: 'invalid_dry_run' });
       const origin = await trace.run('configuration', () => originFor(request, env));
       const publisher = await publisherFor(env, trace);
       publicationAttempted = true;
@@ -170,8 +171,8 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         throw new HttpError(f.status, f.error, {}, { code: f.code, retryable: f.retryable, publication_status: f.publication_status, details: { stage: f.stage } });
       }
       state.post_id = received.result.post_id;
-      state.publication_status = 'committed';
-      state.publication_outcome = 'retracted';
+      state.publication_status = received.result.status === 'retracted' ? 'committed' : undefined;
+      state.publication_outcome = received.result.status;
       return reply({ ok: true, ...received.result });
     }
     const maintenance = /^\/api\/rebuild(?:\/([a-f0-9-]{36})(\/resume)?)?$/.exec(path);
@@ -179,6 +180,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       const allowedMethod = maintenance[1] && !maintenance[2] ? 'GET' : 'POST';
       if (request.method !== allowedMethod) throw new HttpError(405, 'Method not allowed', { Allow: allowedMethod });
+      if (request.method === 'POST' && query.has('dry_run')) throw new HttpError(400, 'dry_run is not supported for rebuild operations.', {}, { code: 'invalid_dry_run' });
       if (!maintenance[1]) {
         const origin = await trace.run('configuration', () => originFor(request, env));
         const publisher = await publisherFor(env, trace);
@@ -199,6 +201,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     if (path === '/api/digests' || path === '/api/images' || append) {
       if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: path === '/api/digests' ? 'GET, HEAD, POST' : 'POST' });
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      if (path === '/api/images' && query.has('dry_run')) throw new HttpError(400, 'dry_run is not supported for image uploads.', {}, { code: 'invalid_dry_run' });
       if (path === '/api/digests' || append) {
         if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) {
           throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
@@ -299,7 +302,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       state.publication_outcome = state.dry_run ? 'preview_failed' : 'failed';
       if (state.dry_run) state.publication_status = 'not_attempted';
       if (publicationAttempted) {
-        const f = publicationFailure(error, stage, state.publication_status);
+        const f = publicationFailure(error, stage, state.publication_status, context.operation);
         failure = new HttpError(f.status, f.error, failure.headers, { code: f.code, details: failure.details, retryable: f.retryable, publication_status: f.publication_status });
       }
     }
@@ -314,7 +317,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       return new Response(notFoundPage, { status: 404, headers });
     }
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
-    return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable, state.dry_run), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
+    return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable, state.dry_run, context.operation), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
       diagnostics, ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(['digest', 'append', 'retract'].includes(context.operation) ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
   }
 }

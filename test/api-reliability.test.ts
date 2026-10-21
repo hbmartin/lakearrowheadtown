@@ -471,14 +471,15 @@ describe('actionable diagnostics', () => {
     const completion = infoEvents.map(args => args[0] as any).find(event => event.event === 'rebuild_completed');
     expect(completion).toMatchObject({ request_id: result.request_id, job_id: result.job.id });
   });
-  it('quietly accepts old and future timestamps without changing the submitted source dates', async () => {
+  it('warns on old and future timestamps without changing the submitted source dates', async () => {
     for (const posted_at of ['2000-01-01T00:00:00Z', '2099-01-01T00:00:00Z']) {
       const payload = input('https://example.com/' + posted_at);
       payload.items[0].posted_at = posted_at;
       const response = await submit(payload);
       expect(response.status).toBe(200);
       const result = await response.json<any>();
-      expect(result.warnings).toBeUndefined();
+      expect(result.warnings).toEqual([{ index: 0, field: 'items[0].posted_at',
+        code: posted_at.startsWith('2000') ? 'posted_at_stale' : 'posted_at_in_future', message: expect.any(String), value: posted_at, server_time: result.post.received_at }]);
       const stored = await (await bindings.SITE_BUCKET.get(postKey(result.post)))!.json<StoredPost>();
       expect(stored.items[0].posted_at).toBe(posted_at);
     }
