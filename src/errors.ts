@@ -72,12 +72,19 @@ export function asHttpError(error: unknown): HttpError {
 
 export const UNKNOWN_PUBLICATION = 'Unable to confirm publication; it may have completed. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.';
 
+export function committedFailureAdvice(retryable: boolean, operation?: string): string {
+  if (!retryable || (operation && !['publish', 'digest', 'append', 'retract'].includes(operation))) return 'Use the request ID to contact the operator.';
+  return operation === 'retract'
+    ? 'Reconcile the original batch status. An unchanged retry with the original publishing token can confirm an already-retracted result while its record is retained. Contact the operator if subsequent processing still fails.'
+    : 'Reconcile the committed stories. Retry only the unchanged payload within the original 30 Los Angeles receipt-date history window. Contact the operator if subsequent processing still fails.';
+}
+
 export function publicationFailure(error: unknown, stage: string, publication_status: PublicationStatus, operation?: string): PublishFailure {
   const failure = asHttpError(error);
   const retryable = publication_status === 'unknown' || failure.retryable;
   const message = publication_status === 'unknown' ? operation === 'retract'
     ? 'Unable to confirm retraction; it may have completed. Reconcile the batch status or retry promptly with the original token. A first retraction must commit within 24 hours of the original batch receipt.' : UNKNOWN_PUBLICATION
-    : publication_status === 'committed' ? `${operation === 'retract' ? 'Retraction' : 'Publication'} committed, but subsequent processing failed. Use the request ID to contact the operator.`
+    : publication_status === 'committed' ? `${operation === 'retract' ? 'Retraction' : 'Publication'} committed, but subsequent processing failed. ${committedFailureAdvice(retryable, operation)}`
     : retryable ? operation === 'retract'
       ? 'Retraction did not commit. Retry promptly with the original token within 24 hours of the original batch receipt; after that deadline contact the operator.'
       : 'Publication did not commit. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.'

@@ -162,13 +162,15 @@ export interface Migration {
   complete: boolean;
 }
 
+export interface ArchiveProgress { completed_days: number; total_days: number }
+
 export interface RebuildJob {
   id: string;
   origin: string;
   status: 'queued' | 'running' | 'completed' | 'failed';
   phase: 'migration' | 'render';
   processed: number;
-  archive_progress?: { completed_days: number; total_days: number };
+  archive_progress?: ArchiveProgress;
   created_at: string;
   started_at?: string;
   finished_at?: string;

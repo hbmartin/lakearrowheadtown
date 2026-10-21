@@ -94,7 +94,7 @@ export class DigestPublisher extends DurableObject<Env> {
     context = this.executingContext(context);
     const trace = new OperationTrace(context);
     try {
-      const publication = await trace.run('source_loading', async () => (await committedSnapshot(this.env.SITE_BUCKET)).publication({ archives: false }));
+      const publication = await trace.run('publication_loading', async () => (await committedSnapshot(this.env.SITE_BUCKET)).publication({ archives: false }));
       const index = await trace.run('history_index_loading', () => publication ? loadHistoryIndex(this.env.SITE_BUCKET, publication) : { version: 1 as const, posts: [], batches: [] });
       return { ok: true, result: findBatch(index, clientRef, new Date()) };
     } catch (error) {
@@ -251,7 +251,7 @@ export class DigestPublisher extends DurableObject<Env> {
         const baseline = migration.complete ? await trace.run('publication_loading', async () => {
           const snapshot = await committedSnapshot(this.env.SITE_BUCKET);
           bootstrap = !snapshot.index?.customMetadata?.manifest;
-          return { snapshot, publication: await currentPublication(this.env.SITE_BUCKET, migrationBefore.complete ? async () => [] : undefined, snapshot, migrationBefore.complete) };
+          return { snapshot, publication: await currentPublication(this.env.SITE_BUCKET, migrationBefore.complete ? async () => [] : undefined, snapshot, migrationBefore.complete, trace) };
         }) : undefined;
         job.processed = migration.processed;
         job.phase = migration.complete ? 'render' : 'migration';
@@ -278,7 +278,7 @@ export class DigestPublisher extends DurableObject<Env> {
           case 'committed': break;
           default: {
             const unexpected: never = rebuilt;
-            throw new Error(`Unexpected rebuild result: ${unexpected}`);
+            throw new Error(`Unexpected rebuild result kind: ${String((unexpected as { kind?: unknown })?.kind)}`);
           }
         }
         job.status = 'completed';
