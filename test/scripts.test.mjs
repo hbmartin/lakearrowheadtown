@@ -10,7 +10,7 @@ import { migrateProductionCredential, readCredential, readPublishingCredential, 
 import { deploy } from '../scripts/deploy.mjs';
 import { maintenance, maintenanceTarget } from '../scripts/maintenance.mjs';
 import { provisionSecret } from '../scripts/provision-secret.mjs';
-import { checkRssHeaders, parseSmokeArgs, smoke } from '../scripts/smoke-preview.mjs';
+import { checkHtmlHeaders, checkRssHeaders, parseSmokeArgs, smoke } from '../scripts/smoke-preview.mjs';
 
 const secret = 'a'.repeat(64);
 const id = '00000000-0000-0000-0000-000000000001';
@@ -276,6 +276,17 @@ test('smoke arguments support a default URL, flag alone, and either argument ord
   assert.deepEqual(parseSmokeArgs(['--verify-edge']), { origin: remote, edge: true });
   for (const args of [[remote, '--verify-edge'], ['--verify-edge', remote]]) assert.deepEqual(parseSmokeArgs(args), { origin: remote, edge: true });
   assert.deepEqual(parseSmokeArgs(['http://localhost:8787']), { origin: 'http://localhost:8787', edge: false });
+});
+test('HTML smoke checks require public validators and transformation-safe negotiated responses', () => {
+  const headers = { ETag: 'W/"story"', 'Cache-Control': 'public, max-age=0, must-revalidate, no-transform', Vary: 'Accept-Encoding' };
+  for (const status of [200, 304]) {
+    checkHtmlHeaders(new Response(null, { status, headers }));
+    for (const name of ['ETag', 'Cache-Control', 'Vary']) {
+      const missing = new Headers(headers); missing.delete(name);
+      assert.throws(() => checkHtmlHeaders(new Response(null, { status, headers: missing })));
+    }
+    assert.throws(() => checkHtmlHeaders(new Response(null, { status, headers: { ...headers, ETag: '"strong"' } })));
+  }
 });
 test('RSS smoke checks validate present 304 MIME and require MIME on GET and HEAD 200s', () => {
   const headers = { 'Cache-Control': 'public, max-age=0, must-revalidate', 'X-Robots-Tag': 'noindex' };
