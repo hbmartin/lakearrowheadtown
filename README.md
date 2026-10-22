@@ -586,6 +586,18 @@ Normal pages and the public 404 page inline the same bundled theme initializatio
 
 Template assembly requires exactly one `<!-- theme-head -->` marker inside `<head>` and throws during initialization if it is missing, duplicated, misspelled, or outside the head. Opening and closing head tags accept mixed casing. Shared `{{site.name}}`, `{{site.background}}`, and `{{site.foreground}}` placeholders are escaped for HTML text/attributes; bundled CSS accepts only the two six-digit hex color placeholders. Unsupported or unresolved site placeholders fail initialization. Node theme tests bundle the actual renderers in memory and execute their head scripts in document order.
 
+## Responsive thumbnails
+
+Owned content images with known dimensions use `<img srcset sizes>` on the homepage, daily archives, and story updates. The browser selects an on-demand thumbnail for the existing 96px mobile / 160px desktop boxes and display density. Portrait `sizes` account for the height limit. Originals, authored Markdown, upload responses, RSS images, external images, and share cards retain their existing formats and URLs.
+
+`GET` and `HEAD /thumbnails/v1/<sha256>.<jpg|png|webp|gif>/<edge>` accept only edges 96, 160, 192, 288, 320, and 480, with no query parameters. The `IMAGES` binding reads original R2 bytes and resizes without cropping or upscaling. It preserves transparency and animation, serves quality-80 WebP when explicitly accepted, and otherwise retains the source encoding. Successful responses use one-year immutable browser and Workers caching, `Vary: Accept`, representation-specific weak ETags, and conditional 304 responses. Encoding changes require a new URL version.
+
+Use **Images Free only**, with its 5,000 unique transformations per month; do not activate a paid plan. Check **Images & Stream → Transformations** usage and **Plans** before rollout. A quota error (`9422`), unavailable binding, or transformation failure logs `thumbnail_fallback` with a fixed reason and preset, then returns an uncached 302 to the original image. Missing originals stay 404. A fallback never acquires an immutable thumbnail cache entry. Six requested presets per image consume the allowance at roughly 833 distinct images monthly; only requested transformations count.
+
+`npm run test:thumbnails:preview` uploads fixed JPEG, transparent PNG, and two-frame GIF fixtures to the allowlisted preview environment. It verifies encoding, alpha, animation, exact candidate widths, conditional requests, cache isolation/hits, and at least 90% JPEG download savings. It publishes preview verification stories and prints the temporary directory containing encoded files for visual inspection. It never writes production content. Local Images tests use a reduced-fidelity encoder; run the preview check before production deployment.
+
+Deploy preview and complete the normal rebuild before checking real browsers at mobile/desktop sizes and 1×–3× density, then deploy production through the existing rebuild workflow. Daily archives render with the current template. To roll back, restore original-image markup and rebuild the homepage while retaining the versioned thumbnail endpoint for cached HTML.
+
 ## Upload images
 
 ```sh

@@ -7,6 +7,7 @@ import { archivePath, type ArchiveDay, type ArchiveReference } from './archives'
 import type { ImageMetadataMap } from './image-metadata';
 import type { PageMetadata } from './metadata';
 import { renderMetadata } from './metadata';
+import { responsiveThumbnail } from './thumbnail-sizes';
 import { orderedUpdates, selectFeedItems, snapshotDates, TIME_ZONE } from './feed';
 import type { DigestItem, Publication, StoredItem, StoredPost } from './types';
 export { escapeHtml } from './html';
@@ -25,6 +26,12 @@ markdown.renderer.rules.image = (tokens, index, options, environment, renderer) 
   if (markdown.validateLink(url)) token.attrSet('src', url);
   const size = env.images[url];
   if (size) { token.attrSet('width', String(size.width)); token.attrSet('height', String(size.height)); }
+  const thumbnail = responsiveThumbnail(url, env.origin, size);
+  if (thumbnail) {
+    token.attrSet('src', thumbnail.src);
+    token.attrSet('srcset', thumbnail.srcset);
+    token.attrSet('sizes', thumbnail.sizes);
+  }
   token.attrSet('loading', env.counter.value++ === 0 ? 'eager' : 'lazy');
   token.attrSet('decoding', 'async');
   return defaultImage(tokens, index, options, environment, renderer);

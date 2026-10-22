@@ -239,7 +239,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const images = [...seoHtml.matchAll(/<img\b[^>]*>/g)].map(match => match[0]);
   assert.equal(images.filter(tag => tag.includes('loading="eager"')).length, 1);
   assert(images.every(tag => tag.includes('decoding="async"')));
-  assert(images.some(tag => tag.includes(imageUrl) && tag.includes('width="1" height="1"')));
+  assert(images.some(tag => tag.includes(`/thumbnails/v1/${new URL(imageUrl).pathname.split('/').at(-1)}/160`) && tag.includes('width="1" height="1"')));
   const dailyPath = seoHtml.match(/<h2 id="day-[^"]+"><a href="(\/\d{4}\/\d{2}\/\d{2}\/)"/)[1];
   const daily = await fetch(origin + dailyPath);
   assert.equal(daily.status, 200);

@@ -188,6 +188,7 @@ export interface RebuildJob {
 }
 
 export interface Env {
+  IMAGES?: ImagesBinding;
   API_SECRET?: string;
   SITE_ORIGIN: string;
   SITE_BUCKET: R2Bucket;

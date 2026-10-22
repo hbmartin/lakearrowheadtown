@@ -21,6 +21,7 @@ import { HttpError, isTimestamp, parseDigestJson, readLimited, validateClientRef
 import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isBatchReply, isPublishReply, isRetractReply, OperationFailure, publicationFailure, failureError } from './errors';
 import notFoundPage from './not-found';
 import { noStoreHeaders } from './responses';
+import { thumbnailResponse } from './thumbnails';
 export { DigestPublisher } from './publisher';
 
 function json(value: unknown, status = 200, headers: HeadersInit = {}): Response {
@@ -352,6 +353,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     try { origin = originFor(request, env); }
     catch (error) { if (!(error instanceof HttpError && error.status === 503)) throw error; }
     return await trace.run('public_read', async () => {
+      if (path.startsWith('/thumbnails/')) return thumbnailResponse(request, env, trace);
       const metadata = await metadataResource(request, env.SITE_BUCKET, origin);
       if (metadata) return metadata;
       const page = await pageResource(request, env.SITE_BUCKET, origin);
@@ -410,6 +412,7 @@ function routeFor(path: string): { route: string; operation: string } {
   if (/^\/api\/posts\/[^/]+\/retract$/.test(path)) return { route: '/api/posts/:id/retract', operation: 'retract' };
   if (/^\/api\/rebuild(?:\/[a-f0-9-]{36}(?:\/resume)?)?$/.test(path)) return { route: path === '/api/rebuild' ? path : path.endsWith('/resume') ? '/api/rebuild/:id/resume' : '/api/rebuild/:id', operation: 'rebuild' };
   if (path.startsWith('/api/') || path === '/api') return { route: '/api/*', operation: 'read' };
+  if (path.startsWith('/thumbnails/')) return { route: '/thumbnails/v1/:file/:edge', operation: 'read' };
   return { route: path === '/' || path === '/index.html' ? '/' : path.startsWith('/images/') ? '/images/:file' : '/public/*', operation: 'read' };
 }
 

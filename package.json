@@ -13,6 +13,7 @@
     "deploy": "node scripts/deploy.mjs production",
     "secret": "node scripts/provision-secret.mjs",
     "test:scripts": "node --test test/*.test.mjs",
+    "test:thumbnails:preview": "node scripts/smoke-thumbnails.mjs",
     "secret:migrate-production": "node scripts/migrate-production-secret.mjs",
     "rebuild": "node scripts/maintenance.mjs start",
     "rebuild:status": "node scripts/maintenance.mjs status",
