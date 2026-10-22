@@ -1,3 +1,4 @@
+import type { ValidationIssue } from './errors';
 import type { DigestPublisher } from './publisher';
 
 export interface DigestItem {
@@ -127,6 +128,8 @@ export interface PublishResult {
 }
 
 export interface PublishFailure {
+  details?: ValidationIssue[] | Record<string, unknown>;
+  details_truncated?: boolean;
   retry_at?: string;
   status: number;
   code: string;

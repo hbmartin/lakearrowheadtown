@@ -17,13 +17,14 @@ export function errorSuggestion(code: string, retryable: boolean, dryRun = false
       ? 'Read alert history or retry the same retraction promptly with its original token.'
       : 'Look up the exact client_ref or retry the unchanged submission within its original 30 Los Angeles receipt-date reference window.', method: 'GET', path: '/api/alerts' };
   }
+  if (code === 'repair_pending') return { action: 'retry_unchanged', message: 'Retry the identical repair request after retry_at to recover its result and regeneration job.' };
   if (code === 'publication_conflict') return { action: 'retry_unchanged', message: 'Retry the unchanged request after retry_at or Retry-After.' };
   if (code === 'publication_changed') return { action: 'refresh_publication', message: 'Read GET /api/publication/repair and review the current version before submitting a repair.', method: 'GET', path: '/api/publication/repair' };
   if (publicationStatus === 'committed' && publicationOperation(operation)) {
     return { action: retryable ? operation === 'retract' ? 'reconcile_or_retry_retraction' : 'retry_unchanged' : 'contact_operator',
       message: `The ${operation === 'retract' ? 'retraction' : 'publication'} is confirmed committed. ${committedFailureAdvice(retryable, operation)}` };
   }
-  if (code === 'invalid_dry_run' && ['image', 'retract', 'rebuild'].includes(operation ?? '')) return { action: 'remove_dry_run', message: 'Remove the dry_run parameter; this endpoint does not support previews.' };
+  if (code === 'invalid_dry_run' && ['image', 'retract', 'rebuild', 'publication_repair'].includes(operation ?? '')) return { action: 'remove_dry_run', message: 'Remove the dry_run parameter; this endpoint does not support previews.' };
   if (operation === 'retract' && retryable) return { action: 'reconcile_or_retry_retraction', message: 'Reconcile the original batch status or retry promptly with its publishing token. A first retraction must commit within 24 hours of the original receipt; otherwise contact the operator.' };
   if (operation === 'publication_repair' && retryable) return { action: 'refresh_publication', message: 'Read GET /api/publication/repair to reconcile an uncertain repair, then retry the same pointers if necessary.', method: 'GET', path: '/api/publication/repair' };
   if (code === 'client_ref_conflict') return { action: 'look_up_batch', message: 'Look up the committed batch with GET /api/digests?client_ref=YOUR_REFERENCE, or choose a new client_ref for a new batch.', method: 'GET', path: '/api/digests' };

@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { evictDurableObject, reset, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
-import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import worker from '../src/worker';
 import { currentPublication, loadPost, publishDigest, rebuildHomepage, retractPost } from '../src/publishing';
 import { loadCatalog, loadArchiveDay, stableJson, type ArchiveCatalog, type ArchiveDay } from '../src/archives';
@@ -69,6 +69,8 @@ beforeEach(async () => {
   vi.restoreAllMocks(); await reset(); events = [];
   for (const level of ['info', 'warn', 'error'] as const) vi.spyOn(console, level).mockImplementation(value => events.push(value));
 });
+
+afterEach(() => { vi.useRealTimers(); });
 
 describe('safe requests and repair contracts', () => {
   it.each(['true', 'false', '', 'true&dry_run=false'])('rejects unsupported dry_run=%s before reading bodies or invoking mutations', async value => {
@@ -605,7 +607,7 @@ describe('publication I/O', () => {
     } }), trace);
     for (let i = 0; i < 8; i++) await trace.run(`write_${i}`, () => prepared.bucket.put(i === 7 ? 'object-0' : `object-${i}`, String(i)));
     await trace.run('index_write', () => prepared.bucket.put('pages/index.html', 'index'));
-    const committed = prepared.commit();
+    const committed = prepared.commit(null);
     await vi.waitFor(() => expect(active).toBe(4));
     expect(calls.some(call => call.includes('pages/index.html'))).toBe(false);
     release(); await committed;
@@ -629,7 +631,7 @@ describe('publication I/O', () => {
     } }), trace);
     for (const key of ['broken', 'a', 'b', 'c', 'later', 'pages/index.html']) await trace.run(key, () => prepared.bucket.put(key, key));
     let settled = false;
-    const committed = prepared.commit();
+    const committed = prepared.commit(null);
     void committed.catch(() => { settled = true; });
     await vi.waitFor(() => expect(active).toBe(4));
     fail(); await vi.waitFor(() => expect(active).toBe(3));

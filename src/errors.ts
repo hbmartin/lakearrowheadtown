@@ -4,6 +4,7 @@ import { publicationOperation } from './operations';
 
 export interface ValidationIssue { path: string; code: string; message: string }
 interface ErrorOptions {
+  stage?: string;
   retry_at?: string;
   code?: string;
   details?: ValidationIssue[] | Record<string, unknown>;
@@ -13,6 +14,7 @@ interface ErrorOptions {
 }
 
 export class HttpError extends Error {
+  readonly stage?: string;
   readonly retry_at?: string;
   readonly code: string;
   readonly details: ValidationIssue[] | Record<string, unknown>;
@@ -22,6 +24,7 @@ export class HttpError extends Error {
   constructor(public status: number, message: string, public headers: HeadersInit = {}, options: ErrorOptions = {}) {
     super(message);
     this.name = 'HttpError';
+    this.stage = options.stage;
     this.retry_at = options.retry_at;
     this.code = options.code ?? ({ 400: 'invalid_request', 401: 'unauthorized', 404: 'not_found', 405: 'method_not_allowed', 409: 'conflict', 413: 'body_too_large', 415: 'unsupported_media_type', 503: 'service_unavailable' } as Record<number, string>)[status] ?? 'internal_error';
     this.details = options.details ?? {};
@@ -163,4 +166,11 @@ export function isBatchReply(value: unknown): value is BatchReply {
 
 export function retryHeaders(retryAt?: string): HeadersInit {
   return retryAt ? { 'Retry-After': String(Math.max(1, Math.ceil((Date.parse(retryAt) - Date.now()) / 1000))) } : {};
+}
+
+// Preserve the complete typed RPC failure, including read-only certainty.
+export function failureError(f: PublishFailure): HttpError {
+  return new HttpError(f.status, f.error, retryHeaders(f.retry_at), { stage: f.stage, code: f.code,
+    retryable: f.retryable, retry_at: f.retry_at, publication_status: f.publication_status,
+    details: f.details ?? { stage: f.stage }, details_truncated: f.details_truncated });
 }

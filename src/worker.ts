@@ -1,3 +1,4 @@
+import { validRssKey } from './committed';
 import { metadataKey } from './image-metadata';
 import { pageResource } from './pages';
 import { timingSafeEqual } from 'node:crypto';
@@ -17,7 +18,7 @@ import { isIndexable, metadataResource } from './public-metadata';
 import type { AppendReply, Digest, Env, OperationContext, PublicationStatus, PublishReply, PublishResult, RebuildJob, StoryUpdate } from './types';
 import { emit, fingerprint, OperationTrace, safeError } from './diagnostics';
 import { HttpError, isTimestamp, parseDigestJson, readLimited, validateClientRef, validateDigest, validateUpdate } from './validation';
-import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isBatchReply, isPublishReply, isRetractReply, OperationFailure, publicationFailure, retryHeaders } from './errors';
+import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isBatchReply, isPublishReply, isRetractReply, OperationFailure, publicationFailure, failureError } from './errors';
 import notFoundPage from './not-found';
 import { noStoreHeaders } from './responses';
 export { DigestPublisher } from './publisher';
@@ -158,7 +159,7 @@ interface RequestState {
   counts?: PublishResult['counts'];
   post_id?: string;
   publication_status?: PublicationStatus;
-  publication_outcome?: 'published' | 'duplicate' | 'failed' | 'preview' | 'preview_failed' | 'retracted' | 'already_retracted';
+  publication_outcome?: 'repaired' | 'unchanged' | 'published' | 'duplicate' | 'failed' | 'preview' | 'preview_failed' | 'retracted' | 'already_retracted';
   dry_run?: boolean;
 }
 
@@ -197,9 +198,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         : await publisher.submitAlertV1(payload!, fingerprint(env.API_SECRET!), context, state.dry_run)));
       if (!isAlertsReply(received)) throw new OperationFailure('rpc', new Error('Invalid alerts reply'));
       if (!received.ok) {
-        const f = received.failure;
-        throw new HttpError(f.status, f.error, {}, { code: f.code, retryable: f.retryable, publication_status: f.publication_status,
-          details: f.details ?? { stage: f.stage }, details_truncated: f.details_truncated });
+        throw failureError(received.failure);
       }
       if (!reading) {
         if (!('status' in received.result)) throw new OperationFailure('rpc', new Error('Invalid alert mutation reply'));
@@ -227,10 +226,10 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       const received: unknown = await trace.run('repair_rpc', () => boundary('rpc', async () => await publisher.publicationRepairV1(input, origin, context)));
       if (!isRepairReply(received)) throw new OperationFailure('rpc', new Error('Invalid publication repair reply'));
       if (!received.ok) {
-        const f = received.failure;
-        throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { code: f.code, retryable: f.retryable,
-          retry_at: f.retry_at, publication_status: f.publication_status, details: { stage: f.stage } });
+        throw failureError(received.failure);
       }
+      state.publication_status = input === undefined || received.result.unchanged ? 'not_attempted' : 'committed';
+      state.publication_outcome = input === undefined ? undefined : received.result.unchanged ? 'unchanged' : 'repaired';
       return reply({ ok: true, ...received.result });
     }
     if (path === '/api/digests' && ['GET', 'HEAD'].includes(request.method)) {
@@ -242,8 +241,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       const received: unknown = await trace.run('batch_lookup_rpc', () => boundary('rpc', async () => await publisher.findBatchV1(clientRef, context)));
       if (!isBatchReply(received)) throw new OperationFailure('rpc', new Error('Invalid batch reply'));
       if (!received.ok) {
-        const f = received.failure;
-        throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { retry_at: f.retry_at, code: f.code, retryable: f.retryable, details: { stage: f.stage } });
+        throw failureError(received.failure);
       }
       return reply({ ok: true, ...received.result });
     }
@@ -254,8 +252,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       const received: unknown = await trace.run('posts_read_rpc', () => boundary('rpc', async () => await publisher.readPostsV1(new URL(request.url).searchParams.toString(), context)));
       if (!isPostsReply(received)) throw new OperationFailure('rpc', new Error('Invalid posts reply'));
       if (!received.ok) {
-        const f = received.failure;
-        throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { retry_at: f.retry_at, code: f.code, retryable: f.retryable, details: { stage: f.stage } });
+        throw failureError(received.failure);
       }
       return reply({ ok: true, ...received.result });
     }
@@ -272,8 +269,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       const received: unknown = await trace.run('retract_rpc', () => boundary('rpc', async () => await publisher.retractPostV1(retract[1], fingerprint(env.API_SECRET!), origin, context)));
       if (!isRetractReply(received)) throw new OperationFailure('rpc', new Error('Invalid retract reply'));
       if (!received.ok) {
-        const f = received.failure;
-        throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { retry_at: f.retry_at, code: f.code, retryable: f.retryable, publication_status: f.publication_status, details: { stage: f.stage } });
+        throw failureError(received.failure);
       }
       state.post_id = received.result.post_id;
       state.publication_status = received.result.status === 'retracted' ? 'committed' : undefined;
@@ -344,8 +340,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
           if (!(append ? isAppendReply(received) : isPublishReply(received))) throw new OperationFailure('rpc', new Error('Invalid publisher reply'));
           const receivedReply = received as AppendReply | PublishReply;
           if (!receivedReply.ok) {
-            const f = receivedReply.failure;
-            throw new HttpError(f.status, f.error, retryHeaders(f.retry_at), { retry_at: f.retry_at, code: f.code, details: { stage: f.stage }, retryable: f.retryable, publication_status: f.publication_status });
+            throw failureError(receivedReply.failure);
           }
           if (state.dry_run && (receivedReply.result.dry_run !== true || receivedReply.result.committed !== false || !isTimestamp(receivedReply.result.checked_at))) {
             throw new OperationFailure('rpc', new Error('Invalid preview reply'));
@@ -389,7 +384,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         const index = await boundary('storage', () => env.SITE_BUCKET.head('pages/index.html'));
         if (!index) return emptyResponse(request, originFor(request, env), true);
         const key = index.customMetadata?.rss;
-        if (!key || !/^publications\/[a-f0-9-]{36}\.rss\.xml$/.test(key)) throw rssUnavailable();
+        if (!validRssKey(key)) throw rssUnavailable();
         return publicObject(request, env, key, 'rss');
       }
       if (path === '/' || path === '/index.html') return homepageResponse(request, env, context);
@@ -401,7 +396,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     const expected = error instanceof HttpError;
     let failure = asHttpError(error);
     const detailStage = !Array.isArray(failure.details) && typeof failure.details.stage === 'string' ? failure.details.stage : undefined;
-    const stage = detailStage ?? trace.failed_stage ?? trace.stage ?? 'request_processing';
+    const stage = failure.stage ?? detailStage ?? trace.failed_stage ?? trace.stage ?? 'request_processing';
     if (publicationOperation(context.operation) || ['alert', 'alert_retract'].includes(context.operation) || context.operation === 'publication_repair') {
       state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
       state.publication_outcome = state.dry_run ? 'preview_failed' : 'failed';

@@ -201,7 +201,7 @@ export async function rebuildArchives(bucket: ContentBucket, posts: StoredPost[]
         try {
           const reference = await prepareDay(prepared.bucket, date, base.days[date], plan, publication, trace,
             createImageResolver(prepared.bucket, origin, imageCache), createCardCache(prepared.bucket));
-          await prepared.commit();
+          await prepared.commit(null);
           result = { input, reference: reference ?? null };
         } finally { prepared.close(); }
         await trace.run('rebuild_day_checkpoint', () => boundary('storage', () => bucket.put(receipt, stableJson({ version: 1, result }), { httpMetadata: { contentType: 'application/json' } })), { phase: 'commit' });

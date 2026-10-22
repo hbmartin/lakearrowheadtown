@@ -27,14 +27,29 @@ export async function maintenance(operation, environment, id, options = {}) {
     || typeof payload.rss !== 'string' || !/^publications\/[a-f0-9-]{36}\.rss\.xml$/.test(payload.rss)
     || payload.archives !== null && (typeof payload.archives !== 'string' || !/^archive-catalogs\/[a-f0-9]{64}\.json$/.test(payload.archives)))) throw new Error('Invalid repair payload');
   const path = repairing ? '/api/publication/repair' : `/api/rebuild${operation === 'start' ? '' : `/${id}${operation === 'resume' ? '/resume' : ''}`}`;
-  const response = await (options.request ?? fetch)(origin + path, { method: ['status', 'snapshot'].includes(operation) ? 'GET' : 'POST', headers: { Authorization: `Bearer ${secret}`, ...(payload ? { 'Content-Type': 'application/json' } : {}) }, ...(payload ? { body: JSON.stringify(payload) } : {}), signal: AbortSignal.timeout(30000) });
+  let response;
+  try { response = await (options.request ?? fetch)(origin + path, { method: ['status', 'snapshot'].includes(operation) ? 'GET' : 'POST', headers: { Authorization: `Bearer ${secret}`, ...(payload ? { 'Content-Type': 'application/json' } : {}) }, ...(payload ? { body: JSON.stringify(payload) } : {}), signal: AbortSignal.timeout(Math.min(30000, options.requestTimeoutMs ?? 30000)) }); }
+  catch (cause) {
+    const error = new Error('Maintenance request transport failed', { cause });
+    error.transport = true;
+    throw error;
+  }
   let result;
   try { result = await response.json(); }
-  catch { throw new Error(response.ok ? `Invalid maintenance response (${response.status}): expected JSON` : `Maintenance request failed (${response.status}): non-JSON response`); }
+  catch {
+    const failure = new Error(response.ok ? `Invalid maintenance response (${response.status}): expected JSON` : `Maintenance request failed (${response.status}): non-JSON response`);
+    failure.status = response.status;
+    failure.retryable = response.ok || response.status >= 500;
+    throw failure;
+  }
   if (!response.ok) {
     const failure = new Error(`Maintenance request failed (${response.status}): ${typeof result?.error === 'string' ? result.error : 'Unknown error'}`);
     failure.code = result?.code;
     failure.retryAt = result?.retry_at;
+    failure.retryable = result?.retryable === true;
+    failure.publicationStatus = result?.publication_status;
+    failure.details = result?.details;
+    failure.status = response.status;
     throw failure;
   }
   if (repairing) {
@@ -47,31 +62,60 @@ export async function maintenance(operation, environment, id, options = {}) {
 }
 export async function repairAndFollow(environment, file, options = {}) {
   const payload = options.payload ?? JSON.parse(await readFile(file, 'utf8'));
-  const started = Date.now();
+  const timeoutMs = options.timeoutMs ?? 1800000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('timeout-ms must be a positive integer');
+  const now = options.now ?? (() => performance.now());
+  const deadline = now() + timeoutMs;
   const wait = options.sleep ?? sleep;
-  let result;
-  while (true) {
-    try { result = await maintenance('repair', environment, undefined, { ...options, payload }); break; }
+  let result; let jobId; let attempts = 0; let statusRetryAt;
+  const context = () => jobId ? `Repair committed; rebuild ${jobId} is ${result?.job?.status ?? 'awaiting activation'}.` : 'Repair outcome may be unknown; retry the identical repair file to reconcile it.';
+  const remaining = () => {
+    const left = Math.ceil(deadline - now());
+    if (left <= 0) throw new Error(`${context()} Overall repair timeout exceeded. Inspect the snapshot and rebuild status.`);
+    return left;
+  };
+  const pause = async retryAt => {
+    const delay = Math.min(30000, Math.max(1000, Date.parse(retryAt) - Date.now() || Math.min(30000, 2 ** Math.min(attempts++, 5) * 1000)));
+    await wait(Math.min(delay, remaining()));
+    remaining();
+  };
+  const call = (operation, id) => maintenance(operation, environment, id, { ...options, payload, requestTimeoutMs: remaining() });
+  const retryable = error => error.transport === true || error.retryable === true;
+  while (!result) {
+    try { result = await call('repair'); }
     catch (error) {
-      if (error.code !== 'publication_conflict' || Date.now() - started > 300000) throw error;
-      await wait(Math.min(30000, Math.max(1000, Date.parse(error.retryAt) - Date.now() || 1000)));
+      if (error.publicationStatus === 'committed' && typeof error.details?.job_id === 'string') {
+        jobId = error.details.job_id;
+        options.onProgress?.({ publication_status: 'committed', repair_id: error.details.repair_id, job_id: jobId });
+      }
+      if (!retryable(error)) throw new Error(`${jobId ? context() + ' ' : ''}${error.message}`, { cause: error });
+      await pause(error.retryAt);
     }
   }
+  jobId = result.job?.id;
   options.onProgress?.(result);
-  if (result.job) {
-    while (!['completed', 'failed'].includes(result.job.status) && !result.job.blocked_by) {
-      await wait(Math.min(30000, Math.max(1000, Date.parse(result.job.next_retry_at) - Date.now() || 1000)));
-      result.job = await maintenance('status', environment, result.job.id, options);
-      options.onProgress?.(result);
+  while (result.job && !['completed', 'failed'].includes(result.job.status) && !result.job.blocked_by) {
+    await pause(statusRetryAt ?? result.job.next_retry_at);
+    try { result.job = await call('status', jobId); attempts = 0; statusRetryAt = undefined; }
+    catch (error) {
+      if (!retryable(error)) throw new Error(`${context()} ${error.message}`, { cause: error });
+      statusRetryAt = error.retryAt;
+      options.onProgress?.({ job_id: jobId, publication_status: 'committed', warning: error.message });
+      continue;
     }
-    if (result.job.status === 'failed' || result.job.blocked_by) throw new Error(`Repair committed; rebuild ${result.job.id} failed or is blocked. Inspect rebuild status.`);
+    options.onProgress?.(result);
   }
+  if (result.job && (result.job.status === 'failed' || result.job.blocked_by)) throw new Error(`Repair committed; rebuild ${jobId} failed or is blocked. Inspect rebuild status.`);
   return result;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [operation, environment, id] = process.argv.slice(2);
   try {
-    if (operation === 'repair') await repairAndFollow(environment, id, { onProgress: value => console.log(JSON.stringify(value, null, 2)) });
+    if (operation === 'repair') {
+      const extra = process.argv.slice(5);
+      if (extra.length && (extra.length !== 2 || extra[0] !== '--timeout-ms' || !/^[1-9][0-9]*$/.test(extra[1]))) throw new Error('Use --timeout-ms <positive integer>');
+      await repairAndFollow(environment, id, { ...(extra.length ? { timeoutMs: Number(extra[1]) } : {}), onProgress: value => console.log(JSON.stringify(value, null, 2)) });
+    }
     else {
       const result = await maintenance(operation, environment, id);
       console.log(JSON.stringify(result, null, 2));
