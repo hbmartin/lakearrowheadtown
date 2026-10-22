@@ -8,8 +8,7 @@ import { HTML_CACHE } from './publishing';
 import { htmlResponse } from './html-response';
 import { renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
-import { currentAlertViews, isAlertsReply, validateAlertInput } from './alerts';
-import { renderAlertBanner } from './alert-banner';
+import { isAlertsReply, validateAlertInput } from './alerts';
 import { isPostsReply } from './posts';
 import { isEventsReply, validateEvents, type EventDigest } from './events';
 import { isRepairReply, validateRepair, type RepairInput } from './publication-repair';
@@ -112,42 +111,6 @@ async function publicObject(request: Request, env: Env, key: string, type: 'html
   return new Response(body, { headers });
 }
 
-async function homepageResponse(request: Request, env: Env, context: OperationContext): Promise<Response> {
-  const banner = await currentAlertViews(env.SITE_BUCKET).then(alerts => ({ html: renderAlertBanner(alerts), healthy: true })).catch(error => {
-    emit('alerts_banner_failed', context, { error_code: asHttpError(error).code, ...safeError(error) }, 'error');
-    return { html: '', healthy: false };
-  });
-  // Preserve R2's body-free conditional reads when there is no banner to compose.
-  if (banner.healthy && !banner.html) return publicObject(request, env, 'pages/index.html');
-  // A story-only conditional read can incorrectly return 304 after an alert changes.
-  const baseHeaders = new Headers(request.headers);
-  baseHeaders.delete('if-none-match');
-  const condition = parseIfNoneMatch(request.headers.get('if-none-match'));
-  const preflight = banner.healthy && !!condition && request.method === 'GET';
-  let base = await publicObject(new Request(request, { method: preflight ? 'HEAD' : request.method, headers: baseHeaders }), env, 'pages/index.html');
-  const representationEtag = async (response: Response) => banner.html
-    ? `W/"${await hashBytes(new TextEncoder().encode(`${response.headers.get('etag')}\n${banner.html}`))}"` : response.headers.get('etag')!;
-  let etag = await representationEtag(base);
-  if (preflight && !matchesEtag(condition, etag)) {
-    base = await publicObject(new Request(request, { headers: baseHeaders }), env, 'pages/index.html');
-    etag = await representationEtag(base);
-  }
-  const headers = new Headers(base.headers);
-  if (banner.healthy) headers.set('ETag', etag);
-  else {
-    headers.delete('ETag');
-    for (const name of ['Cache-Control', 'Cloudflare-CDN-Cache-Control', 'CDN-Cache-Control', 'Surrogate-Control']) headers.set(name, 'no-store');
-  }
-  if (banner.healthy && matchesEtag(condition, etag)) {
-    if (base.body) await base.body.cancel();
-    return new Response(null, { status: 304, headers });
-  }
-  if (request.method === 'HEAD' || !banner.html) return new Response(base.body, { headers });
-  // The marker also exists in previously published pages and the empty fallback.
-  return new HTMLRewriter().on('main', {
-    comments(comment) { if (comment.text.trim() === 'digests:start') comment.before(banner.html, { html: true }); },
-  }).transform(new Response(base.body, { headers }));
-}
 
 interface RequestState {
   context: OperationContext;
@@ -400,7 +363,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         if (!validRssKey(key)) throw rssUnavailable();
         return publicObject(request, env, key, 'rss');
       }
-      if (path === '/' || path === '/index.html') return homepageResponse(request, env, context);
+      if (path === '/' || path === '/index.html') return publicObject(request, env, 'pages/index.html');
       if (/^\/assets\/daily\/[a-f0-9]{64}\.png$/.test(path)) return publicObject(request, env, path.slice(1), 'image');
       if (/^\/images\/[a-f0-9]{64}\.(jpg|png|webp|gif)$/.test(path)) return publicObject(request, env, path.slice(1), 'image');
       throw new HttpError(404, 'Not found');
@@ -451,6 +414,10 @@ function routeFor(path: string): { route: string; operation: string } {
 }
 
 export default {
+  async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+    const origin = env.SITE_ORIGIN || 'https://lakearrowheadtown-preview.harold-martin.workers.dev';
+    await env.PUBLISHER.getByName('site').pullWeatherV1(origin);
+  },
   async fetch(request: Request, env: Env): Promise<Response> {
     const started = performance.now();
     const path = new URL(request.url).pathname;

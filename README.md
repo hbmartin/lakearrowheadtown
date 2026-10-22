@@ -17,9 +17,9 @@ New posts rebuild the homepage without a Git commit, deployment, or CI run. New 
 
 ## Traffic and power alerts
 
-The homepage displays separate **Traffic** and **Power** lists above stories, sorted by latest observation within each list. Rows expand to show the latest effective details and official source. Current and upcoming notices appear; empty groups disappear. Recurring work notices cover the entire announced period, with daily work hours in `detail`. Scheduled power notices remain scheduled until an explicit stage update confirms power is off. The banner is composed on each page load, independently of story rebuilds. Visitors reload to see changes. Alert-read failures are logged and silently omit the banner while news remains available; degraded pages use `no-store` and no ETag.
+The homepage displays separate **Traffic** and **Power** lists above stories, sorted by latest observation within each list. Rows expand to show the latest effective details and official source. Current and upcoming notices appear; empty groups disappear. Recurring work notices cover the entire announced period, with daily work hours in `detail`. Scheduled power notices remain scheduled until an explicit stage update confirms power is off. Alerts and weather are composed into the stored homepage when sources change. Page visits serve that completed HTML without reading alert or weather state. Visitors reload to see a new publication. A failed composition preserves the previous complete page and durable pending intent for the next source event or manual rebuild.
 
-The external watcher collects and verifies conditions. This server does not poll providers. Use the existing `Authorization: Bearer <API_SECRET>` credential. All API replies include `request_id`, `X-Request-ID`, `X-API-Version: 3`, and no-store headers. Public pages require no credential.
+The external watcher collects and verifies conditions. This server does not poll traffic or power providers. Use the existing `Authorization: Bearer <API_SECRET>` credential. All API replies include `request_id`, `X-Request-ID`, `X-API-Version: 3`, and no-store headers. Public pages require no credential.
 
 | Endpoint | Behavior |
 | --- | --- |
@@ -56,7 +56,7 @@ Lifecycle states are `open`, `resolved`, `expired-unconfirmed`, and `retracted`.
 - Without `expected_end`: `expires_at = latest surviving observed_at + 24 elapsed hours`, even for an upcoming notice.
 - Resolved or retracted: `expires_at = null`.
 
-At the exact deadline, an unconfirmed alert leaves the banner but stays in history as `expired-unconfirmed`. **The caller must schedule confirmation before the returned `expires_at`**, including when nothing has changed. A strictly change-only watcher is insufficient for open-ended conditions. Confirm an unchanged condition by submitting `phase: "update"` with the existing `alert_id`, a new persisted `client_ref`, and fresh `observed_at`:
+At the exact deadline, an unconfirmed alert becomes `expired-unconfirmed` in API reads. The static homepage retains its built snapshot until the next source-driven or manual build; it displays the snapshot time and confirmation expiration. No expiration build is scheduled. **The caller must schedule confirmation before the returned `expires_at`**, including when nothing has changed. A strictly change-only watcher is insufficient for open-ended conditions. Confirm an unchanged condition by submitting `phase: "update"` with the existing `alert_id`, a new persisted `client_ref`, and fresh `observed_at`:
 
 ```json
 {
@@ -81,7 +81,19 @@ Persist one exact, case-sensitive `client_ref` per intended submission before se
 
 Retraction uses the exact token that published the target entry and must first commit less than 24 elapsed hours after that entry’s server receipt. Token rotation loses self-retraction access to older-token entries. Retracting an update or resolution replays surviving entries and can reopen or expire the condition; retracting an opening removes the whole alert. History is preserved. If later field-clearing updates depend on the target change, correct their effective fields before retraction (`409 retraction_dependency_conflict`). Repeated authorized retractions return `already_retracted`, including after the initial deadline. Retraction has no `dry_run`; inspect the read/lookup history first. After the deadline, an operator must repair the immutable alert revision and atomically publish a replacement snapshot rather than editing story sources or running a story rebuild.
 
-Alert revisions and snapshots are independent of story and calendar storage. Only replacement of `alerts/current.json` commits an operation; orphan artifacts do not create receipts or public conditions. An uncertain write response may have committed: look up `client_ref` or retry unchanged. Reads and public history never expose publishing-token fingerprints. Existing Worker logs include sanitized alert operation and banner-read failures.
+Alert revisions and snapshots are independent of story and calendar storage. Only replacement of `alerts/current.json` commits an operation; orphan artifacts do not create receipts or public conditions. An uncertain write response may have committed: look up `client_ref` or retry unchanged. Reads and public history never expose publishing-token fingerprints. Existing Worker logs include sanitized alert operations and conditions composition failures.
+
+## Homepage weather
+
+Open Sun publishes `town-card.json` (schema version 1) alongside its other data files at `https://raw.githubusercontent.com/hbmartin/open-sun/data/town-card.json`. The document carries station identity, explicit imperial units, true observation/rainfall dates, forecast issue time, a short outlook, and 24 absolute hourly timestamps with fractional rain probabilities and normalized 90%/60%/30% temperature intervals. The shared fixture in `test/fixtures/town-card.json` is also tested by Open Sun's Python publisher and TypeScript weather helpers.
+
+Production and preview independently poll every ten minutes with conditional requests. A valid changed document is stored privately as `weather/town-card.json` and triggers a conditions-only replacement of the homepage. Invalid versions, station identity, units, hourly spacing, probabilities or bands are rejected; failures retain the last accepted data and complete page. An unchanged document makes no homepage write, except to recover an already pending source-driven composition. Logs include `weather_pull`, `weather_pull_failed`, `conditions_composed`, and `conditions_composition_failed`.
+
+The weather card is full-width with its 24-hour chart on desktops without alerts. With alerts, the desktop row is 60% alerts / 40% weather. Below 960px, alerts stack above a compact weather summary. Clicking the compact card or its keyboard-accessible button opens a separate details card; without JavaScript details are visible. The chart is pre-rendered SVG, scrolls horizontally when needed, and has accessible hourly values. Its window and all displayed conditions remain anchored to the publication; there are no browser data requests or scheduled expiry, aging, midnight or chart-advancement builds. Existing theme/font and news timestamp interactions continue independently.
+
+Weather/alert-only replacements preserve news HTML, footer publication dates, RSS/archive references and storage metadata. News publication and template rebuilds also compose current conditions. Alert source commits retain their existing API certainty contract: if derived homepage composition fails after the source commits, its durable pending marker survives eviction and retries on the next source event (including a duplicate retry) or manual rebuild. No new public API or publishing secret is introduced.
+
+Rollout order: publish Open Sun's document first, deploy preview and run its explicit rebuild, verify the weather after the next poll, then deploy production and verify its explicit rebuild. A normal deploy queues its existing one-off template rebuild; polling only triggers additional builds on changed data. Do not edit the weather snapshot or alert files in R2 manually.
 
 ## Set up Cloudflare
 

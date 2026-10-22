@@ -17,6 +17,7 @@ function renderAlert(alert: AlertView): string {
       ${alert.detail ? `<div class="markdown">${markdown.render(alert.detail)}</div>` : ''}
       <dl class="alert-facts">
         <div><dt>Last reported</dt><dd>${time(alert.observed_at)}</dd></div>
+        ${alert.expires_at ? `<div><dt>Confirmation expires</dt><dd>${time(alert.expires_at)}</dd></div>` : ''}
         ${alert.starts_at ? `<div><dt>Starts</dt><dd>${time(alert.starts_at)}</dd></div>` : ''}
         ${alert.expected_end ? `<div><dt>${alert.category === 'power' ? 'Estimated restoration / end' : 'Expected end'}</dt><dd>${time(alert.expected_end)}</dd></div>` : ''}
         ${count === undefined ? '' : `<div><dt>${alert.power!.stage === 'in-effect' ? 'Customers affected' : 'Customers potentially affected'}</dt><dd>${count.toLocaleString('en-US')}</dd></div>`}

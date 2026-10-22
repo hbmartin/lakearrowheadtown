@@ -13,6 +13,7 @@ import { boundary, DamagedSource } from './errors';
 import { batchRecord, indexPost, loadHistoryIndex, retainedBatches } from './history-index';
 import { prepareWrites } from './prepared-writes';
 import { PublicationConflict } from './publication-conflict';
+import { renderConditions, replaceConditions } from './homepage-conditions';
 import { digestItemWarnings, postedAtWarnings } from './warnings';
 import type { AppendResult, ArchiveProgress, ContentBucket, Digest, HistoryIndex, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishOptions, PublishResult, RetractResult, StoredPost, StoryIdentity, StoryUpdate } from './types';
 
@@ -110,7 +111,8 @@ async function prepareHomepage(bucket: ContentBucket, publication: Publication, 
   }
   publication.archives = options.archives ?? await prepareArchives(bucket, posts, publication, origin, archives, trace, resolve, { cards, allCards: options.allCards });
   const images = await trace.run('image_metadata', () => resolve(posts.flatMap(post => post.items)));
-  const html = await trace.run('rendering', () => boundary('rendering', () => renderPage(posts, { origin, publication, images })));
+  const html = await trace.run('rendering', () => boundary('rendering', async () =>
+    replaceConditions(renderPage(posts, { origin, publication, images }), await renderConditions(bucket))));
   const feed = await trace.run('rss_rendering', () => boundary('rendering', () => renderRss(posts, { origin, publication, images })));
   const manifest = `publications/${crypto.randomUUID()}.json`;
   const rss = manifest.replace(/\.json$/, '.rss.xml');
