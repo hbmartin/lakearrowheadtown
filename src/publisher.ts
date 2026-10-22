@@ -1,10 +1,11 @@
+import { captureChanges, readChanges, type ChangesReply } from './changes';
 import { DurableObject } from 'cloudflare:workers';
 import { appendUpdate, currentPublication, initialMigration, migrateBatch, PublicationError, publishDigest, rebuildHomepage, retractPost } from './publishing';
 import { findBatch, loadHistoryIndex } from './history-index';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { committedSnapshot, requireCommittedManifest, type CommittedSnapshot } from './committed';
 import { asHttpError, boundary, HttpError, publicationFailure } from './errors';
-import { alertRpcFailure, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type AlertsReply } from './alerts';
+import { alertRpcFailure, confirmAlerts, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type AlertsReply } from './alerts';
 import { readPosts, type PostsReply } from './posts';
 import { publishEvents, readEvents, type EventDigest, type EventsReply } from './events';
 import { validateRepair, type RepairReply } from './publication-repair';
@@ -35,8 +36,8 @@ export class DigestPublisher extends DurableObject<Env> {
   }
 
   private async finishConditions(origin = this.conditionsOrigin(), context?: OperationContext): Promise<void> {
-    if (!await this.ctx.storage.get('conditions:pending')) return;
     try {
+      if (!await this.ctx.storage.get('conditions:pending')) return;
       await this.repairCoordinator().recover(new OperationTrace(context));
       await composeHomepageConditions(this.env.SITE_BUCKET, origin);
       await this.ctx.storage.delete('conditions:pending');
@@ -168,23 +169,36 @@ export class DigestPublisher extends DurableObject<Env> {
     }, context);
   }
 
-  async retractAlertEntryV1(alertId: string, entryId: string, owner: string, context?: OperationContext): Promise<AlertsReply> {
+  async retractAlertEntryV1(alertId: string, entryId: string, owner: string, context?: OperationContext, dryRun = false): Promise<AlertsReply> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
         const result = await retractAlertEntry(this.env.SITE_BUCKET, alertId, entryId, owner, new Date(), context,
-          () => this.ctx.storage.put('conditions:pending', true));
-        await this.finishConditions(undefined, context);
+          () => this.ctx.storage.put('conditions:pending', true), dryRun);
+        if (!dryRun) await this.finishConditions(undefined, context);
         return { ok: true, result };
       }
       catch (error) { return alertRpcFailure(error, context); }
     }, context);
   }
 
-  async readAlertsV1(query: string, context?: OperationContext): Promise<AlertsReply> {
+  async confirmAlertsV1(inputs: unknown[], context?: OperationContext, dryRun = false): Promise<AlertsReply> {
+    context = this.executingContext(context);
+    return this.serialize(async () => {
+      try {
+        if (!dryRun && this.env.ALERT_CONFIRMATIONS_ENABLED !== 'true') throw new HttpError(503, 'Confirmation writes are not enabled. Deploy compatible readers before enabling this endpoint.', {}, { code: 'confirmations_not_enabled' });
+        const result = await confirmAlerts(this.env.SITE_BUCKET, inputs, new Date(), context, dryRun,
+          () => this.ctx.storage.put('conditions:pending', true));
+        if (!dryRun) await this.finishConditions(undefined, context);
+        return { ok: true, result };
+      } catch (error) { return alertRpcFailure(error, context); }
+    }, context);
+  }
+
+  async readAlertsV1(query: string, context?: OperationContext, alertId?: string): Promise<AlertsReply> {
     context = this.executingContext(context);
     try {
-      return { ok: true, result: await readAlerts(this.env.SITE_BUCKET, new URLSearchParams(query), await this.getCursorKey()) };
+      return { ok: true, result: await readAlerts(this.env.SITE_BUCKET, new URLSearchParams(query), await this.getCursorKey(), new Date(), alertId) };
     } catch (error) { return alertRpcFailure(error, context); }
   }
 
@@ -272,6 +286,23 @@ export class DigestPublisher extends DurableObject<Env> {
       return key;
     })).catch(error => { this.cursorKey = undefined; throw error; });
     return this.cursorKey;
+  }
+
+  async readChangesV1(query: string, context?: OperationContext): Promise<ChangesReply> {
+    context = this.executingContext(context);
+    const trace = new OperationTrace(context);
+    try {
+      const key = await trace.run('cursor_key', () => this.getCursorKey());
+      return { ok: true, result: await trace.run('changes_read', () => readChanges(this.env.SITE_BUCKET, new URLSearchParams(query), key,
+        () => this.serialize(async () => {
+          const migration = await boundary('storage', () => this.ctx.storage.get<Migration>('migration'));
+          return captureChanges(this.env.SITE_BUCKET, new Date(), migration?.complete ?? false);
+        }, context), new Date(), context)) };
+    } catch (error) {
+      const failure = asHttpError(error); const stage = trace.failed_stage ?? 'changes_read';
+      emit('changes_read_failed', context, { stage, error_code: failure.code, ...safeError(error) }, 'error');
+      return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, retryable: failure.retryable, stage, publication_status: 'not_attempted' } };
+    }
   }
 
   async readPostsV1(query: string, context?: OperationContext): Promise<PostsReply> {

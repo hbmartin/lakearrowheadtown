@@ -8,6 +8,7 @@ export default defineConfig({
       bindings: {
         API_SECRET: 'test-secret-at-least-thirty-two-characters-long',
         SITE_ORIGIN: 'https://lakearrowhead.town',
+        ALERT_CONFIRMATIONS_ENABLED: 'true',
       },
     },
   })],

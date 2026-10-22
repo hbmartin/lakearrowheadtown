@@ -55,10 +55,12 @@ export interface Suggestion {
 export interface PublicationWarning {
   index?: number;
   field: string;
-  code: 'unknown_category' | 'posted_at_in_future' | 'posted_at_stale';
+  code: 'unknown_category' | 'posted_at_in_future' | 'posted_at_stale' | 'possible_duplicate_alert';
   message: string;
   value: string;
   server_time?: string;
+  matches?: { alert_id: string; reason: 'source_event_id' | 'location' }[];
+  matches_truncated?: boolean;
 }
 
 export interface AppendResult extends StoryIdentity {
@@ -158,6 +160,7 @@ export interface Publication {
   archives?: string;
   legacy_receipts?: Record<string, string>;
   history_index?: string;
+  sync_index?: string;
 }
 
 export interface Migration {
@@ -195,6 +198,7 @@ export interface Env {
   PUBLISHER: DurableObjectNamespace<DigestPublisher>;
   CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
   ENVIRONMENT?: string;
+  ALERT_CONFIRMATIONS_ENABLED?: string;
 }
 
 // A narrow storage interface also allows failure injection in publishing tests.

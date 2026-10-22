@@ -36,7 +36,24 @@ export async function smokeAlerts(origin, request, headers) {
     assert.equal(conflict.status, 409); assert.equal((await conflict.json()).code, 'client_ref_conflict');
     const lookup = await send(`/api/alerts?client_ref=${encodeURIComponent(traffic.client_ref)}`);
     assert.equal(lookup.entry_id, published.entry_id); assert.equal(lookup.expires_at, published.expires_at);
+    const compact = await send(`/api/alerts/${published.alert_id}?fields=index`);
+    assert.equal(compact.fields, 'index'); assert.equal(compact.alert.alert_id, published.alert_id);
+    assert(!('history' in compact.alert)); assert(!('detail' in compact.alert));
+    assert.equal((await send('/api/alerts?fields=index')).fields, 'index');
     const outage = await send('/api/alerts', power); openings.push(outage);
+    const checks = { confirmations: [{ client_ref: `${run}:batch-confirm`, alert_id: outage.alert_id, source: power.source, source_url: power.source_url, observed_at: new Date().toISOString() }] };
+    const checkPreview = await send('/api/alerts/confirmations?dry_run=true', checks);
+    assert.equal(checkPreview.counts.confirmed, 1); assert.equal(checkPreview.committed, false);
+    const checkResponse = await request(origin + '/api/alerts/confirmations', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(checks) });
+    const checked = await checkResponse.json();
+    if (checkResponse.status === 503) assert.equal(checked.code, 'confirmations_not_enabled');
+    else {
+      assert.equal(checkResponse.status, 200); assert.equal(checked.counts.confirmed, 1);
+      assert.equal((await send('/api/alerts/confirmations', checks)).counts.duplicates, 1);
+      const coalesced = await send(`/api/alerts/${outage.alert_id}?history=coalesced`);
+      assert.equal(coalesced.history, 'coalesced'); assert.equal(coalesced.alert.history[1].confirmation_run.count, 1);
+    }
+
     const page = await request(origin, { headers: { 'If-None-Match': before.headers.get('etag') } });
     assert.equal(page.status, 200);
     const tag = page.headers.get('etag'); const html = await page.text();
@@ -58,7 +75,10 @@ export async function smokeAlerts(origin, request, headers) {
     assert.equal(dryResolution.expires_at, null); assert.equal(dryResolution.committed, false);
     const resolved = await send('/api/alerts', resolving); assert.equal(resolved.expires_at, null);
     assert(!(await (await request(origin)).text()).includes(power.headline));
-    const undone = await send(`/api/alerts/${resolved.alert_id}/entries/${resolved.entry_id}/retract`, {});
+    const retractPath = `/api/alerts/${resolved.alert_id}/entries/${resolved.entry_id}/retract`;
+    const retractPreview = await send(retractPath + '?dry_run=true', {});
+    assert.equal(retractPreview.state, 'open'); assert.equal(retractPreview.committed, false);
+    const undone = await send(retractPath, {});
     assert.equal(undone.state, 'open'); assert(undone.expires_at);
     let cursor;
     let found = false;
