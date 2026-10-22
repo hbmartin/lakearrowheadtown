@@ -1,3 +1,4 @@
+import { localDate as dateAt } from './feed';
 import { escapeHtml } from './html';
 import { isDate, isTimestamp } from './validation';
 import { record } from './primitives';
@@ -17,7 +18,7 @@ export interface TownWeather {
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const nullable = (v: unknown, min = -150, max = 150): boolean => v === null || finite(v) && v >= min && v <= max;
 const string = (v: unknown, max: number): v is string => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
-const localDate = (at: string) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(at));
+const localDate = (at: string) => dateAt(new Date(at));
 
 /** Validate at both the upstream boundary and the stored-document boundary. */
 export function validateWeather(value: unknown): TownWeather {
@@ -92,7 +93,8 @@ export function renderWeatherChart(hours: WeatherHour[]): string {
   const details = hours.map((h, i) => {
     const label = `${dateTime.format(new Date(h.valid_time))}: ${temp(h.temp_f)}, rain ${h.pop === null ? 'unavailable' : `${Math.round(h.pop * 100)}%`}${h.bands.length ? `; likely ${temp(h.bands[1].low_f)} to ${temp(h.bands[1].high_f)} (60% interval)` : ''}`;
     const dateChange = i === 0 || localDate(h.valid_time) !== localDate(hours[i - 1].valid_time);
-    const tick = i % 3 === 0 || dateChange;
+    const nearBoundary = hours.some((hour, j) => j !== i && Math.abs(j - i) < 2 && (j === 0 || localDate(hour.valid_time) !== localDate(hours[j - 1].valid_time)));
+    const tick = dateChange || i % 3 === 0 && !nearBoundary;
     return `${dateChange ? `<line class="weather-grid" x1="${x(i)}" x2="${x(i)}" y1="10" y2="250"/><text x="${x(i)}" y="22" text-anchor="middle">${escapeHtml(dayTime.format(new Date(h.valid_time)))}</text>` : ''}
       ${tick ? `<text x="${x(i)}" y="215" text-anchor="middle">${escapeHtml(hourTime.format(new Date(h.valid_time)))}</text>` : ''}
       ${h.temp_f === null ? '' : `<circle class="weather-point" cx="${x(i)}" cy="${y(h.temp_f)}" r="3.5"><title>${escapeHtml(label)}</title></circle>`}

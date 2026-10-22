@@ -145,3 +145,33 @@ describe('static weather publication', () => {
     expect(await (await bucket.get(index!.customMetadata!.rss))!.text()).toContain('A saved story');
   });
 });
+
+it('publishes news with an unavailable marker and recovers from repaired conditions', async () => {
+  await bucket.put(WEATHER_KEY, '{broken');
+  await publishDigest(bucket, digest, base, new Date());
+  const degraded = (await bucket.get('pages/index.html'))!;
+  expect(await degraded.text()).toContain('Mountain conditions are temporarily unavailable.');
+  expect(degraded.customMetadata?.conditions_status).toBe('unavailable');
+  await bucket.put(WEATHER_KEY, JSON.stringify(sample()));
+  await runInDurableObject(publisher(), async instance => (instance as any).finishConditions(base));
+  const repaired = (await bucket.get('pages/index.html'))!;
+  expect(await repaired.text()).toContain('Today on the mountain');
+  expect(repaired.customMetadata?.conditions_status).toBeUndefined();
+});
+it('replaces corrupt stored weather without sending its conditional ETag', async () => {
+  await bucket.put(WEATHER_KEY, '{broken');
+  await runInDurableObject(publisher(), async (_, state) => state.storage.put('weather:etag', '"bad"'));
+  const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify(sample()), { headers: { ETag: '"good"' } }));
+  await publisher().pullWeatherV1(base);
+  expect(fetcher.mock.calls[0][1]).toMatchObject({ headers: {} });
+  expect(await (await bucket.get(WEATHER_KEY))!.json()).toEqual(sample());
+});
+it('allows news publishing while upstream weather is still being fetched', async () => {
+  let release!: (response: Response) => void; let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  vi.spyOn(globalThis, 'fetch').mockImplementation(() => { entered(); return new Promise(resolve => { release = resolve; }); });
+  const pulling = publisher().pullWeatherV1(base);
+  await started;
+  try { expect(await publisher().publishV2(digest, base)).toMatchObject({ ok: true }); }
+  finally { release(new Response(JSON.stringify(sample()))); await pulling; }
+});

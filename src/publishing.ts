@@ -14,7 +14,7 @@ import { boundary, DamagedSource } from './errors';
 import { batchRecord, indexPost, loadHistoryIndex, retainedBatches } from './history-index';
 import { prepareWrites } from './prepared-writes';
 import { PublicationConflict } from './publication-conflict';
-import { renderConditions, replaceConditions } from './homepage-conditions';
+import { conditionsSnapshot, replaceConditions } from './homepage-conditions';
 import { digestItemWarnings, postedAtWarnings } from './warnings';
 import type { AppendResult, ArchiveProgress, ContentBucket, Digest, HistoryIndex, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishOptions, PublishResult, RetractResult, StoredPost, StoryIdentity, StoryUpdate } from './types';
 
@@ -74,7 +74,7 @@ export async function currentPublication(bucket: ContentBucket, discover?: () =>
   if (requireManifest) requireCommittedManifest(snapshot);
   // Bootstrap old deployments using server storage times, never client dates.
   const legacy = await (discover ? discover() : trace ? trace.run('legacy_discovery', () => legacyReferences(bucket)) : legacyReferences(bucket));
-  const anchor = snapshot.index?.uploaded ?? (legacy.length ? new Date([...legacy].sort(order)[0].received_at) : null);
+  const anchor = (snapshot.index?.customMetadata?.conditions_only === 'true' ? undefined : snapshot.index?.uploaded) ?? (legacy.length ? new Date([...legacy].sort(order)[0].received_at) : null);
   const days = anchor ? recentDates(anchor) : [];
   const archives = await snapshot.archives();
   return { version: 1, posts: legacy.filter(post => days.includes(post.date)).sort(order), snapshot_date: days[0] ?? null,
@@ -112,8 +112,9 @@ async function prepareHomepage(bucket: ContentBucket, publication: Publication, 
   }
   publication.archives = options.archives ?? await prepareArchives(bucket, posts, publication, origin, archives, trace, resolve, { cards, allCards: options.allCards });
   const images = await trace.run('image_metadata', () => resolve(posts.flatMap(post => post.items)));
+  const conditions = await conditionsSnapshot(bucket, trace.context);
   const html = await trace.run('rendering', () => boundary('rendering', async () =>
-    replaceConditions(renderPage(posts, { origin, publication, images }), await renderConditions(bucket))));
+    replaceConditions(renderPage(posts, { origin, publication, images }), conditions.html)));
   const feed = await trace.run('rss_rendering', () => boundary('rendering', () => renderRss(posts, { origin, publication, images })));
   const manifest = `publications/${crypto.randomUUID()}.json`;
   const rss = manifest.replace(/\.json$/, '.rss.xml');
@@ -131,7 +132,7 @@ async function prepareHomepage(bucket: ContentBucket, publication: Publication, 
   await trace.run('manifest_write', () => boundary('storage', () => bucket.put(manifest, serialized, { httpMetadata: { contentType: 'application/json' } })));
   await trace.run('rss_write', () => boundary('storage', () => bucket.put(rss, feed, { httpMetadata: { contentType: RSS_TYPE, cacheControl: HTML_CACHE } })));
   // The single index replacement commits HTML and both immutable snapshot references.
-  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest, rss, archives: publication.archives! } })));
+  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest, rss, archives: publication.archives!, ...(!conditions.available ? { conditions_status: 'unavailable' } : {}) } })));
 }
 
 async function retainedSources(bucket: ContentBucket, now: Date, migrationComplete: boolean, trace: OperationTrace, context?: OperationContext, provided?: Publication, snapshot?: CommittedSnapshot, requiredPostId?: string) {
