@@ -197,6 +197,7 @@ export interface Env {
   PUBLISHER: DurableObjectNamespace<DigestPublisher>;
   CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
   ENVIRONMENT?: string;
+  ALERT_CONFIRMATIONS_ENABLED?: string;
 }
 
 // A narrow storage interface also allows failure injection in publishing tests.

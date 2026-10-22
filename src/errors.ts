@@ -90,8 +90,8 @@ export function committedFailureAdvice(retryable: boolean, operation?: string): 
 export function publicationFailure(error: unknown, stage: string, publication_status: PublicationStatus, operation?: string): PublishFailure {
   const failure = asHttpError(error);
   const retryable = publication_status === 'unknown' || failure.retryable;
-  if (['alert', 'alert_retract'].includes(operation ?? '') && retryable && ['unknown', 'not_committed'].includes(publication_status)) {
-    const advice = operation === 'alert_retract'
+  if (['alert', 'alert_retract', 'alert_confirm'].includes(operation ?? '') && retryable && ['unknown', 'not_committed'].includes(publication_status)) {
+    const advice = operation === 'alert_confirm' ? 'Look up each confirmation client_ref or retry the unchanged batch within the original 30 Los Angeles receipt-date reference window.' : operation === 'alert_retract'
       ? 'Reconcile the alert history or retry the same retraction with its original publishing token; a first retraction must commit within 24 hours of the entry receipt.'
       : 'Look up GET /api/alerts?client_ref=YOUR_REFERENCE or retry the unchanged submission within its original 30 Los Angeles receipt-date reference window.';
     return { status: failure.status, code: failure.code, error: `${publication_status === 'unknown' ? 'Unable to confirm the alert operation; it may have completed.' : 'The alert operation did not commit.'} ${advice}`, stage, publication_status, retryable };

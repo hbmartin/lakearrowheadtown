@@ -41,6 +41,19 @@ export async function smokeAlerts(origin, request, headers) {
     assert(!('history' in compact.alert)); assert(!('detail' in compact.alert));
     assert.equal((await send('/api/alerts?fields=index')).fields, 'index');
     const outage = await send('/api/alerts', power); openings.push(outage);
+    const checks = { confirmations: [{ client_ref: `${run}:batch-confirm`, alert_id: outage.alert_id, source: power.source, source_url: power.source_url, observed_at: new Date().toISOString() }] };
+    const checkPreview = await send('/api/alerts/confirmations?dry_run=true', checks);
+    assert.equal(checkPreview.counts.confirmed, 1); assert.equal(checkPreview.committed, false);
+    const checkResponse = await request(origin + '/api/alerts/confirmations', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(checks) });
+    const checked = await checkResponse.json();
+    if (checkResponse.status === 503) assert.equal(checked.code, 'confirmations_not_enabled');
+    else {
+      assert.equal(checkResponse.status, 200); assert.equal(checked.counts.confirmed, 1);
+      assert.equal((await send('/api/alerts/confirmations', checks)).counts.duplicates, 1);
+      const coalesced = await send(`/api/alerts/${outage.alert_id}?history=coalesced`);
+      assert.equal(coalesced.history, 'coalesced'); assert.equal(coalesced.alert.history[1].confirmation_run.count, 1);
+    }
+
     const page = await request(origin, { headers: { 'If-None-Match': before.headers.get('etag') } });
     assert.equal(page.status, 200);
     const tag = page.headers.get('etag'); const html = await page.text();

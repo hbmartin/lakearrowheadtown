@@ -7,12 +7,14 @@ export const duplicateMessage = 'This exact source URL already belongs to a reta
 
 export function errorSuggestion(code: string, retryable: boolean, dryRun = false, operation?: string, publicationStatus?: PublicationStatus): Suggestion {
   if (dryRun && retryable) return { action: 'retry_preview', message: 'Retry the unchanged preview. No publication was attempted.' };
-  if (['alert', 'alert_retract', 'alerts_read'].includes(operation ?? '')) {
+  if (['alert', 'alert_retract', 'alert_confirm', 'alerts_read'].includes(operation ?? '')) {
     if (code === 'client_ref_conflict') return { action: 'look_up_alert', message: 'Look up the exact client_ref before choosing a new reference for an intentional new submission.', method: 'GET', path: '/api/alerts' };
-    if (['invalid_cursor', 'invalid_days', 'invalid_fields'].includes(code)) return { action: 'restart_read', message: 'Start a fresh alert read with days between 1 and 30, omit fields, and follow next_cursor without changing days.', method: 'GET', path: '/api/alerts?days=30' };
+    if (['invalid_cursor', 'invalid_days', 'invalid_fields', 'invalid_history'].includes(code)) return { action: 'restart_read', message: 'Start a fresh alert read with days between 1 and 30, choose fields=full or fields=index, and follow next_cursor without changing its representation or history mode.', method: 'GET', path: '/api/alerts?days=30' };
     if (['alert_not_found', 'alert_entry_not_found', 'alert_reference_not_found', 'stale_observation', 'alert_closed', 'alert_identity_conflict', 'retraction_dependency_conflict'].includes(code)) return { action: 'reconcile_alert', message: 'Read alert history before sending a fresh observation, correcting dependent fields, or opening a new occurrence.', method: 'GET', path: '/api/alerts?days=30' };
     if (['retract_forbidden', 'retract_window_expired'].includes(code)) return { action: 'contact_operator', message: 'Retraction requires the original publishing token and an entry received less than 24 hours ago.' };
-    if (code === 'invalid_dry_run' && operation === 'alert_retract') return { action: 'remove_dry_run', message: 'Retraction does not support dry_run; inspect alert history first.' };
+    if (code === 'invalid_dry_run') return { action: 'correct_dry_run', message: 'Use one dry_run=true or dry_run=false query parameter.' };
+    if (code === 'confirmation_not_retractable') return { action: 'correct_alert', message: 'Confirmations cannot be undone. Submit a corrective observation or contact the operator if the latest observation prevents correction.' };
+    if (code === 'confirmations_not_enabled') return { action: 'complete_reader_rollout', message: 'Deploy compatible alert readers, then enable ALERT_CONFIRMATIONS_ENABLED before sending confirmation writes.' };
     if (retryable) return { action: operation === 'alert_retract' ? 'reconcile_or_retry_retraction' : 'look_up_or_retry_alert', message: operation === 'alert_retract'
       ? 'Read alert history or retry the same retraction promptly with its original token.'
       : 'Look up the exact client_ref or retry the unchanged submission within its original 30 Los Angeles receipt-date reference window.', method: 'GET', path: '/api/alerts' };

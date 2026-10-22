@@ -4,7 +4,7 @@ import { findBatch, loadHistoryIndex } from './history-index';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { committedSnapshot, requireCommittedManifest, type CommittedSnapshot } from './committed';
 import { asHttpError, boundary, HttpError, publicationFailure } from './errors';
-import { alertRpcFailure, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type AlertsReply } from './alerts';
+import { alertRpcFailure, confirmAlerts, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type AlertsReply } from './alerts';
 import { readPosts, type PostsReply } from './posts';
 import { publishEvents, readEvents, type EventDigest, type EventsReply } from './events';
 import { validateRepair, type RepairReply } from './publication-repair';
@@ -178,6 +178,19 @@ export class DigestPublisher extends DurableObject<Env> {
         return { ok: true, result };
       }
       catch (error) { return alertRpcFailure(error, context); }
+    }, context);
+  }
+
+  async confirmAlertsV1(inputs: unknown[], context?: OperationContext, dryRun = false): Promise<AlertsReply> {
+    context = this.executingContext(context);
+    return this.serialize(async () => {
+      try {
+        if (!dryRun && this.env.ALERT_CONFIRMATIONS_ENABLED !== 'true') throw new HttpError(503, 'Confirmation writes are not enabled. Deploy compatible readers before enabling this endpoint.', {}, { code: 'confirmations_not_enabled' });
+        const result = await confirmAlerts(this.env.SITE_BUCKET, inputs, new Date(), context, dryRun,
+          () => this.ctx.storage.put('conditions:pending', true));
+        if (!dryRun && result.counts.confirmed) await this.finishConditions(undefined, context);
+        return { ok: true, result };
+      } catch (error) { return alertRpcFailure(error, context); }
     }, context);
   }
 
