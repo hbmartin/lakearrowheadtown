@@ -5,6 +5,7 @@
   "compatibility_date": "2026-10-16",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  "triggers": { "crons": ["*/10 * * * *"] },
   "preview_urls": false,
   "cache": { "enabled": true },
   "routes": [{ "pattern": "lakearrowhead.town", "custom_domain": true }],
@@ -24,6 +25,7 @@
   "env": {
     "preview": {
       "name": "lakearrowheadtown-preview",
+      "triggers": { "crons": ["*/10 * * * *"] },
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
       "observability": { "enabled": true, "redact_query_string": true, "logs": { "enabled": true, "persist": true, "invocation_logs": true, "head_sampling_rate": 1 }, "traces": { "enabled": true, "persist": true, "head_sampling_rate": 1 } },
       "routes": [],

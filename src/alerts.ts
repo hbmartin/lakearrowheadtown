@@ -265,7 +265,7 @@ async function commitRecord(bucket: ContentBucket, manifest: Manifest, value: Al
   trace.publication_status = 'committed';
 }
 
-export async function submitAlert(bucket: ContentBucket, input: AlertInput, owner: string, now = new Date(), context?: OperationContext, dryRun = false): Promise<AlertMutationResult> {
+export async function submitAlert(bucket: ContentBucket, input: AlertInput, owner: string, now = new Date(), context?: OperationContext, dryRun = false, beforeCommit?: () => Promise<void>): Promise<AlertMutationResult> {
   const trace = new OperationTrace(context);
   try {
     // Revalidate at the serialized boundary, not just in the public Worker.
@@ -299,7 +299,10 @@ export async function submitAlert(bucket: ContentBucket, input: AlertInput, owne
       const entry: StoredEntry = { entry_id: crypto.randomUUID(), received_at: now.toISOString(), input, publisher_fingerprint: owner };
       value = { ...value, entries: [...value.entries, entry] };
       result = mutationResult(value, entry, 'published', now);
-      if (!dryRun) await commitRecord(bucket, manifest, value, now, trace, { client_ref: input.client_ref, payload_hash, alert_id: value.alert_id, entry_id: entry.entry_id, received_at: entry.received_at });
+      if (!dryRun) {
+        if (beforeCommit) await trace.run('alert_homepage_intent', beforeCommit);
+        await commitRecord(bucket, manifest, value, now, trace, { client_ref: input.client_ref, payload_hash, alert_id: value.alert_id, entry_id: entry.entry_id, received_at: entry.received_at });
+      }
     }
     emit(dryRun ? 'alert_preview_result' : 'alert_publish_result', context, { alert_id: result.alert_id, entry_id: result.entry_id, state: result.state, expires_at: result.expires_at, outcome: dryRun ? 'preview' : result.status });
     return { ...result, ...(dryRun ? { dry_run: true, committed: false, checked_at: now.toISOString() } : {}) };
@@ -315,7 +318,7 @@ function alertFailure(error: unknown, trace: OperationTrace, dryRun = false): Ht
   { alert_stage: trace.failed_stage ?? 'alerts' });
 }
 
-export async function retractAlertEntry(bucket: ContentBucket, alertId: string, entryId: string, owner: string, now = new Date(), context?: OperationContext): Promise<AlertMutationResult> {
+export async function retractAlertEntry(bucket: ContentBucket, alertId: string, entryId: string, owner: string, now = new Date(), context?: OperationContext, beforeCommit?: () => Promise<void>): Promise<AlertMutationResult> {
   const trace = new OperationTrace(context);
   try {
     const manifest = await trace.run('alert_manifest_loading', () => loadManifest(bucket));
@@ -333,6 +336,7 @@ export async function retractAlertEntry(bucket: ContentBucket, alertId: string, 
       try { validateEffective(effective); }
       catch { throw new HttpError(409, 'Later entries depend on this change. Correct their fields before retracting it.', {}, { code: 'retraction_dependency_conflict' }); }
     }
+    if (beforeCommit) await trace.run('alert_homepage_intent', beforeCommit);
     await commitRecord(bucket, manifest, next, now, trace);
     return mutationResult(next, entry, 'retracted', now);
   } catch (error) { throw alertFailure(error, trace); }

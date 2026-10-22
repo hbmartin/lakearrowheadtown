@@ -293,11 +293,11 @@ describe('API and homepage integration', () => {
     expect(html).toContain('Customers potentially affected'); expect(html).not.toContain('Power off');
     expect(html).toContain('PDT');
   });
-  it('injects alerts above stories even with an empty homepage and revalidates at expiry', async () => {
+  it('builds alerts above stories and retains the snapshot at expiry', async () => {
     const now = new Date();
     vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(now);
     const empty = await request('/'); const emptyTag = empty.headers.get('etag')!; await empty.text();
-    const opened = await submitAlert(bucket, traffic({ observed_at: now.toISOString() }), owner, now);
+    const opened = await (await post(traffic({ observed_at: now.toISOString() }))).json<AlertMutationResult>();
     const page = await request('/', { headers: { 'If-None-Match': emptyTag } });
     expect(page.status).toBe(200);
     const tag = page.headers.get('etag')!; const html = await page.text();
@@ -308,18 +308,19 @@ describe('API and homepage integration', () => {
     expect(await (await request('/road-conditions/')).text()).not.toContain('class="alerts-banner"');
     vi.setSystemTime(new Date(Date.parse(opened.expires_at!)));
     const expired = await request('/', { headers: { 'If-None-Match': tag } });
-    expect(expired.status).toBe(200); expect(expired.headers.get('etag')).toBe(emptyTag);
-    expect(await expired.text()).not.toContain('class="alerts-banner"');
+    expect(expired.status).toBe(304); expect(expired.headers.get('etag')).toBe(tag);
+    expect(await (await request('/')).text()).toContain('class="alerts-banner"');
   });
-  it('silently hides read failures, logs them, disables caching, and recovers', async () => {
-    await bucket.put('pages/index.html', renderPage([], { origin: base }));
-    await submitAlert(bucket, traffic({ observed_at: new Date().toISOString() }), owner);
-    const healthy = await request('/'); const tag = healthy.headers.get('etag')!; await healthy.text();
-    const failedBucket = wrapped({ get(key) { if (key === ALERTS_KEY) throw new Error('offline'); return bucket.get(key); } }) as R2Bucket;
-    const response = await request('/', { headers: { 'If-None-Match': tag } }, { SITE_BUCKET: failedBucket });
-    expect(response.status).toBe(200); expect(response.headers.get('cache-control')).toBe('no-store'); expect(response.headers.has('etag')).toBe(false);
-    const html = await response.text(); expect(html).toContain('No posts from the past week'); expect(html).not.toContain('class="alerts-banner"');
-    expect(JSON.stringify(loggedErrors)).toContain('alerts_banner_failed');
-    expect((await request('/', { headers: { 'If-None-Match': tag } })).status).toBe(304);
+  it('serves the built snapshot without reading alert state or changing cache behavior', async () => {
+    await post(traffic({ observed_at: new Date().toISOString() }));
+    const healthy = await request('/'); const tag = healthy.headers.get('etag')!;
+    const html = await healthy.text();
+    const reads: string[] = [];
+    const failedBucket = wrapped({ get(key) { reads.push(key); if (key === ALERTS_KEY) throw new Error('offline'); return bucket.get(key); } }) as R2Bucket;
+    const response = await request('/', {}, { SITE_BUCKET: failedBucket });
+    expect(response.status).toBe(200); expect(response.headers.get('etag')).toBe(tag);
+    expect(await response.text()).toBe(html);
+    expect(reads).not.toContain(ALERTS_KEY);
+    expect((await request('/', { headers: { 'If-None-Match': tag } }, { SITE_BUCKET: failedBucket })).status).toBe(304);
   });
 });
