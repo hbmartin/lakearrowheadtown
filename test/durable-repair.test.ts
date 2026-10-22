@@ -5,6 +5,7 @@ import worker from '../src/worker';
 import { currentPublication, publishDigest } from '../src/publishing';
 import { failureError, OperationFailure } from '../src/errors';
 import { REPAIR_MARKER } from '../src/repair-coordinator';
+import { REBUILD_MARKER } from '../src/index-metadata';
 import type { Digest, Env, RebuildJob } from '../src/types';
 
 const bindings = env as unknown as Env;
@@ -224,7 +225,7 @@ it('persists reconciliation backoff, honors premature alarms, and gates other in
   const { input } = await seed(); let clock = Date.now();
   vi.spyOn(Date, 'now').mockImplementation(() => clock);
   let response: any;
-  for (const [i, seconds] of [1, 2, 4, 8, 16, 30, 30].entries()) {
+  for (const [i, seconds] of [5, 10, 20, 40, 80, 160, 300].entries()) {
     await inside(publisher(), async instance => {
       const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
       const spy = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => {
@@ -311,13 +312,20 @@ it('rejects deletion between snapshot selection and repair write without recreat
 });
 
 it('stalls after ten failures, keeps status reads pure, and requires guarded explicit recovery', async () => {
-  const { input } = await seed(); let result: any;
+  const { input } = await seed(); let result: any; let cycleStart = 0;
   await inside(publisher(), async (instance, state) => {
     const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
     const fail = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') throw new Error('offline'); return put(key, ...args); });
-    try { for (let i = 0; i < 10; i++) result = await instance.publicationRepairV1(input, origin); }
+    try { for (let i = 0; i < 10; i++) {
+      result = await instance.publicationRepairV1(input, origin);
+      const key = (await state.storage.get<string>('publication_repair_pending'))!;
+      const saved = await state.storage.get<any>(key);
+      if (i === 0) cycleStart = Date.parse(saved.next_retry_at) - 5000;
+      if (i < 9) vi.setSystemTime(new Date(saved.next_retry_at));
+    } }
     finally { fail.mockRestore(); }
     expect(result).toMatchObject({ ok: false, failure: { code: 'repair_stalled', retryable: false } });
+    expect(Date.now() - cycleStart).toBe(1_215_000);
     expect(await state.storage.getAlarm()).toBeNull();
     const recordKey = await state.storage.get<string>('publication_repair_pending');
     const saved = await state.storage.get<any>(recordKey!);
@@ -379,4 +387,139 @@ it('propagates a failed recovery backoff write instead of acknowledging alarm de
       finally { failedSchedule.mockRestore(); }
     } finally { failedPut.mockRestore(); }
   });
+});
+
+it.each([0, 1])('validates the complete repair metadata before journaling at limit + %s bytes', async excess => {
+  const { input } = await seed();
+  const index = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
+  const metadata = { ...index.customMetadata, padding: '' };
+  const size = Object.entries(metadata).reduce((n, [key, value]) => n + new TextEncoder().encode(key + value).length, 0);
+  metadata.padding = 'x'.repeat(8192 - REPAIR_MARKER.length - 36 - size + excess);
+  await bindings.SITE_BUCKET.put('pages/index.html', await index.text(), { customMetadata: metadata });
+  input.expected_version = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
+  const response = await request(input);
+  expect(response.status).toBe(excess ? 400 : 200);
+  if (excess) {
+    expect(await response.json()).toMatchObject({ code: 'invalid_repair_target' });
+    await inside(publisher(), async (_, state) => {
+      expect(await state.storage.get('publication_repair_pending')).toBeUndefined();
+      expect(await state.storage.get('jobs')).toBeUndefined();
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  }
+});
+
+it('identical early retries cannot consume the repair budget or dispatch another write', async () => {
+  const { input } = await seed();
+  await inside(publisher(), async (instance, state) => {
+    const store = instance.env.SITE_BUCKET; const put = store.put.bind(store); let writes = 0;
+    const spy = vi.spyOn(store, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') { writes++; throw new Error('offline'); } return put(key, ...args); });
+    try { for (let i = 0; i < 12; i++) expect(await instance.publicationRepairV1(input, origin)).toMatchObject({ ok: false, failure: { code: 'repair_pending' } }); }
+    finally { spy.mockRestore(); }
+    const key = (await state.storage.get<string>('publication_repair_pending'))!;
+    expect(await state.storage.get(key)).toMatchObject({ attempts: 1, stalled: false }); expect(writes).toBe(1);
+  });
+});
+
+it.each(['own', 'other'] as const)('reconciles a late %s metadata write between HEAD and GET without false certainty', async who => {
+  const { input } = await seed();
+  await inside(publisher(), async (instance, state) => {
+    const store = instance.env.SITE_BUCKET; const put = store.put.bind(store); const get = store.get.bind(store);
+    const fail = vi.spyOn(store, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') throw new Error('lost response'); return put(key, ...args); });
+    try { await instance.publicationRepairV1(input, origin); } finally { fail.mockRestore(); }
+    const key = (await state.storage.get<string>('publication_repair_pending'))!;
+    const saved = await state.storage.get<any>(key); vi.setSystemTime(new Date(saved.next_retry_at)); let landed = false;
+    const race = vi.spyOn(store, 'get').mockImplementation(async (name: any) => {
+      if (name === 'pages/index.html' && !landed) {
+        landed = true; const before = (await get(name))!;
+        await put(name, await before.text(), { customMetadata: { ...before.customMetadata, ...(who === 'own' ? { manifest: input.manifest, [REPAIR_MARKER]: saved.id } : { operator_note: 'unrelated' }) } });
+      }
+      return get(name);
+    });
+    try {
+      const result = await instance.publicationRepairV1(input, origin);
+      expect(result).toMatchObject(who === 'own' ? { ok: true, result: { repair_id: saved.id, job: { id: saved.job.id } } }
+        : { ok: false, failure: { code: 'repair_pending', publication_status: 'unknown' } });
+    } finally { race.mockRestore(); }
+    expect(await state.storage.get(key)).toMatchObject({ state: who === 'own' ? 'committed' : 'pending' });
+    if (who === 'other') {
+      const inspected = await instance.publicationRepairV1(undefined, origin);
+      expect(await instance.publicationRepairControlV1('cancel', { expected_version: inspected.result.publication.version, expected_recovery_token: inspected.result.recovery.recovery_token })).toMatchObject({ ok: false, failure: { code: 'unsafe_repair_cancellation' } });
+    }
+  });
+});
+
+it('does not pause a legacy head whose consumed alarm is waiting behind repair preparation', async () => {
+  const { input } = await seed(); const queued = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    const legacy = await state.storage.get<RebuildJob>(`job:${queued.id}`); delete legacy!.scheduling;
+    await state.storage.put(`job:${queued.id}`, legacy!);
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>(r => { entered = r; }); const held = new Promise<void>(r => { release = r; });
+    const store = instance.env.SITE_BUCKET; const get = store.get.bind(store); let paused = false;
+    const spy = vi.spyOn(store, 'get').mockImplementation(async (key: any) => { if (key === input.manifest && !paused) { paused = true; entered(); await held; } return get(key); });
+    try {
+      const repairing = instance.publicationRepairV1(input, origin); await started;
+      await state.storage.deleteAlarm(); const delivered = instance.alarm(); release();
+      expect(await repairing).toMatchObject({ ok: true }); await delivered;
+      expect(await state.storage.get(`job:${queued.id}`)).toMatchObject({ status: 'completed' });
+      expect((await state.storage.get<RebuildJob>(`job:${queued.id}`))?.manual_resume).toBeUndefined();
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    } finally { release(); spy.mockRestore(); }
+  });
+});
+
+it('exposes self-paused, unscheduled, and repair-blocked status without changing storage', async () => {
+  const { input } = await seed(); const queued = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.deleteAlarm();
+    expect(await instance.jobStatus(queued.id)).toMatchObject({ blocked: { reason: 'unscheduled', job_id: queued.id } });
+    const job = (await state.storage.get<RebuildJob>(`job:${queued.id}`))!;
+    await state.storage.put(`job:${queued.id}`, { ...job, manual_resume: true });
+    expect(await instance.jobStatus(queued.id)).toMatchObject({ blocked: { reason: 'manual_resume', job_id: queued.id } });
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const fail = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') throw new Error('offline'); return put(key, ...args); });
+    try { await instance.publicationRepairV1(input, origin); } finally { fail.mockRestore(); }
+    const before = await state.storage.list(); const alarm = await state.storage.getAlarm();
+    expect(await instance.jobStatus(queued.id)).toMatchObject({ blocked: { reason: 'repair_pending', repair_id: expect.any(String), retry_at: expect.any(String) } });
+    expect(await state.storage.list()).toEqual(before); expect(await state.storage.getAlarm()).toBe(alarm);
+  });
+});
+
+it('finalizes a committed rebuild across eviction without a second index write, even after a newer publication', async () => {
+  await seed(); const queued = await publisher().enqueueRebuild(origin); let indexWrites = 0;
+  await inside(publisher(), async (instance, state) => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const writes = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation(async (...args: any[]) => { const result = await put(...args); if (args[0] === 'pages/index.html') indexWrites++; return result; });
+    const transaction = state.storage.transaction.bind(state.storage);
+    const failure = vi.spyOn(state.storage, 'transaction').mockImplementation(callback => transaction(async storage => callback(new Proxy(storage, { get(target, prop) {
+      if (prop === 'put') return (key: any, value: any) => { if (value?.status === 'completed') throw new Error('finalization unavailable'); return target.put(key, value); };
+      const value = Reflect.get(target, prop); return typeof value === 'function' ? value.bind(target) : value;
+    } }))));
+    try { await expect(instance.alarm()).rejects.toBeInstanceOf(OperationFailure); }
+    finally { writes.mockRestore(); failure.mockRestore(); }
+    expect(await state.storage.get(`job:${queued.id}`)).toMatchObject({ status: 'running' });
+  });
+  expect(indexWrites).toBe(1);
+  const publication = await currentPublication(bindings.SITE_BUCKET);
+  const digest = JSON.parse(await (await bindings.SITE_BUCKET.get(publication.posts[0].key))!.text());
+  digest.items[0].post_url += '/newer'; await publisher().publishV2(digest, origin);
+  const index = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
+  expect(index.customMetadata?.[REBUILD_MARKER]).toBe(queued.id);
+  await evictDurableObject(publisher()); await runDurableObjectAlarm(publisher());
+  expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'completed' });
+  expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(index.version);
+  await inside(publisher(), async (_, state) => expect(await state.storage.get('conditions:pending')).toBe(true));
+});
+
+it('finishes a successful rebuild without reading the index again after commit', async () => {
+  await seed(); const job = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async instance => {
+    const store = instance.env.SITE_BUCKET; const put = store.put.bind(store); const head = store.head.bind(store); let committed = false;
+    const writes = vi.spyOn(store, 'put').mockImplementation(async (...args: any[]) => { const result = await put(...args); if (args[0] === 'pages/index.html') committed = true; return result; });
+    const reads = vi.spyOn(store, 'head').mockImplementation((key: any) => { if (committed && key === 'pages/index.html') throw new Error('post-commit reads are unavailable'); return head(key); });
+    try { await instance.alarm(); } finally { writes.mockRestore(); reads.mockRestore(); }
+    expect(committed).toBe(true);
+  });
+  expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'completed' });
 });

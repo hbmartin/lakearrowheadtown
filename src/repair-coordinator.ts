@@ -3,8 +3,9 @@ import { emit, OperationTrace, safeError } from './diagnostics';
 import { fingerprint, record as object } from './primitives';
 import { prepareWrites } from './prepared-writes';
 import { PublicationConflict } from './publication-conflict';
+import { validateIndexMetadata } from './index-metadata';
 import { indexNotFound, publicationHead, validateRepair, validateRepairTargets, type PublicationHead, type RepairInput, type RepairResult, type RecoverySummary } from './publication-repair';
-import type { ContentBucket, OperationContext, PublicationStatus, RebuildJob } from './types';
+import type { ContentBucket, OperationContext, PublicationStatus, RebuildJob, RebuildBlocker } from './types';
 
 export const REPAIR_MARKER = 'lakearrowhead_repair_id';
 const ACTIVE = 'publication_repair_pending';
@@ -17,14 +18,14 @@ interface RepairRecord {
   last_error?: { code: string; stage: string; retryable: boolean };
 }
 export function restartRebuild(job: RebuildJob): RebuildJob {
-  const next = { ...job, status: 'queued' as const };
-  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume'] as const) delete next[key];
+  const next = { ...job, status: 'queued' as const, scheduling: 'automatic' as const };
+  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume', 'blocked', 'blocked_by'] as const) delete next[key];
   return next;
 }
 export function newRebuild(id: string, origin: string, migration: { complete: boolean; processed: number }, context?: OperationContext): RebuildJob {
   const jobContext = context ? { ...context, job_id: id } : undefined;
   if (jobContext) delete jobContext.candidate_job_id;
-  return { id, origin, status: 'queued', phase: migration.complete ? 'render' : 'migration', processed: migration.processed,
+  return { id, origin, status: 'queued', scheduling: 'automatic', phase: migration.complete ? 'render' : 'migration', processed: migration.processed,
     created_at: new Date().toISOString(), ...(jobContext ? { context: jobContext } : {}) };
 }
 export const publicationChanged = (status: PublicationStatus = 'not_committed') => new HttpError(409,
@@ -37,6 +38,12 @@ const pending = (record: RepairRecord, status = certainty(record)) => new HttpEr
   { code: record.stalled ? 'repair_stalled' : 'repair_pending', retryable: !record.stalled, publication_status: status,
     ...(!record.stalled ? { retry_at: record.next_retry_at ?? new Date(Date.now() + 1000).toISOString() } : {}), details: { repair_id: record.id, job_id: record.job.id } });
 const damaged = () => new HttpError(503, 'The repair journal is damaged. Restore the active journal and its referenced record from a verified backup before resuming. Do not force-clear an unknown write.', {}, { code: 'repair_journal_damaged', retryable: false });
+function repairMetadata(index: R2Object, record: Pick<RepairRecord, 'id' | 'input'>): Record<string, string> {
+  const metadata: Record<string, string> = { ...index.customMetadata, manifest: record.input.manifest, rss: record.input.rss, [REPAIR_MARKER]: record.id };
+  if (record.input.archives === null) delete (metadata as Record<string, string>).archives; else metadata.archives = record.input.archives;
+  validateIndexMetadata(metadata);
+  return metadata;
+}
 function valid(value: unknown): value is RepairRecord {
   if (!object(value) || typeof value.id !== 'string' || typeof value.key !== 'string' || !/^repair-request:[a-f0-9]{64}$/.test(value.key)
     || !object(value.job) || typeof value.job.id !== 'string' || !/^[a-f0-9-]{36}$/.test(value.job.id) || value.job.status !== 'queued' || !['migration', 'render'].includes(String(value.job.phase)) || !Number.isSafeInteger(value.job.processed) || typeof value.etag !== 'string' || !['pending', 'committed', 'conflict'].includes(String(value.state))
@@ -45,12 +52,21 @@ function valid(value: unknown): value is RepairRecord {
 }
 export class RepairCoordinator {
   constructor(private bucket: ContentBucket, private storage: DurableObjectStorage,
-    private reserve: (origin: string, trace: OperationTrace, context?: OperationContext) => Promise<RebuildJob>) {}
+    private reserve: (origin: string, trace: OperationTrace, context?: OperationContext) => Promise<RebuildJob>,
+    private alarmDelivered: () => boolean = () => false) {}
 
   private async active() {
     const key = await boundary('storage', () => this.storage.get<unknown>(ACTIVE));
     const raw = typeof key === 'string' && key.startsWith('repair-request:') ? await boundary('storage', () => this.storage.get<unknown>(key)) : undefined;
     return { key, raw, record: valid(raw) && raw.key === key && raw.state === 'pending' ? raw : undefined };
+  }
+
+  async blocker(): Promise<RebuildBlocker | undefined> {
+    const active = await this.active();
+    if (active.key === undefined) return;
+    const saved = active.record;
+    return { reason: !saved ? 'repair_damaged' : saved.stalled ? 'repair_stalled' : 'repair_pending',
+      ...(saved ? { repair_id: saved.id, job_id: saved.job.id, ...(saved.next_retry_at && !saved.stalled ? { retry_at: saved.next_retry_at } : {}) } : {}) };
   }
 
   async snapshot(trace: OperationTrace): Promise<RepairResult> {
@@ -72,7 +88,7 @@ export class RepairCoordinator {
     for (const id of ids) {
       const job = await storage.get<RebuildJob>(`job:${id}`);
       if (!job || job.status === 'completed') continue;
-      if (job.status === 'failed' || job.manual_resume) await storage.deleteAlarm();
+      if (job.status === 'failed' || job.manual_resume || job.scheduling === 'manual') await storage.deleteAlarm();
       else await storage.setAlarm(Math.max(Date.now() + 1000, Date.parse(job.next_retry_at ?? '') || 0));
       return;
     }
@@ -96,21 +112,30 @@ export class RepairCoordinator {
     }));
     emit('rebuild_queued', record.job.context ?? context, { job_id: record.job.id });
   }
-  private async attempt(record: RepairRecord, trace: OperationTrace, firstAttempt = false) {
+  private async reconcile(record: RepairRecord, index: R2Object | null, trace: OperationTrace, uncertain: boolean): Promise<boolean> {
+    if (index?.customMetadata?.[REPAIR_MARKER] === record.id && matches(index, record.input)) {
+      trace.publication_status = 'committed'; record.phase = 'activation'; record.publication = publicationHead(index);
+      await trace.run('repair_activation', () => this.activate(record, index, trace.context)); return true;
+    }
+    if (!index || index.etag !== record.etag || !uncertain && index.version !== record.input.expected_version) {
+      await trace.run('repair_cancellation', () => this.cancel(record, uncertain ? 'unknown' : 'not_committed')); return true;
+    }
+    // R2's condition tests bytes, not version or metadata. A metadata-only
+    // replacement cannot fence an earlier write whose acknowledgement was lost.
+    if (index.version !== record.input.expected_version) throw pending(record);
+    return false;
+  }
+  private async attempt(record: RepairRecord, trace: OperationTrace) {
+    const uncertain = certainty(record) !== 'not_committed';
+    let body: R2ObjectBody | null = null;
     try {
       const head = await trace.run('repair_index_loading', () => boundary('storage', () => this.bucket.head('pages/index.html')));
-      if (head?.customMetadata?.[REPAIR_MARKER] === record.id && matches(head, record.input)) {
-        trace.publication_status = 'committed'; record.phase = 'activation'; record.publication = publicationHead(head);
-        await trace.run('repair_activation', () => this.activate(record, head, trace.context)); return;
-      }
-      if (!head || head.version !== record.input.expected_version || head.etag !== record.etag) {
-        await trace.run('repair_cancellation', () => this.cancel(record, firstAttempt ? 'not_committed' : 'unknown')); return;
-      }
+      if (await this.reconcile(record, head, trace, uncertain)) return;
       const index = await boundary('storage', () => this.bucket.get('pages/index.html'));
-      if (!index || index.version !== head.version) { await this.cancel(record, 'not_committed'); return; }
-      const metadata: Record<string, string> = { ...index.customMetadata, manifest: record.input.manifest, rss: record.input.rss, [REPAIR_MARKER]: record.id };
-      if (record.input.archives === null) delete metadata.archives; else metadata.archives = record.input.archives;
-      if (Object.entries(metadata).reduce((size, [key, value]) => size + new TextEncoder().encode(key + value).length, 0) > 8192) throw new HttpError(400, 'Repair metadata exceeds the R2 object metadata limit.', {}, { code: 'invalid_repair_target' });
+      body = index;
+      if (await this.reconcile(record, index, trace, uncertain)) return;
+      if (!index) return;
+      const metadata = repairMetadata(index, record);
       const prepared = prepareWrites(this.bucket, trace);
       let committed: R2Object;
       try {
@@ -121,17 +146,23 @@ export class RepairCoordinator {
         try { committed = (await prepared.commit(index))!; }
         catch (error) {
           if (!(error instanceof PublicationConflict)) throw error;
-          await trace.run('repair_cancellation', () => this.cancel(record, 'not_committed')); return;
+          if (!uncertain) { await trace.run('repair_cancellation', () => this.cancel(record, 'not_committed')); return; }
+          const latest = await boundary('storage', () => this.bucket.head('pages/index.html'));
+          if (await this.reconcile(record, latest, trace, true)) return;
+          throw pending(record);
         }
       } finally { prepared.close(); }
       record.phase = 'activation'; record.publication = publicationHead(committed);
       await trace.run('repair_activation', () => this.activate(record, committed, trace.context));
     } catch (error) {
-      record.attempts++;
       const failure = asHttpError(error);
+      if (!uncertain && record.phase === 'prepared' && failure.status < 500 && !failure.retryable) {
+        await this.cancel(record, 'not_committed'); throw error;
+      }
+      record.attempts++;
       record.last_error = { code: failure.code, stage: trace.failed_stage ?? 'repair_recovery', retryable: failure.retryable };
       record.stalled = record.attempts >= MAX_ATTEMPTS || failure.status < 500 && !failure.retryable;
-      record.next_retry_at = new Date(Date.now() + Math.min(30, 2 ** Math.min(record.attempts - 1, 5)) * 1000).toISOString();
+      record.next_retry_at = new Date(Date.now() + Math.min(300, 5 * 2 ** Math.min(record.attempts - 1, 6)) * 1000).toISOString();
       emit('repair_recovery_failed', trace.context, { repair_id: record.id, job_id: record.job.id, attempts: record.attempts, stalled: record.stalled,
         stage: trace.failed_stage, error_code: failure.code, ...safeError(error) }, 'error');
       // Never acknowledge an alarm when persisting its next wake-up failed.
@@ -142,9 +173,9 @@ export class RepairCoordinator {
         if (record.stalled) await storage.deleteAlarm(); else await storage.setAlarm(Date.parse(record.next_retry_at!));
       }));
       throw pending(record, trace.publication_status === 'committed' ? 'committed' : certainty(record));
-    }
+    } finally { if (body && !body.bodyUsed) await body.body.cancel().catch(() => {}); }
   }
-  async recover(trace: OperationTrace, respectDeadline = false): Promise<boolean> {
+  async recover(trace: OperationTrace, respectDeadline = true): Promise<boolean> {
     const active = await this.active();
     if (active.key === undefined) return false;
     const saved = active.record; if (!saved) throw damaged();
@@ -207,14 +238,15 @@ export class RepairCoordinator {
       const migration = await boundary('storage', () => this.storage.get<{ complete: boolean }>('migration'));
       await trace.run('repair_validation', () => validateRepairTargets(this.bucket, input, migration?.complete ?? false));
       record = { id: crypto.randomUUID(), key, input, etag: index.etag, job, state: 'pending', phase: 'prepared', attempts: 0 };
+      repairMetadata(index, record);
       const saved = record;
       try {
         await trace.run('repair_preparation', () => boundary('storage', () => this.storage.transaction(async storage => {
           const alarm = await storage.getAlarm(); const ids = await storage.get<string[]>('jobs') ?? [];
-          if (alarm === null) for (const id of ids) {
+          if (alarm === null && !this.alarmDelivered()) for (const id of ids) {
             const existing = await storage.get<RebuildJob>(`job:${id}`);
             if (!existing || existing.status === 'completed') continue;
-            if (existing.status !== 'failed') await storage.put(`job:${id}`, { ...existing, manual_resume: true });
+            if (existing.status !== 'failed' && existing.scheduling === undefined) await storage.put(`job:${id}`, { ...existing, manual_resume: true, scheduling: 'manual' });
             break;
           }
           await storage.put(key, saved); await storage.put(ACTIVE, key);
@@ -224,7 +256,7 @@ export class RepairCoordinator {
         emit('repair_preparation_failed', context, { ...safeError(error), error_code: asHttpError(error).code }, 'error');
         throw pending(saved);
       }
-      await this.attempt(record, trace, true); worked = true;
+      await this.attempt(record, trace); worked = true;
     }
     try {
     const saved = (await boundary('storage', () => this.storage.get<RepairRecord>(key)))!;

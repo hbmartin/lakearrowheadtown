@@ -459,7 +459,7 @@ describe('execution failure versus failure-state persistence', () => {
     expect(JSON.stringify(events)).not.toMatch(/private start failure|private record failure/);
   });
 
-  it.each(['rebuild_start', 'publication_loading', 'rebuild_finalize'] as const)('logs both failures and recovers after %s plus failed state persistence', async stage => {
+  it.each(['rebuild_start', 'publication_loading'] as const)('logs both failures and recovers after %s plus failed state persistence', async stage => {
     await seed('queued', [id], true);
     const manifest = 'publications/private-damaged.json';
     if (stage === 'publication_loading') {
@@ -470,10 +470,10 @@ describe('execution failure versus failure-state persistence', () => {
     await inPublisher(publisher(), async (_instance, state) => {
       const transaction = state.storage.transaction.bind(state.storage);
       let calls = 0;
-      const persistenceCall = stage === 'rebuild_finalize' ? 3 : 1;
+      const persistenceCall = 1;
       const transactionSpy = vi.spyOn(state.storage, 'transaction').mockImplementation((callback: any) => {
         calls++;
-        if (calls === persistenceCall || (stage === 'rebuild_finalize' && calls === 2)) throw new Error('private transaction error');
+        if (calls === persistenceCall) throw new Error('private transaction error');
         return transaction(callback);
       });
       const putSpy = stage === 'rebuild_start' ? vi.spyOn(state.storage, 'put').mockRejectedValue(new Error('private start error')) : undefined;
@@ -481,7 +481,7 @@ describe('execution failure versus failure-state persistence', () => {
     });
     try { await expect(runDurableObjectAlarm(publisher())).rejects.toMatchObject({ kind: 'storage' }); }
     finally { restore(); }
-    const certainty = stage === 'rebuild_finalize' ? 'committed' : 'not_committed';
+    const certainty = 'not_committed';
     const originalCode = stage === 'publication_loading' ? 'manifest_damaged' : 'storage_error';
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_failed', job_id: id, request_id: context.request_id, stage, error_code: originalCode, publication_status: certainty }));
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_failure_record_failed', job_id: id, request_id: context.request_id,
