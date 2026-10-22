@@ -1,4 +1,5 @@
 import { storyRows, writeSyncIndex } from './sync-index';
+import { rebuildMetadata, REBUILD_MARKER, NEWS_ANCHOR } from './index-metadata';
 import { createCardCache, prepareArchives, rebuildArchives, stableJson, type PendingArchiveRebuild } from './archives';
 import { settledInOrder } from './batches';
 import { committedSnapshot, isLegacyId, requireCommittedManifest, type CommittedSnapshot } from './committed';
@@ -14,7 +15,7 @@ import { boundary, DamagedSource } from './errors';
 import { batchRecord, indexPost, loadHistoryIndex, retainedBatches } from './history-index';
 import { prepareWrites } from './prepared-writes';
 import { PublicationConflict } from './publication-conflict';
-import { conditionsSnapshot, replaceConditions } from './homepage-conditions';
+import { conditionsSnapshot, replaceConditions, newsAnchor } from './homepage-conditions';
 import { digestItemWarnings, postedAtWarnings } from './warnings';
 import type { AppendResult, ArchiveProgress, ContentBucket, Digest, HistoryIndex, Migration, OperationContext, PostReference, Publication, PublicationStatus, PublishOptions, PublishResult, RetractResult, StoredPost, StoryIdentity, StoryUpdate } from './types';
 
@@ -74,7 +75,8 @@ export async function currentPublication(bucket: ContentBucket, discover?: () =>
   if (requireManifest) requireCommittedManifest(snapshot);
   // Bootstrap old deployments using server storage times, never client dates.
   const legacy = await (discover ? discover() : trace ? trace.run('legacy_discovery', () => legacyReferences(bucket)) : legacyReferences(bucket));
-  const anchor = (snapshot.index?.customMetadata?.conditions_only === 'true' ? undefined : snapshot.index?.uploaded) ?? (legacy.length ? new Date([...legacy].sort(order)[0].received_at) : null);
+  const metadata = snapshot.index?.customMetadata;
+  const anchor = (metadata?.conditions_only === 'true' ? undefined : metadata?.[NEWS_ANCHOR] !== undefined ? newsAnchor(metadata[NEWS_ANCHOR]) : snapshot.index?.uploaded) ?? (legacy.length ? new Date([...legacy].sort(order)[0].received_at) : null);
   const days = anchor ? recentDates(anchor) : [];
   const archives = await snapshot.archives();
   return { version: 1, posts: legacy.filter(post => days.includes(post.date)).sort(order), snapshot_date: days[0] ?? null,
@@ -90,7 +92,7 @@ function legacyReceipts(previous: Publication, additional: PostReference[] = [])
 }
 
 async function prepareHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, previous: Publication,
-  trace = new OperationTrace(), options: { migrationComplete?: boolean; allCards?: boolean; now?: Date; history?: HistoryIndex; sources?: Map<string, StoredPost>; archives?: string; imageCache?: ImageResolutionCache } = {}): Promise<void> {
+  trace = new OperationTrace(), options: { migrationComplete?: boolean; allCards?: boolean; now?: Date; history?: HistoryIndex; sources?: Map<string, StoredPost>; archives?: string; imageCache?: ImageResolutionCache; index?: R2Object | null; rebuildId?: string } = {}): Promise<boolean> {
   publication = { ...publication, version: 3 };
   delete publication.legacy_receipts;
   if (!options.migrationComplete) {
@@ -132,7 +134,8 @@ async function prepareHomepage(bucket: ContentBucket, publication: Publication, 
   await trace.run('manifest_write', () => boundary('storage', () => bucket.put(manifest, serialized, { httpMetadata: { contentType: 'application/json' } })));
   await trace.run('rss_write', () => boundary('storage', () => bucket.put(rss, feed, { httpMetadata: { contentType: RSS_TYPE, cacheControl: HTML_CACHE } })));
   // The single index replacement commits HTML and both immutable snapshot references.
-  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { manifest, rss, archives: publication.archives!, ...(!conditions.available ? { conditions_status: 'unavailable' } : {}) } })));
+  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { ...rebuildMetadata(options.index ?? null), ...(options.rebuildId ? { [REBUILD_MARKER]: options.rebuildId } : {}), manifest, rss, archives: publication.archives!, ...(!conditions.available ? { conditions_status: 'unavailable' } : {}) } })));
+  return conditions.available;
 }
 
 async function retainedSources(bucket: ContentBucket, now: Date, migrationComplete: boolean, trace: OperationTrace, context?: OperationContext, provided?: Publication, snapshot?: CommittedSnapshot, requiredPostId?: string) {
@@ -230,7 +233,7 @@ export async function publishDigest(bucket: ContentBucket, digest: Digest, origi
       selected.sort(order);
       // Preserve the established newest-receipt ordering of historical stories.
       posts.sort((a, b) => order(reference(a), reference(b)));
-      await prepareHomepage(bucket, { version: 3, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, history: previousIndex, sources });
+      await prepareHomepage(bucket, { version: 3, posts: selected, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: days[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, history: previousIndex, sources, index: snapshot.index });
       if (!options.dryRun) await prepared.commit(snapshot.index);
     }
     const result: PublishResult = {
@@ -274,7 +277,7 @@ export async function appendUpdate(bucket: ContentBucket, postId: string, itemIn
     const refs = selected.map(ref => ref.id === post.id ? { ...reference(revision), key } : ref).sort(order);
     posts[posts.indexOf(post)] = revision;
     posts.sort((a, b) => order(reference(a), reference(b)));
-    await prepareHomepage(bucket, { version: 3, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, sources });
+    await prepareHomepage(bucket, { version: 3, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}), snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, sources, index: snapshot.index });
     if (!options.dryRun) await prepared.commit(snapshot.index);
     emit(options.dryRun ? 'preview_result' : 'append_result', context, { post_id: post.id, item_index: itemIndex, update_index: updateIndex, publication_outcome: options.dryRun ? 'preview' : 'published', ...(options.dryRun ? {} : { publication_status: trace.publication_status }) });
     return { status: 'appended', post_id: post.id, item_index: itemIndex, update_index: updateIndex, message: options.dryRun ? 'The source would be added to this story.' : 'The source was added to this story and the publication was updated.', ...(warnings.length ? { warnings } : {}), ...preview };
@@ -328,7 +331,7 @@ export async function retractPost(bucket: ContentBucket, postId: string, publish
     const posts = [...retained.posts.filter(post => post.id !== postId), post].sort((a, b) => order(reference(a), reference(b)));
     const omitted = retained.omitted.filter(ref => ref.id !== postId);
     await prepareHomepage(bucket, { version: 3, posts: refs, ...(omitted.length ? { omitted_posts: omitted } : {}),
-      snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, history: index, sources: retained.sources });
+      snapshot_date: recentDates(now)[0], published_at: now.toISOString() }, posts, origin, previous, trace, { migrationComplete, now, history: index, sources: retained.sources, index: snapshot!.index });
     await prepared.commit(snapshot!.index);
     emit('retract_result', context, { post_id: postId, publication_status: trace.publication_status, publication_outcome: 'retracted' });
     return { post_id: postId, status: 'retracted', retracted_at: post.retracted_at! };
@@ -340,10 +343,10 @@ export async function retractPost(bucket: ContentBucket, postId: string, publish
 export interface RebuildBaseline { snapshot: CommittedSnapshot; publication: Publication }
 export type RebuildResult = PendingArchiveRebuild
   | { kind: 'reconcile'; progress: ArchiveProgress }
-  | { kind: 'committed'; progress?: ArchiveProgress };
+  | { kind: 'committed'; conditionsAvailable: boolean; progress?: ArchiveProgress };
 
 export async function rebuildHomepage(bucket: ContentBucket, origin: string, trace = new OperationTrace(), migrationComplete = false, baseline?: RebuildBaseline,
-  work?: { jobId: string; checkpoint?: string }): Promise<RebuildResult> {
+  work?: { jobId: string; checkpoint?: string; beforeCommit?: () => Promise<void> }): Promise<RebuildResult> {
   const durable = bucket;
   const prepared = prepareWrites(bucket, trace);
   bucket = prepared.bucket;
@@ -365,8 +368,8 @@ export async function rebuildHomepage(bucket: ContentBucket, origin: string, tra
     const imageCache = createImageResolutionCache();
     const archives = work ? await rebuildArchives(durable, posts, publication, origin, trace, work.jobId, work.checkpoint, imageCache) : undefined;
     if (archives?.kind === 'pending') return archives;
-    await prepareHomepage(bucket, publication, posts, origin, previous, trace,
-      { migrationComplete, imageCache, ...(archives ? { archives: archives.archives } : { allCards: true }) });
+    const conditionsAvailable = await prepareHomepage(bucket, publication, posts, origin, previous, trace,
+      { migrationComplete, imageCache, index: snapshot.index, rebuildId: work?.jobId, ...(archives ? { archives: archives.archives } : { allCards: true }) });
     if (work) {
       const current = await boundary('storage', () => durable.head('pages/index.html'));
       // The publisher queue prevents mutations between this check and commit.
@@ -376,11 +379,12 @@ export async function rebuildHomepage(bucket: ContentBucket, origin: string, tra
         return { kind: 'reconcile', progress: archives!.progress };
       }
     }
+    await work?.beforeCommit?.();
     try { await prepared.commit(snapshot.index); }
     catch (error) {
       if (work && error instanceof PublicationConflict) return { kind: 'reconcile', progress: archives!.progress };
       throw error;
     }
-    return { kind: 'committed', ...(archives ? { progress: archives.progress } : {}) };
+    return { kind: 'committed', conditionsAvailable, ...(archives ? { progress: archives.progress } : {}) };
   } finally { prepared.close(); }
 }

@@ -216,7 +216,7 @@ describe('bounded resumable archive rebuilds', () => {
     if (pending.kind !== 'pending') throw new Error('Expected pending archive work');
     expect(await bindings.SITE_BUCKET.head(pending.checkpoint)).not.toBeNull();
     const committed = await rebuildHomepage(bindings.SITE_BUCKET, origin, undefined, true, undefined, { ...work, checkpoint: pending.checkpoint });
-    expect(committed).toEqual({ kind: 'committed', progress: { completed_days: 13, total_days: 13 } });
+    expect(committed).toEqual({ kind: 'committed', conditionsAvailable: true, progress: { completed_days: 13, total_days: 13 } });
     expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${work.jobId}/checkpoints/` })).objects).toHaveLength(1);
   });
 
@@ -329,7 +329,7 @@ describe('bounded resumable archive rebuilds', () => {
     expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.customMetadata).toEqual(revised);
     expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${work.jobId}/checkpoints/` })).objects).toHaveLength(1);
     const repaired = await rebuildHomepage(bindings.SITE_BUCKET, origin, undefined, true, undefined, { ...work, checkpoint: pending.checkpoint });
-    expect(repaired).toEqual({ kind: 'committed', progress: { completed_days: 13, total_days: 13 } });
+    expect(repaired).toEqual({ kind: 'committed', conditionsAvailable: true, progress: { completed_days: 13, total_days: 13 } });
     expect(render).toHaveBeenCalledTimes(12);
     expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${work.jobId}/checkpoints/` })).objects).toHaveLength(1);
   });
@@ -451,15 +451,18 @@ describe('bounded resumable archive rebuilds', () => {
         restore = () => spy.mockRestore();
       });
     }
-    try { await runDurableObjectAlarm(publisher()); } finally { restore(); }
+    try {
+      if (stage === 'rebuild_finalize') await expect(runDurableObjectAlarm(publisher())).rejects.toMatchObject({ kind: 'storage' });
+      else await runDurableObjectAlarm(publisher());
+    } finally { restore(); }
     expect(injected).toBe(true);
-    expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'failed', failed_stage: stage });
+    expect(await publisher().jobStatus(job.id)).toMatchObject(stage === 'rendering' ? { status: 'failed', failed_stage: stage } : { status: 'running' });
     expect(render).toHaveBeenCalledTimes(12);
     const after = (await bindings.SITE_BUCKET.head('pages/index.html'))!.customMetadata;
     if (stage === 'rendering') expect(after).toEqual(before);
     else expect(after!.manifest).not.toBe(before!.manifest);
     expect((await bindings.SITE_BUCKET.list({ prefix: `rebuild-work/${job.id}/checkpoints/` })).objects).toHaveLength(1);
-    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_failed', stage, publication_status: stage === 'rendering' ? 'not_committed' : 'committed' }));
+    expect(events).toContainEqual(expect.objectContaining({ event: stage === 'rendering' ? 'rebuild_failed' : 'rebuild_finalization_pending', stage, publication_status: stage === 'rendering' ? 'not_committed' : 'committed' }));
     await publisher().resumeRebuild(job.id); await evictDurableObject(publisher());
     expect(await finish(job.id)).toMatchObject({ status: 'completed' });
     expect(render).toHaveBeenCalledTimes(12);

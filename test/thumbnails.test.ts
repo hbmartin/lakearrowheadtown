@@ -153,7 +153,7 @@ describe('thumbnail serving', () => {
       ...(extension !== 'gif' ? { quality: 80 } : {}), ...(extension !== 'png' ? { anim: true } : {}) });
     await response.arrayBuffer();
   });
-  it('discovers absent or damaged metadata without writing and never upscales', async () => {
+  it('discovers absent or damaged source metadata without rewriting it and never upscales', async () => {
     await source();
     for (const metadata of [null, 'not json', '{"width":0}']) {
       if (metadata === null) await bindings.SITE_BUCKET.delete(metadataKey(hash));
@@ -219,4 +219,74 @@ it('serves canonical v2 formats independently of Accept and skips source bodies 
   expect((await fetch(v2, { headers: { 'If-None-Match': etag } }, { ...mock, SITE_BUCKET: store })).status).toBe(304);
   expect(mock.output).toHaveBeenCalledTimes(count);
   expect((await fetch(v2.replace('.webp', '.png'), {}, mock)).status).toBe(404);
+});
+
+it('redirects cold HEAD without transformation and verifies a cold conditional GET before returning 304', async () => {
+  await source(); const mock = encoder(); const url = `/thumbnails/v2/${hash}.jpg/160.webp`;
+  const etag = `W/"thumbnail-v2-${hash}-160-webp-q80"`;
+  const get = vi.fn(() => { throw new Error('HEAD must read metadata only'); });
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) { if (property === 'get') return get; const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value; } });
+  const cold = await fetch(url, { method: 'HEAD', headers: { 'If-None-Match': etag } }, { ...mock, SITE_BUCKET: store });
+  expect(cold.status).toBe(302); expect(cold.headers.get('etag')).toBeNull(); expect(cold.headers.get('cache-control')).toBe('no-store');
+  expect(get).not.toHaveBeenCalled(); expect(mock.input).not.toHaveBeenCalled();
+  const checked = await fetch(url, { headers: { 'If-None-Match': etag } }, mock);
+  expect(checked.status).toBe(304); expect(mock.output).toHaveBeenCalledTimes(1);
+  const warm = await fetch(url, { method: 'HEAD' }, { SITE_BUCKET: store, IMAGES: undefined });
+  expect(warm.status).toBe(200); expect(warm.headers.get('etag')).toBe(etag); expect(warm.headers.get('cache-control')).toBe(IMAGE_CACHE);
+  expect(get).not.toHaveBeenCalled();
+  const full = await fetch(url, {}, { IMAGES: undefined }); expect(full.status).toBe(200);
+  expect(new Uint8Array(await full.arrayBuffer())).toEqual(png);
+  await bindings.SITE_BUCKET.delete(`images/${hash}.jpg`);
+  expect((await fetch(url, { method: 'HEAD' }, mock)).status).toBe(404);
+  expect((await fetch(url, {}, mock)).status).toBe(404);
+});
+
+it('serves verified cached derivatives during encoder quota exhaustion without opening the source body', async () => {
+  await source(); const url = `/thumbnails/v2/${hash}.jpg/160.webp`;
+  const first = await fetch(url, {}, encoder()); await first.arrayBuffer();
+  const failing = encoder(Object.assign(new Error('quota'), { code: 9422 }));
+  const get = vi.fn((key: string) => { if (key.startsWith('images/')) throw new Error('No original body reads on a hit'); return bindings.SITE_BUCKET.get(key); });
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) { if (property === 'get') return get; const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value; } });
+  const result = await fetch(url, {}, { ...failing, SITE_BUCKET: store }); expect(result.status).toBe(200); await result.arrayBuffer();
+  expect(failing.input).not.toHaveBeenCalled();
+});
+
+it('uses one immutable winner for competing cache fills', async () => {
+  await source(); const url = `/thumbnails/v2/${hash}.jpg/160.webp`;
+  const mocks = [encoder(), encoder()];
+  for (const [index, mock] of mocks.entries()) mock.output.mockImplementation(async options => ({ response: () => new Response(new Uint8Array([index + 1, 2, 3]), { headers: { 'Content-Type': options.format } }) }));
+  const responses = await Promise.all(mocks.map(mock => fetch(url, {}, mock)));
+  expect(responses.map(response => response.status)).toEqual([200, 200]);
+  const bytes = await Promise.all(responses.map(response => response.arrayBuffer().then(buffer => [...new Uint8Array(buffer)])));
+  expect(bytes[0]).toEqual(bytes[1]);
+  const objects = (await bindings.SITE_BUCKET.list({ prefix: 'thumbnail-cache/' })).objects;
+  expect(objects).toHaveLength(1); expect([...new Uint8Array(await (await bindings.SITE_BUCKET.get(objects[0].key))!.arrayBuffer())]).toEqual(bytes[0]);
+  expect((await fetch('/' + objects[0].key, {}, mocks[0])).status).toBe(404);
+});
+
+it('reconstructs damaged cache metadata with a conditional replacement', async () => {
+  await source(); const url = `/thumbnails/v2/${hash}.jpg/160.webp`;
+  const mock = encoder(); await (await fetch(url, {}, mock)).arrayBuffer();
+  const key = (await bindings.SITE_BUCKET.list({ prefix: 'thumbnail-cache/' })).objects[0].key;
+  await bindings.SITE_BUCKET.put(key, 'bad', { customMetadata: { recipe: 'wrong' }, httpMetadata: { contentType: 'image/webp' } });
+  expect((await fetch(url, { method: 'HEAD' }, mock)).status).toBe(302);
+  const rebuilt = await fetch(url, {}, mock); expect(rebuilt.status).toBe(200); await rebuilt.arrayBuffer();
+  expect(mock.output).toHaveBeenCalledTimes(2);
+  expect((await fetch(url, { method: 'HEAD' }, { IMAGES: undefined })).status).toBe(200);
+});
+
+it.each(['write', 'stream', 'oversize'] as const)('never advertises or stores a failed %s cache fill', async failure => {
+  await source(); const mock = encoder(); const put = vi.fn((key: string, value: any, options: any) => {
+    if (key.startsWith('thumbnail-cache/')) throw new Error('cache storage unavailable');
+    return bindings.SITE_BUCKET.put(key, value, options);
+  });
+  if (failure !== 'write') mock.output.mockImplementation(async options => ({ response: () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+    if (failure === 'oversize') { controller.enqueue(new Uint8Array(10 * 1024 * 1024 + 1)); controller.close(); }
+    else { controller.enqueue(png); controller.error(new Error('encoder stream failed')); }
+  } }), { headers: { 'Content-Type': options.format } }) }));
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) { if (property === 'put') return put; const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value; } });
+  const response = await fetch(`/thumbnails/v2/${hash}.jpg/160.webp`, {}, { ...mock, SITE_BUCKET: store });
+  expect(response.status).toBe(302); expect(response.headers.get('etag')).toBeNull(); expect(response.headers.get('cache-control')).toBe('no-store');
+  expect((await bindings.SITE_BUCKET.list({ prefix: 'thumbnail-cache/' })).objects).toHaveLength(0);
+  expect(put).toHaveBeenCalledTimes(failure === 'write' ? 1 : 0);
 });

@@ -52,7 +52,7 @@ it('loads rebuild sources four at a time and preserves publication order after r
     await vi.waitFor(() => expect(reads).toHaveLength(8));
     expect(active).toBe(4);
   } finally { released = true; for (const gate of gates.values()) gate.resolve(); }
-  expect(await rebuilding).toEqual({ kind: 'committed' });
+  expect(await rebuilding).toEqual({ kind: 'committed', conditionsAvailable: true });
   expect(peak).toBe(4); expect(active).toBe(0);
   expect(reads).toEqual(original.posts.map(ref => ref.key));
   const index = await loadHistoryIndex(bindings.SITE_BUCKET, await currentPublication(bindings.SITE_BUCKET));

@@ -97,8 +97,8 @@ assert.equal(digest.status, 200);
 const homepage = await (await fetch(origin)).text();
 assert(homepage.includes('/thumbnails/v2/'));
 assert(homepage.includes('<picture>'));
-const v1 = await fetch(`${origin}/thumbnails/v1/${fixtures[0].url.split('/').at(-1)}/160`, { headers: { Accept: 'image/webp' } });
-assert.equal(v1.status, 200); await v1.arrayBuffer();
+const v1 = await fetch(`${origin}/thumbnails/v1/${fixtures[0].url.split('/').at(-1)}/160`, { headers: { Accept: 'image/webp' }, redirect: 'manual' });
+assert.equal(v1.status, 200); assert.equal(v1.headers.get('content-type'), 'image/webp'); await v1.arrayBuffer();
 assert(homepage.includes('sizes="(max-width: 600px) 96px, 160px"'));
 console.log(JSON.stringify({ preview: origin, artifacts: directory, status: 'passed' }));
 

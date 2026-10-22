@@ -4,9 +4,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import fixture from './fixtures/town-card.json';
 import worker from '../src/worker';
 import { validateWeather, renderWeatherChart, WEATHER_KEY, WEATHER_URL } from '../src/weather';
-import { composeHomepageConditions, replaceConditions } from '../src/homepage-conditions';
+import { composeHomepageConditions, conditionsSnapshot, replaceConditions } from '../src/homepage-conditions';
+import { submitAlert, validateAlertInput, ALERTS_KEY } from '../src/alerts';
+import { NEWS_ANCHOR } from '../src/index-metadata';
 import { renderPage } from '../src/render';
-import { publishDigest } from '../src/publishing';
+import { currentPublication, publishDigest } from '../src/publishing';
 import type { Env, Digest } from '../src/types';
 
 const bindings = env as unknown as Env;
@@ -150,7 +152,7 @@ it('publishes news with an unavailable marker and recovers from repaired conditi
   await bucket.put(WEATHER_KEY, '{broken');
   await publishDigest(bucket, digest, base, new Date());
   const degraded = (await bucket.get('pages/index.html'))!;
-  expect(await degraded.text()).toContain('Mountain conditions are temporarily unavailable.');
+  expect(await degraded.text()).toContain('Weather is temporarily unavailable.');
   expect(degraded.customMetadata?.conditions_status).toBe('unavailable');
   await bucket.put(WEATHER_KEY, JSON.stringify(sample()));
   await runInDurableObject(publisher(), async instance => (instance as any).finishConditions(base));
@@ -170,8 +172,83 @@ it('allows news publishing while upstream weather is still being fetched', async
   let release!: (response: Response) => void; let entered!: () => void;
   const started = new Promise<void>(resolve => { entered = resolve; });
   vi.spyOn(globalThis, 'fetch').mockImplementation(() => { entered(); return new Promise(resolve => { release = resolve; }); });
-  const pulling = publisher().pullWeatherV1(base);
-  await started;
-  try { expect(await publisher().publishV2(digest, base)).toMatchObject({ ok: true }); }
-  finally { release(new Response(JSON.stringify(sample()))); await pulling; }
+  // Keep the synthetic pending fetch in one test I/O context; native upstream
+  // fetches do not share the test runner's cross-RPC promise ownership.
+  await runInDurableObject(publisher(), async instance => {
+    const pulling = instance.pullWeatherV1(base);
+    await started;
+    try { expect(await instance.publishV2(digest, base)).toMatchObject({ ok: true }); }
+    finally { release(new Response(JSON.stringify(sample()))); await pulling; }
+  });
+});
+
+it.each([[false, false], [false, true], [true, false], [true, true]])('isolates alert failure=%s and weather failure=%s', async (badAlerts, badWeather) => {
+  const now = new Date();
+  await submitAlert(bucket, validateAlertInput({ client_ref: 'healthy-alert', phase: 'open', category: 'traffic', kind: 'closure',
+    routes: ['SR-18'], headline: 'Fresh road closure', source: 'caltrans', source_url: 'https://roads.dot.ca.gov/', observed_at: now.toISOString() }), 'a'.repeat(64), now);
+  await bucket.put(WEATHER_KEY, JSON.stringify(sample()));
+  if (badAlerts) await bucket.put(ALERTS_KEY, '{broken');
+  if (badWeather) await bucket.put(WEATHER_KEY, '{broken');
+  const result = await conditionsSnapshot(bucket, undefined, now);
+  expect(result.available).toBe(!badAlerts && !badWeather);
+  expect(result.html.includes('Fresh road closure')).toBe(!badAlerts);
+  expect(result.html.includes('Today on the mountain')).toBe(!badWeather);
+  if (badAlerts || badWeather) expect(result.html).toContain('role="status"');
+  if (badAlerts && badWeather) expect(result.html).toContain('Mountain conditions are temporarily unavailable.');
+  else if (badAlerts) expect(result.html).toContain('Road and power alerts are temporarily unavailable.');
+  else if (badWeather) expect(result.html).toContain('Weather is temporarily unavailable.');
+});
+
+it('treats an existing empty weather body as unavailable and retains composition intent', async () => {
+  await bucket.put(WEATHER_KEY, '');
+  await publishDigest(bucket, digest, base);
+  await runInDurableObject(publisher(), async instance => (instance as any).finishConditions(base));
+  expect((await conditionsSnapshot(bucket)).available).toBe(false);
+  await runInDurableObject(publisher(), async (_, state) => expect(await state.storage.get('conditions:pending')).toBe(true));
+});
+
+it('clears an unavailable metadata marker even when fresh HTML already matches', async () => {
+  vi.setSystemTime(new Date());
+  try {
+  await bucket.put(WEATHER_KEY, JSON.stringify(sample()));
+  await composeHomepageConditions(bucket, base);
+  const index = (await bucket.get('pages/index.html'))!; const html = await index.text();
+  await bucket.put('pages/index.html', html, { customMetadata: { ...index.customMetadata, conditions_status: 'unavailable' } });
+  await composeHomepageConditions(bucket, base);
+  const healed = (await bucket.get('pages/index.html'))!;
+  expect(await healed.text()).toBe(html); expect(healed.customMetadata?.conditions_status).toBeUndefined();
+  } finally { vi.useRealTimers(); }
+});
+
+it('retains a legacy saved news window through repeated conditions writes', async () => {
+  const anchor = new Date('2026-10-10T20:00:00Z');
+  await bucket.put('pages/index.html', renderPage([], { origin: base }));
+  await bucket.put(WEATHER_KEY, JSON.stringify(sample()));
+  let rewritten = false;
+  const dated = (value: R2Object | R2ObjectBody | null) => value && !rewritten ? new Proxy(value, { get(target, property) {
+    if (property === 'uploaded') return anchor;
+    const found = Reflect.get(target, property); return typeof found === 'function' ? found.bind(target) : found;
+  } }) : value;
+  const store = new Proxy(bucket, { get(target, property) {
+    if (property === 'head') return async (key: string) => dated(await target.head(key));
+    if (property === 'get') return async (key: string) => key === 'pages/index.html' ? dated(await target.get(key)) : target.get(key);
+    if (property === 'put') return async (key: string, body: any, options: any) => { const value = await target.put(key, body, options); rewritten = true; return value; };
+    const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const discover = async () => [{ id: 'legacy-2026-10-05', key: 'digests/2026-10-05.json', date: '2026-10-05', received_at: '2026-10-05T20:00:00Z' }];
+  const before = await currentPublication(store, discover);
+  await composeHomepageConditions(store, base);
+  await bucket.put(WEATHER_KEY, '{broken'); await composeHomepageConditions(store, base);
+  expect(await currentPublication(store, discover)).toEqual(before);
+  expect((await bucket.head('pages/index.html'))!.customMetadata?.[NEWS_ANCHOR]).toBe(anchor.toISOString());
+});
+
+it('does not replace a legacy page when its preserved news anchor is invalid or cannot fit', async () => {
+  for (const metadata of [{ [NEWS_ANCHOR]: 'broken' }, { padding: 'x'.repeat(8185) }] as Record<string, string>[]) {
+    await bucket.put('pages/index.html', renderPage([], { origin: base }), { customMetadata: metadata });
+    const before = (await bucket.head('pages/index.html'))!;
+    await bucket.put(WEATHER_KEY, '{broken');
+    await expect(composeHomepageConditions(bucket, base)).rejects.toBeInstanceOf(Error);
+    expect((await bucket.head('pages/index.html'))!.version).toBe(before.version);
+  }
 });

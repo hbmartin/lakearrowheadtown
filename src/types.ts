@@ -171,8 +171,16 @@ export interface Migration {
 
 export interface ArchiveProgress { completed_days: number; total_days: number }
 
+export interface RebuildBlocker {
+  reason: 'manual_resume' | 'unscheduled' | 'failed_rebuild' | 'repair_pending' | 'repair_stalled' | 'repair_damaged';
+  job_id?: string;
+  repair_id?: string;
+  retry_at?: string;
+}
+
 export interface RebuildJob {
   manual_resume?: boolean;
+  scheduling?: 'automatic' | 'manual';
   id: string;
   origin: string;
   status: 'queued' | 'running' | 'completed' | 'failed';
@@ -186,6 +194,7 @@ export interface RebuildJob {
   finished_at?: string;
   error?: string;
   blocked_by?: string;
+  blocked?: RebuildBlocker;
   context?: OperationContext;
   error_code?: string;
   failed_stage?: string;

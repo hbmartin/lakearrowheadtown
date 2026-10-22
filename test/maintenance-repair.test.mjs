@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { maintenance, repairAndFollow } from '../scripts/maintenance.mjs';
+import { maintenance, repairAndFollow, waitForRebuild } from '../scripts/maintenance.mjs';
 const id = '00000000-0000-0000-0000-000000000001';
 const secret = 'a'.repeat(64);
 const publication = { version: 'version-one', manifest: `publications/${id}.json`, rss: `publications/${id}.rss.xml`, archives: null };
@@ -115,4 +115,25 @@ test('repairAndFollow refuses invalid configuration before sleeping or retrying'
     await assert.rejects(repairAndFollow('preview', undefined, { ...options, payload, ...patch, sleep: async () => { waits++; }, request: async () => { calls++; } }));
   }
   assert.equal(calls, 0); assert.equal(waits, 0);
+});
+
+for (const reason of ['manual_resume', 'unscheduled', 'failed_rebuild', 'repair_stalled', 'repair_damaged']) {
+  test(`waiting tools stop immediately with guidance for ${reason}`, async () => {
+    const job = { id, status: 'running', blocked: { reason, job_id: id, ...(reason.startsWith('repair') ? { repair_id: id } : {}) } };
+    let calls = 0; let sleeps = 0;
+    const extra = { ...options, sleep: async () => { sleeps++; }, request: async () => { calls++; return Response.json({ publication, unchanged: false, job }); } };
+    await assert.rejects(waitForRebuild(job, 'preview', extra), new RegExp(reason));
+    assert.equal(calls, 0);
+    await assert.rejects(repairAndFollow('preview', undefined, { ...extra, payload }), new RegExp(reason));
+    assert.equal(calls, 1); assert.equal(sleeps, 0);
+  });
+}
+
+test('a pending repair remains observable progress and its retry deadline is honored', async () => {
+  let calls = 0; const waits = [];
+  const result = await repairAndFollow('preview', undefined, { ...options, payload, sleep: async ms => { waits.push(ms); }, request: async () => {
+    calls++; return Response.json(calls === 1 ? { publication, unchanged: false, job: { id, status: 'running', blocked: { reason: 'repair_pending', repair_id: id, retry_at: new Date(Date.now() + 120000).toISOString() } } }
+      : { job: { id, status: 'completed' } });
+  } });
+  assert.equal(result.job.status, 'completed'); assert(waits[0] > 119000 && waits[0] <= 120000);
 });

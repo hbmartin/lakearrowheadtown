@@ -2,6 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { smokeAlerts } from '../scripts/smoke-alerts.mjs';
 import { smokeThumbnails } from '../scripts/smoke-thumbnails.mjs';
+import { readSmokeNews } from '../scripts/smoke-preview.mjs';
+test('news smoke reads reject failed HTTP and application responses', async () => {
+  for (const response of [Response.json({ error: 'offline' }, { status: 503 }), Response.json({ ok: false, posts: [] })]) {
+    await assert.rejects(readSmokeNews(async () => response, 'http://localhost:8787', {}));
+  }
+});
 test('thumbnail acceptance rejects localhost before credential or network access', async () => {
   await assert.rejects(smokeThumbnails(['http://localhost:8787']), /requires the deployed preview/);
 });

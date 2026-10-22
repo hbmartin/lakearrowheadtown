@@ -48,3 +48,8 @@ it('shares calendar renders but invalidates on publication and Los Angeles date 
   vi.setSystemTime(day(1)); await request(); expect(get.mock.calls.filter(([key]) => key.startsWith('events/batches/'))).toHaveLength(1);
   await publishEvents(bucket, input('2026-10-24'), day(1)); get.mockClear(); await request(); expect(get.mock.calls.filter(([key]) => key.startsWith('events/batches/'))).toHaveLength(2);
 });
+
+it('retains stage details on non-validation event storage failures', async () => {
+  const result = await publishEvents(wrap({ get: async () => { throw new Error('offline'); } }), input(), at);
+  expect(result).toMatchObject({ ok: false, failure: { code: 'storage_error', retryable: true, stage: 'event_manifest_loading', details: { stage: 'event_manifest_loading' } } });
+});

@@ -1,7 +1,7 @@
 import { settledInOrder } from './batches';
 import { Buffer } from 'node:buffer';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { asHttpError, boundary, OperationFailure, DamagedManifest, DamagedSource, HttpError, isPublishReply, type ValidationIssue } from './errors';
+import { asHttpError, boundary, OperationFailure, DamagedManifest, DamagedSource, HttpError, isPublishReply, detailsWithStage, type ValidationIssue } from './errors';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { localDate, recentDates } from './feed';
 import { canonicalJson as canonical, fingerprint, httpUrl, record, text } from './primitives';
@@ -40,7 +40,7 @@ export interface AlertInput extends Omit<NullablePatch<AlertFields>, 'category' 
 export interface StoredEntry { entry_id: string; received_at: string; input: AlertInput; publisher_fingerprint: string;
   entry_type?: 'confirmation'; retractable?: false; confirmation_run?: PublicConfirmationRun }
 export interface Retraction { entry_id: string; retracted_at: string }
-export interface AlertRecord { version: 1; alert_id: string; entries: StoredEntry[]; retractions: Retraction[]; storage?: HistoryRoot; pending_entries?: StoredEntry[]; base_entries?: StoredEntry[]; history_mode?: HistoryMode }
+export interface AlertRecord { version: 1; alert_id: string; entries: StoredEntry[]; retractions: Retraction[]; storage?: HistoryRoot; pending_entries?: StoredEntry[]; base_entries?: StoredEntry[]; history_mode?: HistoryMode; material_entries?: Map<string, StoredEntry> }
 export type HistoryMode = 'full' | 'coalesced';
 export interface PublicConfirmationRun { run_id: string; count: number; first_observed_at: string; last_observed_at: string; first_received_at: string; last_received_at: string }
 export interface AlertView extends AlertFields {
@@ -204,7 +204,7 @@ function referenceFor(value: AlertRecord, key: string, now: Date, alert = derive
 }
 async function responseRecord(bucket: ContentBucket, value: AlertRecord, history: HistoryMode): Promise<AlertRecord> {
   if (!value.storage || history === 'coalesced' || value.history_mode === 'full') return value;
-  return { ...value, entries: [...value.base_entries!, ...await expandHistory(value.storage, 'full', key => readAlertJson(bucket, key, value.alert_id), storedEntry), ...(value.pending_entries ?? [])], history_mode: 'full' };
+  return { ...value, entries: [...value.base_entries!, ...await expandHistory(value.storage, 'full', key => readAlertJson(bucket, key, value.alert_id), storedEntry, value.material_entries), ...(value.pending_entries ?? [])], history_mode: 'full' };
 }
 
 function publicEntry(value: AlertRecord, entry: StoredEntry): PublicEntry {
@@ -301,9 +301,10 @@ export async function loadAlertRecord(bucket: ContentBucket, ref: AlertReference
       const baseValue = await readAlertJson(bucket, value.base, ref.alert_id);
       if (!record(baseValue) || baseValue.version !== 1) throw new Error();
       const base = validateRecord(baseValue, ref.alert_id);
-      const entries = [...base.entries, ...await expandHistory(value, history, key => readAlertJson(bucket, key, ref.alert_id), storedEntry)];
+      const material = new Map<string, StoredEntry>();
+      const entries = [...base.entries, ...await expandHistory(value, history, key => readAlertJson(bucket, key, ref.alert_id), storedEntry, material)];
       validateRetractions(value.retractions, entries.filter(entry => !entry.entry_type));
-      return { version: 1, alert_id: ref.alert_id, entries, retractions: value.retractions, storage: value, base_entries: base.entries, history_mode: history };
+      return { version: 1, alert_id: ref.alert_id, entries, retractions: value.retractions, storage: value, base_entries: base.entries, history_mode: history, material_entries: material };
     }
     return validateRecord(value, ref.alert_id);
   } catch (error) {
@@ -403,20 +404,33 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
     const items: ConfirmationsResult['items'] = [];
     const roots = new Map<string, PromiseSettledResult<HistoryRoot>>();
     const refs = new Map<string, AlertReference>();
-    for (const raw of inputs) { try { const input = validateConfirmation(raw); const ref = manifest.alerts.find(ref => ref.alert_id === input.alert_id); if (ref) refs.set(ref.alert_id, ref); } catch { /* Item validation below reports the error. */ } }
+    const byId = new Map(manifest.alerts.map(ref => [ref.alert_id, ref]));
+    const candidate = (raw: unknown) => {
+      const input = validateConfirmation(raw);
+      const ref = byId.get(input.alert_id);
+      if (!ref) throw new HttpError(404, 'Alert not found.', {}, { code: 'alert_not_found' });
+      if (claimed.has(input.alert_id)) throw new HttpError(400, 'Only one valid check per alert is allowed in a batch.', {}, { code: 'duplicate_alert_id' });
+      const receipt = receipts.find(receipt => receipt.client_ref === input.client_ref);
+      if (receipt) {
+        if (receipt.kind !== 'confirmation') throw new HttpError(409, 'client_ref identifies a different alert submission.', {}, { code: 'client_ref_conflict' });
+        if (receipt.alert_id !== input.alert_id) throw new HttpError(409, 'client_ref identifies another alert.', {}, { code: 'client_ref_conflict' });
+        return { input, ref, receipt };
+      }
+      const effective = atTime(ref.alert, now);
+      if (effective.state === 'resolved' || effective.state === 'retracted') throw new HttpError(409, 'A resolved or retracted alert requires a new opening.', {}, { code: 'alert_closed' });
+      if (instant(input.observed_at) < instant(effective.observed_at)) throw new HttpError(409, 'Observation precedes the latest surviving observation.', {}, { code: 'stale_observation' });
+      const fields = applyFields(effective, { ...input, phase: 'update' }); validateEffective(fields);
+      return { input, ref, fields };
+    };
+    for (const raw of inputs) { try { const { ref } = candidate(raw); refs.set(ref.alert_id, ref); } catch { /* Ordered processing below reports the failure. */ } }
     for await (const { input: ref, result } of settledInOrder([...refs.values()], ref => rootForConfirmation(bucket, ref))) roots.set(ref.alert_id, result);
     const rootFor = (ref: AlertReference) => { const result = roots.get(ref.alert_id)!; if (result.status === 'rejected') throw result.reason; return result.value; };
     for (let index = 0; index < inputs.length; index++) {
       try {
-        const input = validateConfirmation(inputs[index]);
-        const ref = manifest.alerts.find(ref => ref.alert_id === input.alert_id);
-        if (!ref) throw new HttpError(404, 'Alert not found.', {}, { code: 'alert_not_found' });
-        if (claimed.has(input.alert_id)) throw new HttpError(400, 'Only one valid check per alert is allowed in a batch.', {}, { code: 'duplicate_alert_id' });
+        // Repeat cheap checks against receipts/claims added by earlier items.
+        const { input, ref, receipt, fields } = candidate(inputs[index]);
         const payload_hash = fingerprint(canonical({ operation: 'confirmation', ...input }));
-        const receipt = receipts.find(receipt => receipt.client_ref === input.client_ref);
         if (receipt) {
-          if (receipt.kind !== 'confirmation') throw new HttpError(409, 'client_ref identifies a different alert submission.', {}, { code: 'client_ref_conflict' });
-          if (receipt.alert_id !== input.alert_id) throw new HttpError(409, 'client_ref identifies another alert.', {}, { code: 'client_ref_conflict' });
           const prior = await confirmationReceipt(bucket, ref, receipt, rootFor(ref));
           const { phase: _phase, ...original } = prior.entry.input;
           if (receipt.payload_hash !== payload_hash && canonical(timestampPayload(original)) !== canonical(timestampPayload(input))) throw new HttpError(409, 'client_ref identifies a different confirmation.', {}, { code: 'client_ref_conflict' });
@@ -424,11 +438,6 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
           items.push({ index, ok: true, status: 'duplicate', client_ref: input.client_ref, alert_id: input.alert_id, entry_id: receipt.entry_id, received_at: receipt.received_at, alert: alertIndex(ref, now) });
           continue;
         }
-        const effective = atTime(ref.alert, now);
-        if (effective.state === 'resolved' || effective.state === 'retracted') throw new HttpError(409, 'A resolved or retracted alert requires a new opening.', {}, { code: 'alert_closed' });
-        if (instant(input.observed_at) < instant(effective.observed_at)) throw new HttpError(409, 'Observation precedes the latest surviving observation.', {}, { code: 'stale_observation' });
-        const nextFields = applyFields(effective, { ...input, phase: 'update' });
-        validateEffective(nextFields);
         const root = rootFor(ref);
         const last = root.timeline.at(-1);
         const extend = last?.type === 'confirmations' && last.content_revision === root.content_revision && last.source === input.source && last.source_url === input.source_url;
@@ -441,7 +450,7 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
           latest: { entry_id: node.entry_id, client_ref: node.client_ref, observed_at: node.observed_at, received_at: node.received_at } };
         if (extend) root.timeline[root.timeline.length - 1] = run; else root.timeline.push(run);
         const serialized = JSON.stringify(root); const key = `alerts/revisions/${fingerprint(serialized)}.json`;
-        const alert = atTime({ ...nextFields, state: 'open', alert_id: input.alert_id, upcoming: false, expires_at: expiry(nextFields, 'open') }, now);
+        const alert = atTime({ ...fields!, state: 'open', alert_id: input.alert_id, upcoming: false, expires_at: expiry(fields!, 'open') }, now);
         const next = referenceFor({ version: 1, alert_id: input.alert_id, entries: [], retractions: root.retractions, storage: root }, key, now, alert);
         drafts.push({ root, node, key, ref: next }); claimed.add(input.alert_id);
         receipts.push({ client_ref: input.client_ref, payload_hash, alert_id: input.alert_id, entry_id: node.entry_id, received_at: node.received_at, kind: 'confirmation', confirmation_key: nodeKey });
@@ -662,5 +671,5 @@ export function alertRpcFailure(error: unknown, context?: OperationContext): Ext
   emit('alert_operation_failed', context, { error_code: failure.code, stage, ...safeError(error) }, failure.status >= 500 ? 'error' : 'warn');
   return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, stage,
     publication_status: failure.publication_status ?? 'not_attempted', retryable: failure.retryable,
-    details: failure.details, details_truncated: failure.details_truncated } };
+    details: detailsWithStage(failure, stage), details_truncated: failure.details_truncated } };
 }

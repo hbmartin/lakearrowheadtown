@@ -3,7 +3,7 @@ import { env } from 'cloudflare:workers';
 import { reset, runInDurableObject } from 'cloudflare:test';
 import { beforeEach, expect, it, vi } from 'vitest';
 import worker from '../src/worker';
-import { ALERTS_KEY, confirmAlerts, readAlerts, retractAlertEntry, submitAlert, validateAlertInput, validateConfirmationBatch, type AlertReadResult, type AlertMutationResult, type ConfirmationInput, type ConfirmationsResult } from '../src/alerts';
+import { ALERTS_KEY, confirmAlerts, readAlerts, retractAlertEntry, submitAlert, validateAlertInput, validateConfirmationBatch, loadAlertManifest, type AlertReadResult, type AlertMutationResult, type ConfirmationInput, type ConfirmationsResult } from '../src/alerts';
 import { fingerprint } from '../src/primitives';
 import type { ContentBucket, Env } from '../src/types';
 const inPublisher = runInDurableObject as unknown as <T>(stub: unknown, callback: (instance: any, state: DurableObjectState) => Promise<T>) => Promise<T>;
@@ -164,6 +164,43 @@ it('coalesces mutation replies without reading confirmation payloads and still f
   await expect(retractAlertEntry(store, a.alert_id, (first.items[0] as any).entry_id, owner, later(4), undefined, undefined, false, 'coalesced')).rejects.toMatchObject({ code: 'confirmation_not_retractable' });
   const undone = await retractAlertEntry(store, a.alert_id, result.entry_id, owner, later(4), undefined, undefined, true, 'coalesced');
   expect(undone.alert.detail).toBeUndefined(); expect(undone.committed).toBe(false);
+});
+
+it.each(['submit', 'duplicate', 'retract'] as const)('full %s replies reuse material entries across replay and expansion', async action => {
+  const a = await open(); await confirmAlerts(bucket, [check(a.alert_id, 1)], later(1));
+  const update = validateAlertInput({ ...check(a.alert_id, 2), phase: 'update', detail: 'Material detail' });
+  const changed = await submitAlert(bucket, update, owner, later(2));
+  await confirmAlerts(bucket, [check(a.alert_id, 3)], later(3));
+  for (const dryRun of [true, false]) {
+    const reads = new Map<string, number>();
+    const store = wrap({ get: key => { reads.set(key, (reads.get(key) ?? 0) + 1); return bucket.get(key); } });
+    const result = action === 'retract' ? await retractAlertEntry(store, a.alert_id, changed.entry_id, owner, later(4), undefined, undefined, dryRun)
+      : await submitAlert(store, action === 'duplicate' ? update : validateAlertInput({ ...check(a.alert_id, 4), phase: 'update', headline: 'Changed headline' }), owner, later(4), undefined, dryRun);
+    expect(result.alert.history.filter(entry => entry.entry_type === 'confirmation')).toHaveLength(2);
+    const material = [...reads].filter(([key]) => key.startsWith('alerts/entries/'));
+    expect(material.length).toBeGreaterThan(0); expect(material.every(([, count]) => count === 1)).toBe(true);
+    expect([...reads].filter(([key]) => key.startsWith('alerts/confirmations/')).every(([, count]) => count === 1)).toBe(true);
+  }
+});
+
+it('rejects manifest-only failures without loading their roots and preserves ordered claiming', async () => {
+  const closed = await open(); const stale = await open(); const healthy = await open();
+  await submitAlert(bucket, validateAlertInput({ ...check(closed.alert_id, 1), phase: 'resolved' }), owner, later(1));
+  const refs = await loadAlertManifest(bucket);
+  const forbidden = new Set(refs.alerts.filter(ref => ref.alert_id !== healthy.alert_id).map(ref => ref.key));
+  const reads: string[] = [];
+  const store = wrap({ get: key => { reads.push(key); if (forbidden.has(key)) throw new Error('Rejected alert root must not load'); return bucket.get(key); } });
+  const result = await confirmAlerts(store, [check(closed.alert_id), check(stale.alert_id, -1), check(stale.alert_id, 1, { client_ref: stale.client_ref }), null, check(crypto.randomUUID()), check(healthy.alert_id), check(healthy.alert_id, 2)], later(1));
+  expect(result.items.map(item => item.ok ? item.status : item.code)).toEqual(['alert_closed', 'stale_observation', 'client_ref_conflict', 'validation_failed', 'alert_not_found', 'confirmed', 'duplicate_alert_id']);
+  expect(reads.filter(key => key.startsWith('alerts/revisions/'))).toEqual([refs.alerts.find(ref => ref.alert_id === healthy.alert_id)!.key]);
+});
+
+it('validates a retained confirmation retry before rejecting the now-resolved alert', async () => {
+  const a = await open(); const input = check(a.alert_id, 1);
+  const accepted = await confirmAlerts(bucket, [input], later(1));
+  await submitAlert(bucket, validateAlertInput({ ...check(a.alert_id, 2), phase: 'resolved' }), owner, later(2));
+  const result = await confirmAlerts(bucket, [input], later(3));
+  expect(result.items[0]).toMatchObject({ ok: true, status: 'duplicate', entry_id: (accepted.items[0] as any).entry_id });
 });
 it('never marks expired alerts as upcoming', async () => {
   const a = await open({ starts_at: later(72).toISOString() });

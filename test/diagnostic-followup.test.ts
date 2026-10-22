@@ -3,6 +3,7 @@ import { reset, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:tes
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/worker';
 import { currentPublication } from '../src/publishing';
+import { fingerprint } from '../src/primitives';
 import type { Digest, Env, OperationContext, RebuildJob } from '../src/types';
 
 const bindings = env as unknown as Env;
@@ -176,6 +177,23 @@ describe('rebuild storage diagnostics', () => {
 });
 
 describe('parser locations and timing semantics', () => {
+  it('records complete body hashes and consumed UTF-8 bytes for repair POST intake', async () => {
+    const body = JSON.stringify({ invalid: 'é' });
+    const response = await request('/api/publication/repair', { method: 'POST', headers, body });
+    expect(response.status).toBe(400); const result = await response.json<any>();
+    expect(events).toContainEqual(expect.objectContaining({ event: 'request_completed', request_id: result.request_id,
+      body_complete: true, bytes_received: new TextEncoder().encode(body).length, body_sha256: fingerprint(body) }));
+  });
+  it('keeps fallback stage details and diagnostics for an alert storage failure', async () => {
+    const publisher = bindings.PUBLISHER.getByName('site');
+    await inPublisher(publisher, async instance => {
+      const spy = vi.spyOn(instance.env.SITE_BUCKET, 'get').mockRejectedValue(new Error('private storage error'));
+      try {
+        const response = await request('/api/alerts', { method: 'POST', headers, body: JSON.stringify({ client_ref: 'stage-check', phase: 'open', category: 'traffic', kind: 'closure', routes: ['SR-18'], headline: 'Closure', source: 'caltrans', source_url: origin, observed_at: new Date().toISOString() }) });
+        expect(await response.json()).toMatchObject({ code: 'storage_error', details: { stage: 'alert_manifest_loading' }, diagnostics: { stage: 'alert_manifest_loading' }, retryable: true, publication_status: 'not_committed' });
+      } finally { spy.mockRestore(); }
+    });
+  });
   it.each(['\r', '\n', '\r\n'])('reports syntax locations with %j line endings', async newline => {
     const body = `{${newline}"a":1,${newline}}`;
     const response = await request('/api/digests', { method: 'POST', headers, body });

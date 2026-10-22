@@ -60,17 +60,26 @@ export async function maintenance(operation, environment, id, options = {}) {
   if (typeof result?.job?.id !== 'string' || !/^[a-f0-9-]{36}$/.test(result.job.id) || !['queued', 'running', 'completed', 'failed'].includes(result.job.status)) throw new Error(`Invalid maintenance response (${response.status}): expected a rebuild job`);
   return result.job;
 }
+const blocked = job => job.blocked?.reason ? job.blocked.reason !== 'repair_pending' : Boolean(job.manual_resume || job.blocked_by);
+const blockedAdvice = job => {
+  const reason = job.blocked?.reason ?? (job.manual_resume ? 'manual_resume' : 'failed_rebuild');
+  const target = job.blocked?.job_id ?? job.blocked_by ?? job.id;
+  return reason.startsWith('repair_')
+    ? `Inspect publication repair${job.blocked?.repair_id ? ` ${job.blocked.repair_id}` : ''}; restore damaged records or explicitly resume stalled recovery.`
+    : `Inspect rebuild ${target} and explicitly resume it after correcting the cause.`;
+};
+
 export async function waitForRebuild(job, environment, options = {}) {
   const deadline = performance.now() + (options.timeoutMs ?? 1800000);
   let attempts = 0;
-  while (!['completed', 'failed'].includes(job.status) && !job.blocked_by) {
+  while (!['completed', 'failed'].includes(job.status) && !blocked(job)) {
     if (performance.now() >= deadline) throw new Error(`Rebuild ${job.id} exceeded the wait deadline. Inspect its status; no resume was issued.`);
-    const next = Date.parse(job.next_retry_at) - Date.now();
+    const next = Date.parse(job.blocked?.retry_at ?? job.next_retry_at) - Date.now();
     await (options.sleep ?? sleep)(Math.min(Math.max(1000, next > 0 ? next : 2 ** Math.min(attempts, 5) * 1000), 30000, Math.max(1, deadline - performance.now())));
     try { job = await maintenance('status', environment, job.id, options); attempts = 0; options.onProgress?.(job); }
     catch (error) { if (!error.transport && !error.retryable) throw error; attempts++; }
   }
-  if (job.status !== 'completed') throw new Error(`Rebuild ${job.id} failed or is blocked. Inspect its status before deployment acceptance.`);
+  if (job.status !== 'completed') throw new Error(`Rebuild ${job.id} failed or is blocked (${job.blocked?.reason ?? job.status}). ${blockedAdvice(job)}`);
   return job;
 }
 
@@ -89,7 +98,7 @@ export async function repairAndFollow(environment, file, options = {}) {
     return left;
   };
   const pause = async retryAt => {
-    const delay = Math.min(30000, Math.max(1000, (Date.parse(retryAt) > Date.now() ? Date.parse(retryAt) - Date.now() : Math.min(30000, 2 ** Math.min(attempts++, 5) * 1000))));
+    const delay = Math.max(1000, (Date.parse(retryAt) > Date.now() ? Date.parse(retryAt) - Date.now() : Math.min(30000, 2 ** Math.min(attempts++, 5) * 1000)));
     await wait(Math.min(delay, remaining()));
     remaining();
   };
@@ -109,8 +118,8 @@ export async function repairAndFollow(environment, file, options = {}) {
   attempts = 0;
   jobId = result.job?.id;
   options.onProgress?.(result);
-  while (result.job && !['completed', 'failed'].includes(result.job.status) && !result.job.blocked_by) {
-    await pause(statusRetryAt ?? result.job.next_retry_at);
+  while (result.job && !['completed', 'failed'].includes(result.job.status) && !blocked(result.job)) {
+    await pause(statusRetryAt ?? result.job.blocked?.retry_at ?? result.job.next_retry_at);
     try { result.job = await call('status', jobId); attempts = 0; statusRetryAt = undefined; }
     catch (error) {
       if (!retryable(error)) throw new Error(`${context()} ${error.message}`, { cause: error });
@@ -120,7 +129,7 @@ export async function repairAndFollow(environment, file, options = {}) {
     }
     options.onProgress?.(result);
   }
-  if (result.job && (result.job.status === 'failed' || result.job.blocked_by)) throw new Error(`Repair committed; rebuild ${jobId} failed or is blocked. Inspect rebuild status.`);
+  if (result.job && (result.job.status === 'failed' || blocked(result.job))) throw new Error(`Repair committed; rebuild ${jobId} failed or is blocked (${result.job.blocked?.reason ?? result.job.status}). ${blockedAdvice(result.job)}`);
   return result;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -134,7 +143,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     else {
       const result = await maintenance(operation, environment, id);
       console.log(JSON.stringify(result, null, 2));
-      if (result.status === 'failed' || result.blocked_by) process.exitCode = 1;
+      if (result.status === 'failed' || blocked(result)) process.exitCode = 1;
     }
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

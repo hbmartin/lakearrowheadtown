@@ -22,6 +22,13 @@ export function checkRssHeaders(response) {
   assert.equal(response.headers.get('X-Robots-Tag'), 'noindex');
 }
 
+export async function readSmokeNews(fetch, origin, headers) {
+  const response = await fetch(`${origin}/api/posts?fields=index`, { headers });
+  assert.equal(response.status, 200, await response.clone().text());
+  const result = await response.json(); assert.equal(result.ok, true); assert(Array.isArray(result.posts));
+  return result;
+}
+
 export function parseSmokeArgs(args = process.argv.slice(2)) {
   const { values, positionals } = parseArgs({ args, options: { 'verify-edge': { type: 'boolean' } }, allowPositionals: true, strict: true });
   if (positionals.length > 1) throw new Error('Expected at most one preview URL');
@@ -37,7 +44,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const capability = await fetch(`${origin}/api/posts?fields=index`, { headers });
   assert.equal(capability.status, 200, await capability.clone().text());
   assert.equal(capability.headers.get('X-API-Version'), '3');
-  assert.equal((await capability.json()).fields, 'index');
+  const supported = await capability.json(); assert.equal(supported.ok, true); assert.equal(supported.fields, 'index');
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
   const form = new FormData();
   form.append('file', new File([png], 'preview.png', { type: 'image/png' }));
@@ -67,7 +74,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     input.title = `${run}${attempt === 2 ? ' follow-up correction' : ''}`;
     input.items[0].headline = input.title;
     if (attempt === 2) { input.items[0].post_url += '&followup=1'; input.client_ref += ':followup'; }
-    const beforeNews = await (await fetch(`${origin}/api/posts?fields=index`, { headers })).json();
+    const beforeNews = await readSmokeNews(fetch, origin, headers);
     const beforePreview = await fetch(origin, { method: 'HEAD' });
     assert.equal(beforePreview.status, 200);
     checkHtmlHeaders(beforePreview);
@@ -79,7 +86,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     const unchanged = await fetch(origin, { method: 'HEAD', headers: { 'If-None-Match': beforePreview.headers.get('etag') } });
     assert([200, 304].includes(unchanged.status));
     checkHtmlHeaders(unchanged);
-    const afterNews = await (await fetch(`${origin}/api/posts?fields=index`, { headers })).json();
+    const afterNews = await readSmokeNews(fetch, origin, headers);
     assert.deepEqual(afterNews.posts, beforeNews.posts); assert.equal(afterNews.published_at, beforeNews.published_at);
     const response = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
     assert.equal(response.status, 200, await response.clone().text());
@@ -96,6 +103,10 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert.deepEqual(result.counts, { submitted: 1, published: attempt === 1 ? 0 : 1, duplicates: attempt === 1 ? 1 : 0 });
     assert.equal(result.post === null, attempt === 1);
     assert.equal(result.client_ref, input.client_ref);
+    if (attempt === 1) {
+      const afterDuplicate = await readSmokeNews(fetch, origin, headers);
+      assert.deepEqual(afterDuplicate.posts, afterNews.posts); assert.equal(afterDuplicate.published_at, afterNews.published_at);
+    }
     const lookup = await fetch(`${origin}/api/digests?client_ref=${encodeURIComponent(input.client_ref)}`, { headers });
     assert.equal(lookup.status, 200);
     const batch = await lookup.json();

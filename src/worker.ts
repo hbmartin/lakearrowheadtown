@@ -241,10 +241,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       let input: RepairInput | undefined;
       const origin = await trace.run('configuration', () => originFor(request, env));
       if (request.method === 'POST') {
-        if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json');
-        state.bytes_received = 0; state.body_complete = false; state.declared_body_bytes = declaredBodyBytes(request);
-        const bytes = await trace.run('body_reading', () => readLimited(request, 16384, count => { state.bytes_received = count; }));
-        state.body_complete = true;
+        const bytes = await jsonBytes(request, state, 16384);
         input = await trace.run('validation', () => validateRepair(parseDigestJson(bytes)));
       }
       const publisher = await publisherFor(env, trace);

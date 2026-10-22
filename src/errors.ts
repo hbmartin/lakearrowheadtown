@@ -77,6 +77,10 @@ export function asHttpError(error: unknown): HttpError {
   return new HttpError(failure.status, failure.error, {}, failure);
 }
 
+export function detailsWithStage(failure: HttpError, stage: string): HttpError['details'] {
+  return Array.isArray(failure.details) || Object.keys(failure.details).length ? failure.details : { stage };
+}
+
 export const UNKNOWN_PUBLICATION = 'Unable to confirm publication; it may have completed. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.';
 
 export function committedFailureAdvice(retryable: boolean, operation?: string): string {
