@@ -45,9 +45,9 @@ export interface PublicConfirmationRun { run_id: string; count: number; first_ob
 export interface AlertView extends AlertFields {
   alert_id: string; state: typeof states[number]; expires_at: string | null; upcoming: boolean;
 }
-interface AlertReference { alert_id: string; key: string; last_received_at: string; alert: AlertView; revision?: string; confirmation_count?: number; last_confirmed_at?: string }
+export interface AlertReference { alert_id: string; key: string; last_received_at: string; alert: AlertView; revision?: string; confirmation_count?: number; last_confirmed_at?: string }
 interface Receipt { client_ref: string; payload_hash: string; alert_id: string; entry_id: string; received_at: string; kind?: 'confirmation'; confirmation_key?: string }
-interface Manifest { version: 1; published_at: string | null; alerts: AlertReference[]; receipts: Receipt[] }
+export interface AlertManifest { version: 1; published_at: string | null; alerts: AlertReference[]; receipts: Receipt[] }
 export type PublicEntry = Omit<StoredEntry, 'publisher_fingerprint'> & { client_ref: string; retracted_at?: string };
 export interface ReadAlert extends AlertView { history: PublicEntry[] }
 export interface AlertIndex extends Omit<AlertView, 'detail'> { revision: string; last_received_at: string; confirmation_count: number; last_confirmed_at?: string }
@@ -64,7 +64,7 @@ export interface ConfirmationSuccess { index: number; ok: true; status: 'confirm
 export interface ConfirmationFailure { index: number; ok: false; status: number; code: string; error: string; retryable: boolean; details: HttpError['details'] }
 export interface ConfirmationsResult { counts: { submitted: number; confirmed: number; duplicates: number; failed: number }; items: (ConfirmationSuccess | ConfirmationFailure)[]; dry_run?: true; committed?: false; checked_at?: string }
 export type AlertsReply = { ok: true; result: AlertMutationResult | AlertListResult | AlertListResult<AlertIndex> | AlertReadResult | ConfirmationsResult } | { ok: false; failure: PublishFailure & { details?: HttpError['details']; details_truncated?: boolean } };
-const emptyManifest = (): Manifest => ({ version: 1, published_at: null, alerts: [], receipts: [] });
+const emptyManifest = (): AlertManifest => ({ version: 1, published_at: null, alerts: [], receipts: [] });
 const member = (value: unknown, values: readonly string[]): value is string => typeof value === 'string' && values.includes(value);
 
 function invalidFields(issues: ValidationIssue[]): never {
@@ -197,7 +197,7 @@ function publicEntry(value: AlertRecord, entry: StoredEntry): PublicEntry {
   return { entry_id: entry.entry_id, received_at: entry.received_at, client_ref: entry.input.client_ref, input: entry.input, ...(retracted_at ? { retracted_at } : {}),
     ...(entry.entry_type ? { entry_type: entry.entry_type, retractable: false as const } : {}), ...(entry.confirmation_run ? { confirmation_run: entry.confirmation_run } : {}) };
 }
-function readAlert(value: AlertRecord, now: Date): ReadAlert {
+export function readAlert(value: AlertRecord, now: Date): ReadAlert {
   return { ...deriveAlert(value, now), history: value.entries.map(entry => publicEntry(value, entry)) };
 }
 function mutationResult(value: AlertRecord, entry: StoredEntry, status: AlertMutationResult['status'], now: Date): AlertMutationResult {
@@ -205,14 +205,14 @@ function mutationResult(value: AlertRecord, entry: StoredEntry, status: AlertMut
   return { alert_id: value.alert_id, entry_id: entry.entry_id, client_ref: entry.input.client_ref, status,
     state: alert.state, expires_at: alert.expires_at, entry: publicEntry(value, entry), alert };
 }
-function alertIndex(ref: AlertReference, now: Date): AlertIndex {
+export function alertIndex(ref: AlertReference, now: Date): AlertIndex {
   const { detail: _detail, ...alert } = atTime(ref.alert, now);
-  return { ...alert, revision: fingerprint(canonical([ref.revision ?? ref.key, alert.state, alert.upcoming])),
+  return { ...alert, revision: fingerprint(canonical([ref.key, ref.revision ?? null, alert.state, alert.upcoming])),
     last_received_at: ref.last_received_at, confirmation_count: ref.confirmation_count ?? 0,
     ...(ref.last_confirmed_at ? { last_confirmed_at: ref.last_confirmed_at } : {}) };
 }
 
-function duplicateWarnings(input: AlertInput, manifest: Manifest, now: Date): PublicationWarning[] {
+function duplicateWarnings(input: AlertInput, manifest: AlertManifest, now: Date): PublicationWarning[] {
   if (input.phase !== 'open') return [];
   const location = (value: { routes?: readonly string[] | null; area?: string | null }) => canonical([
     [...(value.routes ?? [])].sort(), (value.area ?? '').trim().replace(/\s+/g, ' ').toLowerCase()]);
@@ -237,7 +237,7 @@ async function readJson(bucket: ContentBucket, key: string): Promise<unknown> {
   if (key !== ALERTS_KEY && !key.endsWith(`/${fingerprint(serialized)}.json`)) throw new DamagedManifest(key, 'invalid_manifest');
   try { return JSON.parse(serialized); } catch { throw new DamagedManifest(key, 'invalid_json'); }
 }
-async function loadManifest(bucket: ContentBucket, snapshot?: string, identity?: { key?: string }): Promise<Manifest> {
+export async function loadAlertManifest(bucket: ContentBucket, snapshot?: string, identity?: { key?: string }): Promise<AlertManifest> {
   if (!snapshot) {
     const object = await boundary('storage', () => bucket.get(ALERTS_KEY));
     if (!object) return emptyManifest();
@@ -252,21 +252,24 @@ async function loadManifest(bucket: ContentBucket, snapshot?: string, identity?:
   const value = await readJson(bucket, snapshot);
   if (!record(value) || value.version !== 1 || !isTimestamp(value.published_at) || !Array.isArray(value.alerts) || !Array.isArray(value.receipts)
     || !value.alerts.every(ref => record(ref) && typeof ref.alert_id === 'string' && uuid.test(ref.alert_id) && typeof ref.key === 'string' && revisionKey.test(ref.key)
-      && isTimestamp(ref.last_received_at) && record(ref.alert) && ref.alert.alert_id === ref.alert_id && member(ref.alert.state, states)
+      && isTimestamp(ref.last_received_at) && (ref.revision === undefined || typeof ref.revision === 'string' && /^[a-f0-9]{64}$/.test(ref.revision))
+      && (ref.confirmation_count === undefined || Number.isSafeInteger(ref.confirmation_count) && Number(ref.confirmation_count) >= 0)
+      && (ref.last_confirmed_at === undefined || isTimestamp(ref.last_confirmed_at)) && record(ref.alert) && ref.alert.alert_id === ref.alert_id && member(ref.alert.state, states)
       && (ref.alert.expires_at === null ? ['resolved', 'retracted'].includes(String(ref.alert.state)) : isTimestamp(ref.alert.expires_at)) && isTimestamp(ref.alert.observed_at))
     || new Set(value.alerts.map(ref => ref.alert_id)).size !== value.alerts.length
     || !value.receipts.every(ref => record(ref) && isClientRef(ref.client_ref) && typeof ref.payload_hash === 'string' && /^[a-f0-9]{64}$/.test(ref.payload_hash)
+      && (ref.kind === undefined || ref.kind === 'confirmation' && typeof ref.confirmation_key === 'string' && /^alerts\/confirmations\/[a-f0-9]{64}\.json$/.test(ref.confirmation_key))
       && typeof ref.alert_id === 'string' && uuid.test(ref.alert_id) && typeof ref.entry_id === 'string' && uuid.test(ref.entry_id) && isTimestamp(ref.received_at))
     || new Set(value.receipts.map(ref => ref.client_ref)).size !== value.receipts.length) throw new DamagedManifest(snapshot, 'invalid_manifest');
   if (identity) identity.key = snapshot;
-  return value as unknown as Manifest;
+  return value as unknown as AlertManifest;
 }
 function storedEntry(value: unknown): StoredEntry {
   if (!record(value) || typeof value.entry_id !== 'string' || !uuid.test(value.entry_id) || !isTimestamp(value.received_at)
     || typeof value.publisher_fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(value.publisher_fingerprint)) throw new Error('Invalid stored entry');
   return { entry_id: value.entry_id, received_at: value.received_at, publisher_fingerprint: value.publisher_fingerprint, input: validateAlertInput(value.input) };
 }
-async function loadRecord(bucket: ContentBucket, ref: AlertReference, history: HistoryMode = 'full'): Promise<AlertRecord> {
+export async function loadAlertRecord(bucket: ContentBucket, ref: AlertReference, history: HistoryMode = 'full'): Promise<AlertRecord> {
   const value = await readJson(bucket, ref.key);
   try {
     if (record(value) && value.version === 2) {
@@ -317,14 +320,14 @@ async function writeRecord(bucket: ContentBucket, value: AlertRecord, now: Date,
   return { alert_id: value.alert_id, key, last_received_at: now.toISOString(), alert: deriveAlert(value, now), revision: fingerprint(serialized),
     confirmation_count: runs.reduce((count, run) => count + run.count, 0), ...(runs.length ? { last_confirmed_at: runs.at(-1)!.last_observed_at } : {}) };
 }
-async function commitManifest(bucket: ContentBucket, manifest: Manifest, trace: OperationTrace): Promise<void> {
+async function commitManifest(bucket: ContentBucket, manifest: AlertManifest, trace: OperationTrace): Promise<void> {
   const serialized = JSON.stringify(manifest); const key = `alerts/snapshots/${fingerprint(serialized)}.json`;
   await trace.run('alert_snapshot_write', () => boundary('storage', () => bucket.put(key, serialized, jsonOptions)));
   trace.publication_status = 'unknown';
   await trace.run('alert_manifest_write', () => boundary('storage', () => bucket.put(ALERTS_KEY, JSON.stringify({ version: 1, snapshot: key }), jsonOptions)));
   trace.publication_status = 'committed';
 }
-async function commitRecord(bucket: ContentBucket, manifest: Manifest, value: AlertRecord, now: Date, trace: OperationTrace, receipt?: Receipt): Promise<void> {
+async function commitRecord(bucket: ContentBucket, manifest: AlertManifest, value: AlertRecord, now: Date, trace: OperationTrace, receipt?: Receipt): Promise<void> {
   const ref = await writeRecord(bucket, value, now, trace); const days = recentDates(now, 30);
   await commitManifest(bucket, { version: 1, published_at: now.toISOString(), alerts: [...manifest.alerts.filter(prior => prior.alert_id !== value.alert_id), ref],
     receipts: [...manifest.receipts.filter(prior => days.includes(localDate(new Date(prior.received_at)))), ...(receipt ? [receipt] : [])] }, trace);
@@ -371,7 +374,7 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
   try {
     // RPC callers get the same envelope validation as HTTP callers.
     inputs = validateConfirmationBatch({ confirmations: inputs });
-    const manifest = await trace.run('alert_manifest_loading', () => loadManifest(bucket));
+    const manifest = await trace.run('alert_manifest_loading', () => loadAlertManifest(bucket));
     const days = recentDates(now, 30);
     const receipts = manifest.receipts.filter(receipt => days.includes(localDate(new Date(receipt.received_at))));
     const claimed = new Set<string>();
@@ -448,7 +451,7 @@ export async function submitAlert(bucket: ContentBucket, input: AlertInput, owne
   try {
     // Revalidate at the serialized boundary, not just in the public Worker.
     input = validateAlertInput(input);
-    const manifest = await trace.run('alert_manifest_loading', () => loadManifest(bucket));
+    const manifest = await trace.run('alert_manifest_loading', () => loadAlertManifest(bucket));
     const days = recentDates(now, 30);
     const payload_hash = fingerprint(canonical(input));
     const receipt = manifest.receipts.find(ref => ref.client_ref === input.client_ref && days.includes(localDate(new Date(ref.received_at))));
@@ -457,7 +460,7 @@ export async function submitAlert(bucket: ContentBucket, input: AlertInput, owne
       if (receipt.kind === 'confirmation') throw new HttpError(409, 'client_ref identifies a confirmation.', {}, { code: 'client_ref_conflict' });
       const ref = manifest.alerts.find(ref => ref.alert_id === receipt.alert_id);
       if (!ref) throw new DamagedManifest(ALERTS_KEY, 'invalid_manifest');
-      const value = await trace.run('alert_revision_loading', () => loadRecord(bucket, ref));
+      const value = await trace.run('alert_revision_loading', () => loadAlertRecord(bucket, ref));
       const entry = value.entries.find(entry => entry.entry_id === receipt.entry_id);
       if (!entry) throw new DamagedSource(ref.key, ref.alert_id, 'invalid_digest');
       if (receipt.payload_hash !== payload_hash && canonical(timestampPayload(entry.input)) !== canonical(timestampPayload(input))) {
@@ -470,7 +473,7 @@ export async function submitAlert(bucket: ContentBucket, input: AlertInput, owne
       else {
         const ref = manifest.alerts.find(ref => ref.alert_id === input.alert_id);
         if (!ref) throw new HttpError(404, 'Alert not found.', {}, { code: 'alert_not_found' });
-        value = await trace.run('alert_revision_loading', () => loadRecord(bucket, ref));
+        value = await trace.run('alert_revision_loading', () => loadAlertRecord(bucket, ref));
         const effective = deriveAlert(value, now);
         if (effective.state === 'resolved' || effective.state === 'retracted') throw new HttpError(409, 'A resolved or retracted alert requires a new opening.', {}, { code: 'alert_closed' });
         if (input.category !== undefined && input.category !== effective.category || input.kind !== undefined && input.kind !== effective.kind) throw new HttpError(409, 'Alert category and kind cannot be changed.', {}, { code: 'alert_identity_conflict' });
@@ -504,10 +507,10 @@ function alertFailure(error: unknown, trace: OperationTrace, dryRun = false): Ht
 export async function retractAlertEntry(bucket: ContentBucket, alertId: string, entryId: string, owner: string, now = new Date(), context?: OperationContext, beforeCommit?: () => Promise<void>, dryRun = false): Promise<AlertMutationResult> {
   const trace = new OperationTrace(context);
   try {
-    const manifest = await trace.run('alert_manifest_loading', () => loadManifest(bucket));
+    const manifest = await trace.run('alert_manifest_loading', () => loadAlertManifest(bucket));
     const ref = manifest.alerts.find(ref => ref.alert_id === alertId);
     if (!ref) throw new HttpError(404, 'Alert not found.', {}, { code: 'alert_not_found' });
-    const value = await trace.run('alert_revision_loading', () => loadRecord(bucket, ref));
+    const value = await trace.run('alert_revision_loading', () => loadAlertRecord(bucket, ref));
     const entry = value.entries.find(entry => entry.entry_id === entryId);
     if (!entry) throw new HttpError(404, 'Alert entry not found.', {}, { code: 'alert_entry_not_found' });
     if (entry.entry_type === 'confirmation') throw new HttpError(403, 'Confirmations cannot be retracted. Submit a corrective observation.', {}, { code: 'confirmation_not_retractable' });
@@ -530,7 +533,7 @@ export async function retractAlertEntry(bucket: ContentBucket, alertId: string, 
 }
 
 export async function currentAlertViews(bucket: ContentBucket, now = new Date()): Promise<AlertView[]> {
-  return (await loadManifest(bucket)).alerts.map(ref => atTime(ref.alert, now)).filter(alert => alert.state === 'open');
+  return (await loadAlertManifest(bucket)).alerts.map(ref => atTime(ref.alert, now)).filter(alert => alert.state === 'open');
 }
 
 interface Cursor { snapshot: string; as_of: string; days: number; offset: number; fields?: 'full' | 'index'; history?: HistoryMode }
@@ -562,22 +565,22 @@ export async function readAlerts(bucket: ContentBucket, query: URLSearchParams, 
   if (alertId !== undefined) {
     if (!uuid.test(alertId)) throw new HttpError(400, 'Invalid alert UUID.', {}, { code: 'validation_failed' });
     if (['client_ref', 'cursor', 'days'].some(key => query.has(key))) throw new HttpError(400, 'Direct alert reads do not accept lookup or pagination parameters.');
-    const manifest = await loadManifest(bucket);
+    const manifest = await loadAlertManifest(bucket);
     const ref = manifest.alerts.find(ref => ref.alert_id === alertId);
     if (!ref) throw new HttpError(404, 'Alert not found.', {}, { code: 'alert_not_found' });
     const fields = query.get('fields') === 'index' ? 'index' : 'full';
-    return { fields, ...(fields === 'full' ? { history: requestedHistory } : {}), as_of: now.toISOString(), alert: fields === 'index' ? alertIndex(ref, now) : readAlert(await loadRecord(bucket, ref, requestedHistory), now) };
+    return { fields, ...(fields === 'full' ? { history: requestedHistory } : {}), as_of: now.toISOString(), alert: fields === 'index' ? alertIndex(ref, now) : readAlert(await loadAlertRecord(bucket, ref, requestedHistory), now) };
   }
   if (query.has('client_ref')) {
     if (query.getAll('client_ref').length !== 1 || query.has('cursor') || query.has('days') || query.has('fields')) throw new HttpError(400, 'Use one client_ref without pagination or fields parameters.');
     const clientRef = validateClientRef(query.get('client_ref'));
-    const manifest = await loadManifest(bucket);
+    const manifest = await loadAlertManifest(bucket);
     const days = recentDates(now, 30);
     const receipt = manifest.receipts.find(ref => ref.client_ref === clientRef && days.includes(localDate(new Date(ref.received_at))));
     if (!receipt) throw new HttpError(404, 'No submission with this client_ref exists in the 30-day receipt window.', {}, { code: 'alert_reference_not_found' });
     const ref = manifest.alerts.find(ref => ref.alert_id === receipt.alert_id);
     if (!ref) throw new DamagedManifest(ALERTS_KEY, 'invalid_manifest');
-    const value = await loadRecord(bucket, ref, requestedHistory);
+    const value = await loadAlertRecord(bucket, ref, requestedHistory);
     const entry = receipt.kind === 'confirmation' ? (await confirmationReceipt(bucket, ref, receipt)).entry : value.entries.find(entry => entry.entry_id === receipt.entry_id);
     if (!entry) throw new DamagedSource(ref.key, ref.alert_id, 'invalid_digest');
     return mutationResult(value, entry, 'found', now);
@@ -591,7 +594,7 @@ export async function readAlerts(bucket: ContentBucket, query: URLSearchParams, 
   const days = Number(query.get('days') ?? cursor?.days ?? 30);
   if (cursor && cursor.days !== days) throw badCursor();
   const identity: { key?: string } = {};
-  const manifest = await loadManifest(bucket, cursor?.snapshot, identity);
+  const manifest = await loadAlertManifest(bucket, cursor?.snapshot, identity);
   // Preserve the actual committed key, including operator-restored JSON formatting.
   const snapshot = identity.key;
   const as_of = cursor?.as_of ?? now.toISOString();
@@ -604,7 +607,7 @@ export async function readAlerts(bucket: ContentBucket, query: URLSearchParams, 
   const refs = selected.slice(offset, offset + 20);
   const alerts: (ReadAlert | AlertIndex)[] = [];
   for (let i = 0; i < refs.length; i += 4) {
-    const results = await Promise.allSettled(refs.slice(i, i + 4).map(async ref => fields === 'index' ? alertIndex(ref, at) : readAlert(await loadRecord(bucket, ref, history), at)));
+    const results = await Promise.allSettled(refs.slice(i, i + 4).map(async ref => fields === 'index' ? alertIndex(ref, at) : readAlert(await loadAlertRecord(bucket, ref, history), at)));
     for (const result of results) { if (result.status === 'rejected') throw result.reason; alerts.push(result.value); }
   }
   return { days, fields, ...(fields === 'full' ? { history } : {}), as_of, published_at: manifest.published_at, alerts,

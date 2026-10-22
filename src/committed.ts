@@ -1,3 +1,4 @@
+import { validSyncIndexKey } from './sync-index';
 import { boundary, DamagedManifest, HttpError } from './errors';
 import { isDate, isTimestamp } from './validation';
 import { record, text } from './primitives';
@@ -16,6 +17,7 @@ function isPublication(value: unknown): value is Publication {
     && (ref.last_received_at === undefined || isTimestamp(ref.last_received_at)));
   return record(value) && (value.version === 1 || value.version === 2 || value.version === 3) && refs(value.posts)
     && (value.version === 3 ? typeof value.history_index === 'string' && /^history-index\/[a-f0-9]{64}\.json$/.test(value.history_index) : value.history_index === undefined)
+    && (value.sync_index === undefined || validSyncIndexKey(value.sync_index, 'story'))
     && (value.omitted_posts === undefined || refs(value.omitted_posts))
     && (value.archives === undefined || validArchiveKey(value.archives))
     && (value.legacy_receipts === undefined || (record(value.legacy_receipts)

@@ -160,6 +160,7 @@ export interface Publication {
   archives?: string;
   legacy_receipts?: Record<string, string>;
   history_index?: string;
+  sync_index?: string;
 }
 
 export interface Migration {

@@ -1,3 +1,4 @@
+import { isChangesReply } from './changes';
 import { validRssKey } from './committed';
 import { metadataKey } from './image-metadata';
 import { pageResource } from './pages';
@@ -136,6 +137,16 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
   let publicationAttempted = false;
   const reply = (value: Record<string, unknown>, status = 200, headers: HeadersInit = {}) => json({ ...value, ...(isApi ? { request_id: context.request_id } : {}) }, status, headers);
   try {
+    if (path === '/api/changes') {
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      context.operation = 'changes_read';
+      if (!['GET', 'HEAD'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD' });
+      const publisher = await publisherFor(env, trace);
+      const received: unknown = await trace.run('changes_read_rpc', () => boundary('rpc', () => publisher.readChangesV1(query.toString(), context)));
+      if (!isChangesReply(received)) throw new OperationFailure('rpc', new Error('Invalid changes reply'));
+      if (!received.ok) throw failureError(received.failure);
+      return reply({ ok: true, ...received.result });
+    }
     if (path === '/api/alerts/confirmations') {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       context.operation = 'alert_confirm';
@@ -427,6 +438,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
 }
 
 function routeFor(path: string): { route: string; operation: string } {
+  if (path === '/api/changes') return { route: path, operation: 'changes_read' };
   if (path === '/api/events') return { route: path, operation: 'event' };
   if (path === '/api/alerts/confirmations') return { route: path, operation: 'alert_confirm' };
   if (/^\/api\/alerts\/[^/]+$/.test(path)) return { route: '/api/alerts/:id', operation: 'alerts_read' };

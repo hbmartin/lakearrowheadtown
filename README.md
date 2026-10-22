@@ -25,7 +25,9 @@ The external watcher collects and verifies conditions. This server does not poll
 | --- | --- |
 | `POST /api/alerts` | Publish one opening, update, confirmation, or resolution immediately. |
 | `POST /api/alerts?dry_run=true` | Validate and preview the effective alert and expiry with zero writes. |
-| `GET /api/alerts?days=30` | Read full history and effective state, 20 alerts per page. |
+| `GET /api/alerts?days=30` | Read effective state and history, 20 alerts per page; `fields=index` omits history/detail. |
+| `GET`/`HEAD /api/alerts/{alert_id}` | Read one retained identity with full or compact fields. |
+| `POST /api/alerts/confirmations` | Batch 1–100 checks with independent outcomes and one publication commit; supports dry-run. |
 | `GET /api/alerts?client_ref=...` | Recover a committed submission after a timeout, including retracted submissions. |
 | `POST /api/alerts/ALERT_ID/entries/ENTRY_ID/retract` | Undo one submission within its original 24-hour receipt window. |
 
@@ -83,7 +85,7 @@ Full alert reads accept `history=coalesced`, which aggregates consecutive confir
 
 New confirmations cannot be retracted (`403 confirmation_not_retractable`), including through preview. Correct a mistaken condition with an ordinary observation; if a future latest observation prevents correction, contact the operator. Existing material updates retain their original retraction rules. Individual compact immutable check records support reference recovery and legacy expansion; new checks never copy the previous check payloads.
 
-Confirmation writes default to disabled through `ALERT_CONFIRMATIONS_ENABLED: "false"` in both environments. First deploy and verify this release's compatible readers with writes disabled. Then set that variable to `"true"` for preview, deploy, run the preview smoke checks, and only enable it in production after verification. Previews work while writes are disabled. Reader-only rollout responses use `503 confirmations_not_enabled` for writes. Alert storage converts lazily to version 2 on confirmation; old objects stay intact. Once conversion begins, roll back only to code supporting both alert storage formats. For local verification, use `npx wrangler dev --env preview --var ALERT_CONFIRMATIONS_ENABLED:true`.
+Confirmation writes default to disabled through `ALERT_CONFIRMATIONS_ENABLED: "false"` in both environments. First deploy and verify this release's compatible readers with writes disabled. Then change `env.preview.vars.ALERT_CONFIRMATIONS_ENABLED` in `wrangler.jsonc` to `"true"`, use `npm run deploy:preview`, and run the preview smoke checks. Enable production in a later configuration change only after compatible production readers have fully rolled out and preview verification has passed. Previews work while writes are disabled. Reader-only rollout responses use `503 confirmations_not_enabled` for writes. Alert storage converts lazily to version 2 on confirmation; old objects stay intact. Once conversion begins, roll back only to code supporting both alert storage formats. For local verification, use `npx wrangler dev --env preview --var ALERT_CONFIRMATIONS_ENABLED:true`.
 
 ### Retries, reconciliation, and corrections
 
@@ -164,7 +166,7 @@ npm run rebuild:status -- preview JOB_UUID
 node scripts/smoke-preview.mjs --verify-edge
 ```
 
-The smoke check first confirms API version 3 with a read, previews digests and appends, verifies compact reads and batch-reference lookup, publishes/retracts a separate cleanup fixture twice, reads recent stories, appends a source update and retries it, uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. It also checks daily archives and their PNG cards, local resource pages, WOFF2 serving, image dimensions/loading, and structured metadata. It parses `/rss.xml`, verifies full text/images, creator/media extensions and discovery links, checks HEAD, and confirms duplicate-only submissions preserve the RSS ETag. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
+The smoke check verifies compact/direct alert reads, retraction previews, gated/enabled confirmation batches, coalesced history, and reconciliation bootstrap/deltas, then confirms API version 3 with a read, previews digests and appends, verifies compact reads and batch-reference lookup, publishes/retracts a separate cleanup fixture twice, reads recent stories, appends a source update and retries it, uploads an image, submits three labeled batches (a new story, a duplicate no-op, and a distinct follow-up) and rejects an empty batch, checks public routes and ETags, and queues a rebuild. It also checks daily archives and their PNG cards, local resource pages, WOFF2 serving, image dimensions/loading, and structured metadata. It parses `/rss.xml`, verifies full text/images, creator/media extensions and discovery links, checks HEAD, and confirms duplicate-only submissions preserve the RSS ETag. `--verify-edge` additionally requires real Cloudflare compression and an image cache hit. It leaves all test data in the preview bucket. The optional URL defaults to the configured preview hostname; an explicit URL may come before or after the flag. Only that hostname or `http://localhost:<port>` is accepted. Unknown flags and extra URLs fail before credentials are read or requests are sent.
 
 ### 4. Connect the domain
 
@@ -366,6 +368,35 @@ R2 has no transaction spanning these objects. Index replacement is the commit po
 The Worker uses the versioned `publishV2` Durable Object RPC. During deployment skew, an unavailable method, failed RPC, or invalid reply returns `503 service_unavailable` with `publication_status: "unknown"`; it never falls back to another publish call. The legacy `publish` method retains throw-on-failure behavior for old Workers and the successful reply shape understood by the previous preview Worker.
 
 This intentionally corrects the earlier `500 publish_failed` response for digest publishing RPC failures with `X-API-Version: 3`. All publishing clients are controlled; coordinate their updates before the next production rollout. Clients must handle unfamiliar error codes with a readable fallback and use `retryable` and `publication_status` for retry decisions rather than matching only `publish_failed`. A missing or unusable publisher binding instead returns `503 configuration_error`, `retryable: false`, and `publication_status: "not_attempted"`: publication was never invoked and the configuration needs operator repair. No API-version negotiation or alternate publishing call is provided.
+
+## Incremental reconciliation across stories, alerts, and calendar
+
+Authenticated `GET`/`HEAD /api/changes` bootstraps current state. Apply all pages, then persist the final `sync_cursor`. Subsequent polls use `/api/changes?since=CURSOR`; subsequent pages use `/api/changes?cursor=PAGE_CURSOR`. Do not combine or repeat these parameters. The API remains version 3 and returns:
+
+```json
+{
+  "ok": true,
+  "as_of": "2026-10-22T18:00:00.000Z",
+  "changes": [
+    { "resource": "story", "identity": { "post_id": "UUID", "item_index": 0 }, "operation": "upsert", "revision": "SHA256", "data": {} },
+    { "resource": "alert", "identity": { "alert_id": "UUID" }, "operation": "remove" }
+  ],
+  "next_cursor": null,
+  "sync_cursor": "OPAQUE_CHECKPOINT"
+}
+```
+
+Pages contain at most 20 changes in stable resource/identity order, and `as_of` stays fixed through pagination. `sync_cursor` is null until the final page; save it only after successfully applying every page. Upserts replace the local resource with current public data; removals delete that identity. Story data flattens the existing full-read batch metadata and individual item, including updates. Event data matches full calendar event records. Alert data contains the effective alert and coalesced history. Private storage keys and publishing fingerprints are not data fields. Reapplying pages is safe when clients upsert/delete by the complete resource identity.
+
+The reconciliation dataset matches `/api/posts?days=30`, `/api/alerts?days=30&history=coalesced`, and `/api/events?days=30`. These are API history/calendar windows, separate from the homepage's seven-day story visibility. The feed reports net state, not every intermediate operation. Resolved/retracted alerts remain upserts while retained; resources outside the dataset or removed by supported repairs generate removals. Expiry, upcoming status, and date-window entry/exit are evaluated at each checkpoint, even without writes. Weather-only homepage composition and cosmetic rebuilds do not create story changes.
+
+The publisher briefly captures all three committed snapshots under serialization, then compares private revision-bound indexes and loads only changed source bodies, with at most four simultaneous reads across nested alert histories. New story/event publications prepare indexes before committing. Calendar snapshots are immutable; old mutable manifests are frozen on first capture. Committed legacy publications and repaired manifests with stale indexes build a cache bound to immutable source identities once. Unchanged polls with indexes do not load historical source bodies. `changes_read_result` logs change/returned counts, historical source-read counts, and cache bytes written without content or cursors.
+
+Cursors use the server's persistent signing key with a separate reconciliation namespace and expire after 30 elapsed days from the target capture. This differs from LA receipt-date retention. Invalid cursors return `400 invalid_cursor`; expired ones return `410 resync_required` and require a new bootstrap. Index or requested changed-source damage returns an error, never a false empty result. Preserve all referenced immutable artifacts for advertised cursor lifetimes; this release introduces no deletion/garbage collection. Raw overwrites of immutable sources/manifests are unsupported: create replacement revisions and install supported publication/repair snapshots. Copied story manifests may keep an old sync index; the source binding forces a fresh cache. Existing legacy full reads remain a fallback. Install a committed manifest through the normal rebuild before using this endpoint on a raw pre-migration digest bucket; an alert-only unpublished homepage can bootstrap immediately.
+
+Roll out clients by bootstrapping through this endpoint (rather than combining independent full reads with a later cursor), applying every page, and atomically saving the resulting checkpoint with local state. On interruption, resume the pinned page sequence or replay it using the previous saved checkpoint. Keep the existing alert confirmation scheduler; synchronization alone does not renew alerts. Conditional GET, weather synchronization, and new event-editing endpoints are outside this release.
+
+The preview smoke check covers bootstrap, pagination, changed stories/events, update retries, and retraction removals. It retracts its story fixture and leaves one clearly labeled calendar fixture until that day's calendar window ends. Run against the preview hostname or local Wrangler only; the ordinary smoke script continues to reject production origins.
 
 ## Category vocabulary v1 and advisory warnings
 

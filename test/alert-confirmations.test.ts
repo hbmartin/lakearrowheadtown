@@ -122,3 +122,21 @@ it('wires HTTP batching and stages writes behind the reader rollout gate', async
   const confirmed = await (await send()).json<ConfirmationsResult & { ok: boolean }>(); expect(confirmed).toMatchObject({ ok: true, counts: { confirmed: 1 } });
   expect(await (await send()).json()).toMatchObject({ ok: true, counts: { duplicates: 1, confirmed: 0 } });
 });
+
+it('keeps confirmation lookups within their original LA receipt-date window across DST', async () => {
+  const a = await open(); const input = check(a.alert_id); await confirmAlerts(bucket, [input], at);
+  expect(await readAlerts(bucket, new URLSearchParams({ client_ref: input.client_ref }), 'key', new Date('2026-11-21T07:59:59Z'))).toMatchObject({ status: 'found' });
+  await expect(readAlerts(bucket, new URLSearchParams({ client_ref: input.client_ref }), 'key', new Date('2026-11-21T08:00:00Z'))).rejects.toMatchObject({ code: 'alert_reference_not_found' });
+});
+it('recovers pending homepage composition on an unchanged confirmation retry', async () => {
+  await inPublisher(bindings.PUBLISHER.getByName('site'), async (instance, state) => {
+    const published = await instance.submitAlertV1(validateAlertInput({ client_ref: 'pending-open', phase: 'open', category: 'traffic', kind: 'closure', routes: ['SR-138'], headline: 'Pending', ...source, observed_at: new Date().toISOString() }), owner);
+    const input = { ...check(published.result.alert_id), observed_at: new Date().toISOString() }; const original = instance.env;
+    let rejected = false;
+    instance.env = { ...original, SITE_BUCKET: wrap({ put: (key, body, opts) => { if (key === 'pages/index.html' && !rejected) { rejected = true; throw new Error('Composition failed after source commit'); } return bucket.put(key, body, opts); } }) };
+    try {
+      const committed = await instance.confirmAlertsV1([input]); expect(committed.ok).toBe(true); expect(committed.result.counts.confirmed).toBe(1); expect(await state.storage.get('conditions:pending')).toBe(true);
+      const retry = await instance.confirmAlertsV1([input]); expect(retry.ok).toBe(true); expect(retry.result.counts.duplicates).toBe(1); expect(await state.storage.get('conditions:pending')).toBeUndefined();
+    } finally { instance.env = original; }
+  });
+});

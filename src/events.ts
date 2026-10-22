@@ -1,7 +1,8 @@
 import { boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply, publicationFailure, type ValidationIssue } from './errors';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { localDate } from './feed';
-import { record } from './primitives';
+import { canonicalJson, fingerprint, record } from './primitives';
+import { eventRows, validSyncIndexKey, writeSyncIndex } from './sync-index';
 import { isDate, isTimestamp, validateDigest } from './validation';
 import { digestItemWarnings } from './warnings';
 import type { ContentBucket, DigestItem, OperationContext, PostReference, PublishReply, PublishResult, StoryIdentity } from './types';
@@ -14,8 +15,8 @@ export interface EventItem extends DigestItem {
 }
 export interface EventDigest { title: string; source: string; items: EventItem[] }
 export interface EventPost extends EventDigest { id: string; date: string; received_at: string }
-interface EventReference extends PostReference { first_date: string; last_date: string }
-export interface EventPublication { version: 1; posts: EventReference[]; published_at: string | null }
+export interface EventReference extends PostReference { first_date: string; last_date: string }
+export interface EventPublication { version: 1; posts: EventReference[]; published_at: string | null; sync_index?: string }
 export interface ReadEvent extends EventItem, StoryIdentity {}
 export interface EventsResult { days: number; as_of: string; published_at: string | null; events: ReadEvent[] }
 export type EventsReply = { ok: true; result: EventsResult } | Extract<PublishReply, { ok: false }>;
@@ -69,23 +70,26 @@ export function eventDates(item: EventItem): { first: string; last: string } {
 
 const identity = (item: EventItem) => JSON.stringify([item.post_url, item.all_day, item.all_day ? item.starts_at : new Date(item.starts_at).toISOString()]);
 
-export async function currentEvents(bucket: ContentBucket): Promise<EventPublication> {
-  const object = await boundary('storage', () => bucket.get(EVENTS_KEY));
+export async function currentEvents(bucket: ContentBucket, snapshot?: string): Promise<EventPublication> {
+  const key = snapshot ?? EVENTS_KEY;
+  const object = await boundary('storage', () => bucket.get(key));
+  if (!object && snapshot) throw new DamagedManifest(key, 'missing');
   if (!object) return { version: 1, posts: [], published_at: null };
   const text = await boundary('storage', () => object.text());
+  if (snapshot && (!/^events\/snapshots\/[a-f0-9]{64}\.json$/.test(snapshot) || !snapshot.endsWith(`/${fingerprint(text)}.json`))) throw new DamagedManifest(key, 'invalid_manifest');
   let value: unknown;
   try { value = JSON.parse(text); }
-  catch { throw new DamagedManifest(EVENTS_KEY, 'invalid_json'); }
-  if (!record(value) || value.version !== 1 || !isTimestamp(value.published_at) || !Array.isArray(value.posts)
+  catch { throw new DamagedManifest(key, 'invalid_json'); }
+  if (!record(value) || value.version !== 1 || !isTimestamp(value.published_at) || !Array.isArray(value.posts) || value.sync_index !== undefined && !validSyncIndexKey(value.sync_index, 'event')
     || !value.posts.every(ref => record(ref) && typeof ref.id === 'string' && uuid.test(ref.id) && typeof ref.date === 'string' && isDate(ref.date)
       && isTimestamp(ref.received_at) && ref.key === eventKey({ id: ref.id, date: ref.date })
       && typeof ref.first_date === 'string' && isDate(ref.first_date) && typeof ref.last_date === 'string' && isDate(ref.last_date) && ref.last_date >= ref.first_date)) {
-    throw new DamagedManifest(EVENTS_KEY, 'invalid_manifest');
+    throw new DamagedManifest(key, 'invalid_manifest');
   }
   return value as unknown as EventPublication;
 }
 
-async function loadEvents(bucket: ContentBucket, ref: EventReference): Promise<EventPost> {
+export async function loadEvents(bucket: ContentBucket, ref: EventReference): Promise<EventPost> {
   const object = await boundary('storage', () => bucket.get(ref.key));
   if (!object) throw new DamagedSource(ref.key, ref.id, 'missing');
   const text = await boundary('storage', () => object.text());
@@ -101,7 +105,7 @@ async function loadEvents(bucket: ContentBucket, ref: EventReference): Promise<E
   return { ...digest, id: ref.id, date: ref.date, received_at: ref.received_at };
 }
 
-async function loadBatches(bucket: ContentBucket, refs: EventReference[]): Promise<EventPost[]> {
+export async function loadEventBatches(bucket: ContentBucket, refs: EventReference[]): Promise<EventPost[]> {
   const posts: EventPost[] = [];
   // Bound simultaneous R2 reads and preserve source order for ties and failures.
   for (let i = 0; i < refs.length; i += 4) {
@@ -136,7 +140,7 @@ export async function readEvents(bucket: ContentBucket, query = new URLSearchPar
   const publication = await currentEvents(bucket);
   const first = localDate(now);
   const last = addDays(first, days - 1);
-  const posts = await loadBatches(bucket, publication.posts.filter(ref => ref.last_date >= first && ref.first_date <= last));
+  const posts = await loadEventBatches(bucket, publication.posts.filter(ref => ref.last_date >= first && ref.first_date <= last));
   return { days, as_of: now.toISOString(), published_at: publication.published_at, events: selectEvents(posts, now, days) };
 }
 
@@ -147,7 +151,7 @@ export async function publishEvents(bucket: ContentBucket, digest: EventDigest, 
     const today = localDate(now);
     // Upcoming events stay retained regardless of when their announcements arrived.
     const retained = publication.posts.filter(ref => ref.last_date >= today);
-    const posts = await trace.run('event_source_loading', () => loadBatches(bucket, retained));
+    const posts = await trace.run('event_source_loading', () => loadEventBatches(bucket, retained));
     const seen = new Map<string, StoryIdentity>();
     for (const post of posts) post.items.forEach((item, item_index) => {
       const key = identity(item);
@@ -176,10 +180,14 @@ export async function publishEvents(bucket: ContentBucket, digest: EventDigest, 
       first_date: dates.reduce((date, value) => value.first < date ? value.first : date, dates[0].first),
       last_date: dates.reduce((date, value) => value.last > date ? value.last : date, dates[0].last) };
     await trace.run('event_source_write', () => boundary('storage', () => bucket.put(ref.key, JSON.stringify(post), { httpMetadata: { contentType: 'application/json' } })));
-    // This one atomic replacement commits membership. Orphan sources cannot suppress retries.
+    const next: EventPublication = { version: 1, posts: [...retained, ref], published_at: now.toISOString() };
+    next.sync_index = await trace.run('event_sync_index_write', () => writeSyncIndex(bucket, 'event', next.posts, eventRows([...posts, post], next.posts, eventDates)));
+    const serialized = canonicalJson(next); const snapshot = `events/snapshots/${fingerprint(serialized)}.json`;
+    await trace.run('event_snapshot_write', () => boundary('storage', () => bucket.put(snapshot, serialized, { httpMetadata: { contentType: 'application/json' } })));
+    // Current membership commits only after all immutable artifacts are durable.
     trace.publication_status = 'unknown';
-    await trace.run('event_manifest_write', () => boundary('storage', () => bucket.put(EVENTS_KEY,
-      JSON.stringify({ version: 1, posts: [...retained, ref], published_at: now.toISOString() } satisfies EventPublication), { httpMetadata: { contentType: 'application/json' } })));
+    await trace.run('event_manifest_write', () => boundary('storage', () => bucket.put(EVENTS_KEY, serialized, { httpMetadata: { contentType: 'application/json' } })));
+    trace.publication_status = 'committed';
     return { ok: true, result };
   } catch (error) {
     const stage = trace.failed_stage ?? 'event_publication';
