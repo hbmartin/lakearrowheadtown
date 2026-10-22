@@ -66,7 +66,7 @@ export async function metadataResource(request: Request, bucket: ContentBucket, 
   if (url.pathname === '/sitemap.xml' && indexable) {
     const committed = await (await committedSnapshot(bucket)).metadata();
     const catalog = await loadCatalog(bucket, committed.archives);
-    const pages = [{ path: '/archive/' }, ...RESOURCE_PAGES.map(page => ({ path: page.path })), ...Object.entries(catalog.days).sort(([a], [b]) => b.localeCompare(a)).map(([date, ref]) => ({ path: archivePath(date), modified: ref.modified }))];
+    const pages = [{ path: '/archive/' }, { path: '/calendar/' }, ...RESOURCE_PAGES.map(page => ({ path: page.path })), ...Object.entries(catalog.days).sort(([a], [b]) => b.localeCompare(a)).map(([date, ref]) => ({ path: archivePath(date), modified: ref.modified }))];
     return resourceResponse(request, {
       body: sitemapXml(committed.publishedAt, pages), type: 'application/xml; charset=utf-8', cache: HTML_CACHE,
     });

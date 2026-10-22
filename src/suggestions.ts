@@ -24,6 +24,10 @@ export function errorSuggestion(code: string, retryable: boolean, dryRun = false
     return { action: retryable ? operation === 'retract' ? 'reconcile_or_retry_retraction' : 'retry_unchanged' : 'contact_operator',
       message: `The ${operation === 'retract' ? 'retraction' : 'publication'} is confirmed committed. ${committedFailureAdvice(retryable, operation)}` };
   }
+  if (['event', 'events_read'].includes(operation ?? '')) {
+    if (code === 'invalid_days') return { action: 'restart_read', message: 'Use days between 1 and 30 to read upcoming events.', method: 'GET', path: '/api/events?days=30' };
+    if (retryable) return { action: 'retry_unchanged', message: 'Retry the unchanged event request. An uncertain publication may already have committed.' };
+  }
   if (code === 'invalid_dry_run' && ['image', 'retract', 'rebuild', 'publication_repair'].includes(operation ?? '')) return { action: 'remove_dry_run', message: 'Remove the dry_run parameter; this endpoint does not support previews.' };
   if (operation === 'retract' && retryable) return { action: 'reconcile_or_retry_retraction', message: 'Reconcile the original batch status or retry promptly with its publishing token. A first retraction must commit within 24 hours of the original receipt; otherwise contact the operator.' };
   if (operation === 'publication_repair' && retryable) return { action: 'refresh_publication', message: 'Read GET /api/publication/repair to reconcile an uncertain repair, then retry the same pointers if necessary.', method: 'GET', path: '/api/publication/repair' };

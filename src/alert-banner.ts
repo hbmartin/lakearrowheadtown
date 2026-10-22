@@ -7,16 +7,12 @@ const markdown = new MarkdownIt({ html: false, linkify: false }).disable('image'
 const dateFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
 const time = (value: string) => `<time datetime="${escapeHtml(value)}">${escapeHtml(dateFormat.format(new Date(value)))}</time>`;
 const sourceNames = { caltrans: 'Caltrans', nws: 'National Weather Service', sce: 'Southern California Edison' };
-const kindNames = { closure: 'Closure', 'chain-control': 'Chain controls', 'one-way': 'One-way traffic', construction: 'Construction', storm: 'Storm', hazard: 'Hazard', outage: 'Power off', 'planned-outage': 'Planned outage', psps: 'PSPS' };
-const stageNames = { watch: 'Watch', warning: 'Warning', scheduled: 'Scheduled', 'in-effect': 'Power off' };
 
 function renderAlert(alert: AlertView): string {
   const location = [alert.routes?.join(', '), alert.area].filter(Boolean).join(' · ');
-  const status = [alert.upcoming ? 'Upcoming' : '', kindNames[alert.kind], alert.chain_level ?? '',
-    alert.category === 'power' && alert.kind !== 'outage' ? stageNames[alert.power!.stage] : ''].filter(Boolean).join(' · ');
   const count = alert.power?.customer_count;
   return `<details class="alert-row">
-    <summary><span class="alert-summary"><span class="alert-location">${escapeHtml(location)}</span><span class="alert-headline">${escapeHtml(alert.headline)}</span><span class="alert-status">${escapeHtml(status)}</span></span></summary>
+    <summary><span class="alert-summary"><span class="alert-location">${escapeHtml(location)}</span><span class="alert-headline">${escapeHtml(alert.headline)}</span></span></summary>
     <div class="alert-details">
       ${alert.detail ? `<div class="markdown">${markdown.render(alert.detail)}</div>` : ''}
       <dl class="alert-facts">
