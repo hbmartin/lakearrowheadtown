@@ -42,7 +42,8 @@ export async function smokeAlerts(origin, request, headers) {
     const tag = page.headers.get('etag'); const html = await page.text();
     assert(html.includes(traffic.headline)); assert(html.includes(power.headline));
     assert(html.includes('id="traffic-alerts">Traffic')); assert(html.includes('id="power-alerts">Power'));
-    assert(html.includes('PSPS · Watch')); assert(html.includes('Customers potentially affected'));
+    assert(!html.includes('class="resource-nav"')); assert(!html.includes('class="alert-status"'));
+    assert(html.includes('Customers potentially affected'));
     assert.equal((await request(origin, { method: 'HEAD' })).headers.get('etag'), tag);
     assert.equal((await request(origin, { headers: { 'If-None-Match': tag } })).status, 304);
     const confirmation = await send('/api/alerts', { client_ref: `${run}:confirm`, phase: 'update', alert_id: published.alert_id,

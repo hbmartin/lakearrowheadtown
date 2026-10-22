@@ -11,6 +11,7 @@ import { renderRss, RSS_TYPE } from './rss';
 import { currentAlertViews, isAlertsReply, validateAlertInput } from './alerts';
 import { renderAlertBanner } from './alert-banner';
 import { isPostsReply } from './posts';
+import { isEventsReply, validateEvents, type EventDigest } from './events';
 import { isRepairReply, validateRepair, type RepairInput } from './publication-repair';
 import { publicationOperation } from './operations';
 import { errorSuggestion } from './suggestions';
@@ -208,6 +209,15 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       }
       return reply({ ok: true, ...received.result });
     }
+    if (path === '/api/events' && ['GET', 'HEAD'].includes(request.method)) {
+      context.operation = 'events_read';
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      const publisher = await publisherFor(env, trace);
+      const received: unknown = await trace.run('events_read_rpc', () => boundary('rpc', async () => await publisher.readEventsV1(query.toString(), context)));
+      if (!isEventsReply(received)) throw new OperationFailure('rpc', new Error('Invalid events reply'));
+      if (!received.ok) throw failureError(received.failure);
+      return reply({ ok: true, ...received.result });
+    }
     if (path === '/api/publication/repair') {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       if (!['GET', 'HEAD', 'POST'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD, POST' });
@@ -299,11 +309,12 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (job === 'conflict') throw new HttpError(409, 'Only a failed queue head or a stalled queued/running head without an alarm can resume', {}, { code: 'job_not_resumable' });
       return reply({ ok: true, job }, 202);
     }
-    if (path === '/api/digests' || path === '/api/images' || append) {
-      if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: path === '/api/digests' ? 'GET, HEAD, POST' : 'POST' });
+    if (path === '/api/digests' || path === '/api/events' || path === '/api/images' || append) {
+      const events = path === '/api/events';
+      if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: path === '/api/digests' || events ? 'GET, HEAD, POST' : 'POST' });
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       if (path === '/api/images' && query.has('dry_run')) throw new HttpError(400, 'dry_run is not supported for image uploads.', {}, { code: 'invalid_dry_run' });
-      if (path === '/api/digests' || append) {
+      if (path === '/api/digests' || events || append) {
         if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) {
           throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
         }
@@ -313,7 +324,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       state.body_complete = false;
       state.declared_body_bytes = declaredBodyBytes(request);
       const origin = await trace.run('configuration', () => originFor(request, env));
-      if (path === '/api/digests' || append) {
+      if (path === '/api/digests' || events || append) {
         await trace.run('content_type', () => {
           if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json', {}, { details: { expected: 'application/json' } });
         });
@@ -324,14 +335,16 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         const input = await trace.run('parsing', () => parseDigestJson(bytes));
         const payload = await trace.run('validation', () => {
           if (append && (!/^(?:0|[1-9][0-9]*)$/.test(append[2]) || !Number.isSafeInteger(Number(append[2])))) throw new HttpError(400, 'item_index must be a nonnegative safe integer.');
-          return append ? validateUpdate(input) : validateDigest(input, { requireItems: true });
+          return events ? validateEvents(input) : append ? validateUpdate(input) : validateDigest(input, { requireItems: true });
         });
         const publisher = await publisherFor(env, trace);
         publicationAttempted = !state.dry_run;
         state.publication_status = state.dry_run ? 'not_attempted' : 'unknown';
         const rpc = { transport_outcome: 'error' };
         const result = await trace.run('publisher_rpc', async () => {
-          const received: unknown = await boundary('rpc', async () => state.dry_run
+          const received: unknown = await boundary('rpc', async () => events
+            ? await publisher.publishEventsV1(payload as EventDigest, context, state.dry_run)
+            : state.dry_run
             ? append ? await publisher.previewAppendV1(append[1], Number(append[2]), payload as StoryUpdate, origin, context)
               : await publisher.previewDigestV1(payload as Digest, origin, context)
             : append ? await publisher.appendUpdateV1(append[1], Number(append[2]), payload as StoryUpdate, origin, context)
@@ -361,7 +374,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
           state.publication_status = 'not_attempted';
           state.publication_outcome = 'preview';
         }
-        return reply({ ok: true, url: '/', ...result });
+        return reply({ ok: true, url: events ? '/calendar/' : '/', ...result });
       }
       return await withImageUploadSlot(() => trace.run('upload_slot_held', async () => {
         const image = await trace.run('image_validation', () => imageUpload(request, (bytes, complete) => { state.bytes_received = bytes; state.body_complete = complete ?? false; }));
@@ -397,11 +410,11 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     let failure = asHttpError(error);
     const detailStage = !Array.isArray(failure.details) && typeof failure.details.stage === 'string' ? failure.details.stage : undefined;
     const stage = failure.stage ?? detailStage ?? trace.failed_stage ?? trace.stage ?? 'request_processing';
-    if (publicationOperation(context.operation) || ['alert', 'alert_retract'].includes(context.operation) || context.operation === 'publication_repair') {
+    if (publicationOperation(context.operation) || ['alert', 'alert_retract', 'event'].includes(context.operation) || context.operation === 'publication_repair') {
       state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
       state.publication_outcome = state.dry_run ? 'preview_failed' : 'failed';
       if (state.dry_run) state.publication_status = 'not_attempted';
-      if (publicationAttempted && (publicationOperation(context.operation) || ['alert', 'alert_retract'].includes(context.operation))) {
+      if (publicationAttempted && (publicationOperation(context.operation) || ['alert', 'alert_retract', 'event'].includes(context.operation))) {
         const f = publicationFailure(error, stage, state.publication_status, context.operation);
         failure = new HttpError(f.status, f.error, failure.headers, { code: f.code, details: failure.details, details_truncated: failure.details_truncated, retryable: f.retryable, publication_status: f.publication_status, retry_at: f.retry_at });
       }
@@ -418,11 +431,12 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     }
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
     return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable, state.dry_run, context.operation, state.publication_status), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
-      diagnostics, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}), ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(publicationOperation(context.operation) || ['alert', 'alert_retract'].includes(context.operation) || context.operation === 'publication_repair' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
+      diagnostics, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}), ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(publicationOperation(context.operation) || ['alert', 'alert_retract', 'event'].includes(context.operation) || context.operation === 'publication_repair' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
   }
 }
 
 function routeFor(path: string): { route: string; operation: string } {
+  if (path === '/api/events') return { route: path, operation: 'event' };
   if (path === '/api/alerts') return { route: path, operation: 'alert' };
   if (/^\/api\/alerts\/[^/]+\/entries\/[^/]+\/retract$/.test(path)) return { route: '/api/alerts/:id/entries/:entry/retract', operation: 'alert_retract' };
   if (path === '/api/publication/repair') return { route: path, operation: 'publication_repair' };

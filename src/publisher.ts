@@ -6,6 +6,7 @@ import { committedSnapshot, requireCommittedManifest, type CommittedSnapshot } f
 import { asHttpError, boundary, HttpError, publicationFailure } from './errors';
 import { alertRpcFailure, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type AlertsReply } from './alerts';
 import { readPosts, type PostsReply } from './posts';
+import { publishEvents, readEvents, type EventDigest, type EventsReply } from './events';
 import { validateRepair, type RepairReply } from './publication-repair';
 import { RepairCoordinator, restartRebuild } from './repair-coordinator';
 import type { AppendReply, BatchReply, Digest, Env, Migration, OperationContext, PublishFailure, PublishReply, RebuildJob, RetractReply, StoryUpdate } from './types';
@@ -80,6 +81,24 @@ export class DigestPublisher extends DurableObject<Env> {
 
   async publishV2(digest: Digest, origin: string, context?: OperationContext, publisherFingerprint?: string): Promise<PublishReply> {
     return this.mutation('publish', context, (complete, executing, snapshot) => publishDigest(this.env.SITE_BUCKET, digest, origin, new Date(), complete, executing, { publisherFingerprint, snapshot }));
+  }
+
+  async publishEventsV1(digest: EventDigest, context?: OperationContext, dryRun = false): Promise<PublishReply> {
+    context = this.executingContext(context);
+    return this.serialize(() => publishEvents(this.env.SITE_BUCKET, digest, new Date(), context, dryRun), context);
+  }
+
+  async readEventsV1(query: string, context?: OperationContext): Promise<EventsReply> {
+    context = this.executingContext(context);
+    const trace = new OperationTrace(context);
+    try {
+      return { ok: true, result: await trace.run('events_read', () => readEvents(this.env.SITE_BUCKET, new URLSearchParams(query))) };
+    } catch (error) {
+      const failure = asHttpError(error);
+      const stage = trace.failed_stage ?? 'events_read';
+      emit('events_read_failed', context, { stage, error_code: failure.code, ...safeError(error) }, 'error');
+      return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, retryable: failure.retryable, stage, publication_status: 'not_attempted' } };
+    }
   }
 
   async submitAlertV1(input: AlertInput, owner: string, context?: OperationContext, dryRun = false): Promise<AlertsReply> {

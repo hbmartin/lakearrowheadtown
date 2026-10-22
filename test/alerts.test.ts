@@ -278,7 +278,7 @@ describe('API and homepage integration', () => {
     expect(JSON.stringify(result)).not.toContain('private transport detail');
     expect(result.message).not.toContain('/api/digests');
   });
-  it('renders separate compact groups, latest details, safe markup, and accurate power stages', async () => {
+  it('renders separate compact groups, latest details, safe markup, and accurate power impact wording', async () => {
     const opened = await submitAlert(bucket, traffic({ headline: '<script>bad</script>', detail: 'Original detail' }), owner, start);
     await submitAlert(bucket, change(opened.alert_id, { headline: 'Newer closure', detail: '**Latest detail**\n\n<script>unsafe</script> [bad](javascript:alert(1))' }), owner, later(1));
     await submitAlert(bucket, traffic({ client_ref: 'older', headline: 'Older closure' }), owner, start);
@@ -289,7 +289,8 @@ describe('API and homepage integration', () => {
     expect(html.indexOf('Newer closure')).toBeLessThan(html.indexOf('Older closure'));
     expect(html).toContain('<strong>Latest detail</strong>'); expect(html).not.toContain('Original detail');
     expect(html).not.toContain('<script>'); expect(html).not.toContain('href="javascript:');
-    expect(html).toContain('PSPS · Watch'); expect(html).toContain('Customers potentially affected'); expect(html).not.toContain('Power off');
+    expect(html).not.toContain('class="alert-status"'); expect(html).not.toContain('PSPS · Watch');
+    expect(html).toContain('Customers potentially affected'); expect(html).not.toContain('Power off');
     expect(html).toContain('PDT');
   });
   it('injects alerts above stories even with an empty homepage and revalidates at expiry', async () => {
@@ -301,7 +302,7 @@ describe('API and homepage integration', () => {
     expect(page.status).toBe(200);
     const tag = page.headers.get('etag')!; const html = await page.text();
     expect(html.indexOf('class="alerts-banner"')).toBeLessThan(html.indexOf('No posts from the past week'));
-    expect(html.indexOf('class="resource-nav"')).toBeLessThan(html.indexOf('class="alerts-banner"'));
+    expect(html).not.toContain('class="resource-nav"'); expect(html).not.toContain('class="alert-status"');
     expect((await request('/index.html', { headers: { 'If-None-Match': tag } })).status).toBe(304);
     const head = await request('/', { method: 'HEAD' }); expect(head.headers.get('etag')).toBe(tag); expect(await head.text()).toBe('');
     expect(await (await request('/road-conditions/')).text()).not.toContain('class="alerts-banner"');

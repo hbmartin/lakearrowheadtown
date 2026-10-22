@@ -234,7 +234,8 @@ describe('crawler resources and artwork', () => {
     expect(response.headers.get('Cloudflare-CDN-Cache-Control')).toBe('no-store');
     const sitemap = await response.text();
     expect(sitemap).toContain(`<lastmod>${now.toISOString()}</lastmod>`);
-    expect(sitemap.match(/<loc>/g)).toHaveLength(6);
+    expect(sitemap.match(/<loc>/g)).toHaveLength(7);
+    expect(sitemap).toContain('<loc>https://lakearrowhead.town/calendar/</loc>');
     expect(sitemap).toContain('<loc>https://lakearrowhead.town/2026/10/17/</loc>');
     expect(sitemap).not.toMatch(/2099|orphan|publications|posts|index\.html/);
     await rebuildHomepage(bindings.SITE_BUCKET, SITE.origin);

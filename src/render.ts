@@ -56,7 +56,7 @@ function removeEmptiedWrappers(tokens: Token[], affected: Set<Token>, preserveWh
   return result;
 }
 
-function renderBody(item: DigestItem, context: ImageContext): string {
+export function renderBody(item: DigestItem, context: ImageContext): string {
   // Reference definitions belong to one Markdown document, not the whole feed.
   const env = { imageContext: context };
   const tokens = markdown.parse(item.body, env);
@@ -186,11 +186,12 @@ export function renderPage(digests: StoredPost[], options: { origin: string; pub
     .replace(/<!-- digests:start -->[\s\S]*?<!-- digests:end -->/, () => `<!-- digests:start -->\n${content}\n<!-- digests:end -->`);
 }
 
-export function renderContentPage(origin: string, page: PageMetadata, heading: string, body: string): string {
+export function renderContentPage(origin: string, page: PageMetadata, heading: string, body: string,
+  options: { className?: 'resource-page' | 'calendar-page'; items?: DigestItem[]; publishedAt?: string | null } = {}): string {
   return template
-    .replace('<!-- page-meta -->', () => renderMetadata(origin, [], undefined, { type: 'WebPage', ...page }))
+    .replace('<!-- page-meta -->', () => renderMetadata(origin, options.items ?? [], options.publishedAt, { type: 'WebPage', ...page }))
     .replace('<!-- snapshot-meta -->', '')
-    .replace(/<!-- digests:start -->[\s\S]*?<!-- digests:end -->/, () => `<!-- digests:start --><section class="resource-page"><h2>${escapeHtml(heading)}</h2>${body}</section><!-- digests:end -->`);
+    .replace(/<!-- digests:start -->[\s\S]*?<!-- digests:end -->/, () => `<!-- digests:start --><section class="${options.className ?? 'resource-page'}"><h2>${escapeHtml(heading)}</h2>${body}</section><!-- digests:end -->`);
 }
 
 export function renderArchivePage(origin: string, day: ArchiveDay, ref: ArchiveReference): string {

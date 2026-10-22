@@ -96,6 +96,11 @@ export function publicationFailure(error: unknown, stage: string, publication_st
       : 'Look up GET /api/alerts?client_ref=YOUR_REFERENCE or retry the unchanged submission within its original 30 Los Angeles receipt-date reference window.';
     return { status: failure.status, code: failure.code, error: `${publication_status === 'unknown' ? 'Unable to confirm the alert operation; it may have completed.' : 'The alert operation did not commit.'} ${advice}`, stage, publication_status, retryable };
   }
+  if (operation === 'event' && retryable && ['unknown', 'not_committed'].includes(publication_status)) {
+    return { status: failure.status, code: failure.code, error: publication_status === 'unknown'
+      ? 'Unable to confirm event publication; it may have completed. Retry the unchanged payload; retained occurrences are deduplicated by source URL and start time.'
+      : 'Event publication did not commit. Retry the unchanged payload.', stage, publication_status, retryable };
+  }
   operation = publicationOperation(operation);
   const message = failure.code === 'publication_conflict' ? failure.message : publication_status === 'unknown' ? operation === 'retract'
     ? 'Unable to confirm retraction; it may have completed. Reconcile the batch status or retry promptly with the original token. A first retraction must commit within 24 hours of the original batch receipt.' : UNKNOWN_PUBLICATION
