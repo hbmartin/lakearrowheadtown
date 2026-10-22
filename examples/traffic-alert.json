@@ -1,0 +1,13 @@
+{
+  "client_ref": "traffic-2026-10-21-sr138-oneway-01",
+  "phase": "open",
+  "category": "traffic",
+  "kind": "one-way",
+  "routes": ["SR-138"],
+  "headline": "One-way controlled traffic on SR-138 near SR-18",
+  "detail": "Construction work is scheduled 9 AM–3 PM Tuesday–Friday through October 23. This notice covers the announced period, including hours between work windows.",
+  "source": "caltrans",
+  "source_url": "https://roads.dot.ca.gov/?roadnumber=138",
+  "observed_at": "2026-10-21T10:00:00-07:00",
+  "expected_end": "2026-10-23T15:00:00-07:00"
+}

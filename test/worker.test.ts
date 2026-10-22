@@ -298,9 +298,10 @@ describe('conditional header parsing', () => {
       expect(response.status, condition).toBe(304); expect(await response.text()).toBe('');
       const object = await get.mock.results.at(-1)!.value;
       expect(object && 'body' in object).toBe(kind === 'fallback' ? null : false);
-      const reads = get.mock.calls.length;
+      const pageReads = () => get.mock.calls.filter(([key]) => key !== 'alerts/current.json').length;
+      const reads = pageReads();
       const responseHead = await fetch(path, { method: 'HEAD', headers: { 'If-None-Match': condition } }, { SITE_BUCKET });
-      expect(responseHead.status).toBe(304); expect(await responseHead.text()).toBe(''); expect(get.mock.calls.length).toBe(reads);
+      expect(responseHead.status).toBe(304); expect(await responseHead.text()).toBe(''); expect(pageReads()).toBe(reads);
     }
     for (const condition of ['unquoted', '"unterminated', `"x", garbage, ${etag}`, `*, ${etag}`, `w/${strong}`, `${etag} ${etag}`, '"bad\u007f"']) {
       for (const method of ['GET', 'HEAD']) {
@@ -844,7 +845,8 @@ describe('images and public serving', () => {
     const head = vi.fn((key: string) => bindings.SITE_BUCKET.head(key));
     const SITE_BUCKET = { get, head } as unknown as R2Bucket;
     const response = await fetch('/', { method: 'HEAD' }, { SITE_BUCKET });
-    expect(response.status).toBe(200); expect(await response.text()).toBe(''); expect(get).not.toHaveBeenCalled(); expect(head).toHaveBeenCalledOnce();
+    expect(response.status).toBe(200); expect(await response.text()).toBe('');
+    expect(get.mock.calls.every(([key]) => key === 'alerts/current.json')).toBe(true); expect(head).toHaveBeenCalledOnce();
     for (const value of [etag, etag.replace(/^W\//, ''), `"old", ${etag}`, '*']) {
       expect((await fetch('/', { headers: { 'If-None-Match': value } }, { SITE_BUCKET })).status).toBe(304);
       const object = await get.mock.results.at(-1)!.value; expect(object && 'body' in object).toBe(false);

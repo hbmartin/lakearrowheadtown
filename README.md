@@ -15,6 +15,74 @@ GET  /           → read published HTML from R2
 
 New posts rebuild the homepage without a Git commit, deployment, or CI run. New story URLs append to the feed. Exact source URLs on stories retained in the 30-day history are skipped, including URLs attached as updates; changed wording at the same URL is also skipped.
 
+## Traffic and power alerts
+
+The homepage displays separate **Traffic** and **Power** lists above stories, sorted by latest observation within each list. Rows expand to show the latest effective details and official source. Current and upcoming notices appear; empty groups disappear. Recurring work notices cover the entire announced period, with daily work hours in `detail`. Scheduled power notices remain scheduled until an explicit stage update confirms power is off. The banner is composed on each page load, independently of story rebuilds. Visitors reload to see changes. Alert-read failures are logged and silently omit the banner while news remains available; degraded pages use `no-store` and no ETag.
+
+The external watcher collects and verifies conditions. This server does not poll providers. Use the existing `Authorization: Bearer <API_SECRET>` credential. All API replies include `request_id`, `X-Request-ID`, `X-API-Version: 3`, and no-store headers. Public pages require no credential.
+
+| Endpoint | Behavior |
+| --- | --- |
+| `POST /api/alerts` | Publish one opening, update, confirmation, or resolution immediately. |
+| `POST /api/alerts?dry_run=true` | Validate and preview the effective alert and expiry with zero writes. |
+| `GET /api/alerts?days=30` | Read full history and effective state, 20 alerts per page. |
+| `GET /api/alerts?client_ref=...` | Recover a committed submission after a timeout, including retracted submissions. |
+| `POST /api/alerts/ALERT_ID/entries/ENTRY_ID/retract` | Undo one submission within its original 24-hour receipt window. |
+
+### Submission fields
+
+Each submission requires `client_ref`, `phase`, `source`, `source_url`, and `observed_at`. Phases are `open`, `update`, and `resolved`. `source` is `caltrans`, `nws`, or `sce`; `source_url` is an absolute HTTP(S) URL without embedded credentials. Every timestamp requires an explicit timezone. Requests must be UTF-8 JSON and fit within 1 MiB. Plain text is escaped and Markdown details disable raw HTML and unsafe links.
+
+An opening also requires `category`, `kind`, `headline`, and its location/status fields. Omit `alert_id` on openings; updates and resolutions require the returned `alert_id`. Both `category` and `kind` stay fixed for that alert. Other public fields may be corrected. Updates inherit omitted values; explicit `null` clears optional fields. Nested `power` patches preserve omitted members. An update must leave the effective alert valid. Observations older than the latest surviving observation return `409 stale_observation`.
+
+| Category | Kinds | Additional fields |
+| --- | --- | --- |
+| `traffic` | `closure`, `chain-control`, `one-way`, `construction`, `storm`, `hazard` | `routes` and/or a named `area`; chain controls require `chain_level` (`R1`, `R2`, `R3`). |
+| `power` | `outage`, `planned-outage`, `psps` | Required named `area` and `power.stage`; optional `power.customer_count`. |
+
+Supported routes are `SR-18`, `SR-189`, `SR-330`, `SR-138`, and `SR-173`. A notice may list several routes once, or use an `area` such as “San Bernardino Mountains” without enumerating roads. Power alerts use an area rather than road fields.
+
+Power stages are separate from the alert lifecycle: `outage` requires `in-effect`; `planned-outage` supports `scheduled` and `in-effect`; `psps` supports `watch`, `warning`, `scheduled`, and `in-effect`. The server never infers that power is off from the passage of `starts_at`. Customer counts are nonnegative integers, labeled “potentially affected” until the stage is `in-effect`. Use optional `source_event_id` for the provider outage or warning ID. It is metadata, not a deduplication key.
+
+Shared optional fields are Markdown `detail`, `starts_at`, `expected_end`, and `source_event_id`. For power, `expected_end` is the estimated restoration or end of the notice. It must not precede `starts_at`. See [traffic](examples/traffic-alert.json), [planned power](examples/power-alert.json), and [PSPS](examples/psps-alert.json) examples. The examples are illustrative; replace them with verified observations and fresh timestamps before submitting.
+
+Success is `200` with `ok`, `request_id`, `alert_id`, `entry_id`, `client_ref`, submission `status`, effective `state`, **`expires_at`**, the submitted `entry`, and `alert` containing the effective fields and full `history`. Submission statuses are `published` and `duplicate`; lookup uses `found`. Preview replies also have `dry_run: true`, `committed: false`, and `checked_at`. Preview UUIDs are provisional; persist IDs from the committed response or lookup.
+
+### Expiry and required confirmations
+
+Lifecycle states are `open`, `resolved`, `expired-unconfirmed`, and `retracted`. Upcoming timing and power stages are independent. `expires_at` is returned by submissions, lookups, lists, retractions, and previews:
+
+- With `expected_end`: `expires_at = expected_end + 24 elapsed hours`.
+- Without `expected_end`: `expires_at = latest surviving observed_at + 24 elapsed hours`, even for an upcoming notice.
+- Resolved or retracted: `expires_at = null`.
+
+At the exact deadline, an unconfirmed alert leaves the banner but stays in history as `expired-unconfirmed`. **The caller must schedule confirmation before the returned `expires_at`**, including when nothing has changed. A strictly change-only watcher is insufficient for open-ended conditions. Confirm an unchanged condition by submitting `phase: "update"` with the existing `alert_id`, a new persisted `client_ref`, and fresh `observed_at`:
+
+```json
+{
+  "client_ref": "power-confirmation-2026-10-22-01",
+  "phase": "update",
+  "alert_id": "REPLACE_WITH_COMMITTED_ALERT_ID",
+  "source": "sce",
+  "source_url": "https://www.sce.com/outages-safety/outage-center/check-outage-status",
+  "observed_at": "2026-10-22T09:45:00-07:00"
+}
+```
+
+A fresh update may reactivate an expired alert on the same identity. If the previous `expected_end` is obsolete, extend it from a verified source or clear it with `"expected_end": null`; a fresh observation alone does not override an inherited end. Always schedule the next check from the newly returned `expires_at`, with enough lead time for retries. Keep `observed_at` as the time of actual verification rather than the time of a later retry.
+
+Resolve only after a confirming observation. Submit the same required fields with a new `client_ref`, existing `alert_id`, `phase: "resolved"`, and optional `detail` such as “Provider confirms power restored” or “Caltrans no longer reports the restriction.” A resolved alert requires a new opening for a later occurrence; it cannot be reopened by update. A new power stage is an ordinary update, for example `"power": { "stage": "in-effect", "customer_count": 125 }` when a scheduled interruption actually begins.
+
+### Retries, reconciliation, and corrections
+
+Persist one exact, case-sensitive `client_ref` per intended submission before sending it; reuse the unchanged payload after timeouts. References are nonblank strings of at most 128 Unicode characters without control characters. References are unique across traffic and power submissions for the original 30 Los Angeles receipt dates, including the receipt date. Alert references have their own namespace, separate from digest references. Appending updates or retracting entries does not extend an older reference’s window. An identical retry returns the original `entry_id` without writes; different content using a retained reference returns `409 client_ref_conflict`, including in dry-run. Object key order does not affect retry identity. Different intended conditions may share a source URL; URLs are never used to merge alerts.
+
+`GET /api/alerts?days=30` supports `days=1..30` and defaults to 30. It includes every current or upcoming alert regardless of its opening date, plus conditions with server-received activity or retractions in the selected LA receipt-date window. Each result includes the entire history, original entry/client references, and retraction timestamps. `published_at` identifies the last committed alert operation; `as_of` fixes the time used to derive expiry. Follow `next_cursor` until null, preserving `days` or omitting it. Signed cursors pin both snapshot and `as_of`, so intervening publication, retraction, or expiry cannot skip or change later pages. Start a new read to obtain newer state. Compact `fields=index` is not supported. Reference lookup accepts one `client_ref` without `days`, `cursor`, or `fields`.
+
+Retraction uses the exact token that published the target entry and must first commit less than 24 elapsed hours after that entry’s server receipt. Token rotation loses self-retraction access to older-token entries. Retracting an update or resolution replays surviving entries and can reopen or expire the condition; retracting an opening removes the whole alert. History is preserved. If later field-clearing updates depend on the target change, correct their effective fields before retraction (`409 retraction_dependency_conflict`). Repeated authorized retractions return `already_retracted`, including after the initial deadline. Retraction has no `dry_run`; inspect the read/lookup history first. After the deadline, an operator must repair the immutable alert revision and atomically publish a replacement snapshot rather than editing story sources or running a story rebuild.
+
+Alert revisions and snapshots are independent of story and calendar storage. Only replacement of `alerts/current.json` commits an operation; orphan artifacts do not create receipts or public conditions. An uncertain write response may have committed: look up `client_ref` or retry unchanged. Reads and public history never expose publishing-token fingerprints. Existing Worker logs include sanitized alert operation and banner-read failures.
+
 ## Set up Cloudflare
 
 ### 1. Install and sign in
