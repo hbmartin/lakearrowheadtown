@@ -228,6 +228,16 @@ node scripts/smoke-preview.mjs http://localhost:8787
 
 Tests exercise the Workers runtime, R2, Durable Object alarms/eviction, and local tooling. Build commands above are deployment dry runs. The local smoke check intentionally appends data and queues a local rebuild. It cannot verify Cloudflare edge caching or compression.
 
+### Coverage and Codecov
+
+Run `npm run test:coverage` to measure Worker application code under `src/` with Vitest's V8 provider. This command also runs the Node tooling tests without collecting their coverage. Regular `npm test` runs keep coverage disabled.
+
+Coverage output is ignored by Git. Open `coverage/index.html` for the HTML report; `coverage/lcov.info` is the report uploaded to Codecov. The terminal also shows a coverage summary. No minimum coverage thresholds are configured.
+
+The GitHub Actions **Coverage** workflow runs type checking and both test suites on pull requests, pushes to `main`, and manual dispatch. After successful checks, it uploads the LCOV report using `codecov/codecov-action@v5`. Test failures fail the workflow; Codecov upload failures are non-blocking. Fork pull requests run the checks but skip the upload.
+
+To enable uploads, sign in to [Codecov](https://app.codecov.io/gh/hbmartin/lakearrowheadtown), activate `hbmartin/lakearrowheadtown`, and copy its repository upload token. Add the token in GitHub under **Settings > Secrets and variables > Actions > New repository secret**, named `CODECOV_TOKEN`. After the first successful workflow run, confirm the report appears on the matching commit in Codecov. Production deployment continues through the existing Cloudflare Workers Builds integration.
+
 ## Credentials and rotation
 
 All publishing and maintenance operations require `Authorization: Bearer <API_SECRET>`. Scheme names are case-insensitive; the token is exact. Public page and image retrieval require no credentials.

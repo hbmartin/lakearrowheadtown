@@ -11,5 +11,15 @@ export default defineConfig({
       },
     },
   })],
-  test: { fileParallelism: false, include: ['test/**/*.test.ts'] },
+  test: {
+    fileParallelism: false,
+    include: ['test/**/*.test.ts'],
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.ts'],
+      exclude: ['src/**/*.d.ts'],
+      reporter: ['text-summary', 'html', 'lcovonly'],
+      reportsDirectory: './coverage',
+    },
+  },
 });

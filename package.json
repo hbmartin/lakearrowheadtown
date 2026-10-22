@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler dev --env preview",
     "test": "vitest run && npm run test:scripts",
+    "test:coverage": "vitest run --coverage && npm run test:scripts",
     "typecheck": "tsc --noEmit",
     "artwork": "node scripts/generate-artwork.mjs",
     "build": "wrangler deploy --env='' --dry-run --outdir dist",
@@ -31,6 +32,7 @@
     "@resvg/resvg-js": "^2.6.2",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^4.1.11",
     "esbuild": "0.28.2",
     "saxes": "^6.0.0",
     "typescript": "^5.9.3",
