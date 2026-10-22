@@ -523,3 +523,14 @@ it('finishes a successful rebuild without reading the index again after commit',
   });
   expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'completed' });
 });
+
+it.each(['damaged', {}, { version: 1, migration: { complete: true, processed: -1 } }])('fails closed on a damaged finalization checkpoint %j', async checkpoint => {
+  await seed(); const job = await publisher().enqueueRebuild(origin);
+  const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`rebuild-finalization:${job.id}`, checkpoint);
+    await expect(instance.alarm()).rejects.toMatchObject({ code: 'rebuild_checkpoint_damaged', retryable: false });
+    expect(await state.storage.get(`job:${job.id}`)).toMatchObject({ status: 'queued' });
+  });
+  expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(before);
+});

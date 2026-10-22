@@ -372,14 +372,18 @@ describe('actionable diagnostics', () => {
         if (++calls === 2) throw new Error('private finalize failure');
         return original(callback);
       });
-      try { await instance.alarm(); }
+      try { await expect(instance.alarm()).rejects.toMatchObject({ kind: 'storage' }); }
       finally { spy.mockRestore(); }
       return state.storage.get<RebuildJob>(`job:${result.job.id}`);
     });
-    expect(failed).toMatchObject({ status: 'failed', failed_stage: 'rebuild_finalize', error_code: 'storage_error' });
-    const event = errorEvents.map(args => args[0] as any).find(event => event.event === 'rebuild_failed');
+    expect(failed).toMatchObject({ status: 'running' });
+    const event = errorEvents.map(args => args[0] as any).find(event => event.event === 'rebuild_finalization_pending');
     expect(event).toMatchObject({ job_id: result.job.id, request_id: result.request_id, stage: 'rebuild_finalize', publication_status: 'committed' });
     expect(await (await request('/')).text()).toContain('Original headline');
+    const committed = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
+    await inPublisher(publisher, async instance => instance.alarm());
+    expect(await publisher.jobStatus(result.job.id)).toMatchObject({ status: 'completed' });
+    expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(committed);
   });
   it('reports multiple field issues and rejects the entire batch before writes', async () => {
     const digest = input();

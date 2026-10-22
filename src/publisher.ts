@@ -12,6 +12,7 @@ import { validateRepair, type RepairReply } from './publication-repair';
 import { RepairCoordinator, restartRebuild, newRebuild } from './repair-coordinator';
 import { composeHomepageConditions } from './homepage-conditions';
 import { REBUILD_MARKER } from './index-metadata';
+import { record } from './primitives';
 import { validateWeather, WEATHER_KEY, WEATHER_URL } from './weather';
 import { readLimited } from './validation';
 import type { AppendReply, BatchReply, Digest, Env, Migration, OperationContext, PublishFailure, PublishReply, RebuildJob, RetractReply, StoryUpdate } from './types';
@@ -456,121 +457,125 @@ export class DigestPublisher extends DurableObject<Env> {
     // after the platform has already consumed its scheduled alarm.
     this.alarmDeliveries++;
     try {
-    const bootstrapContext: OperationContext = { request_id: crypto.randomUUID(), worker_version: this.env.CF_VERSION_METADATA?.id ?? 'local', environment: this.env.ENVIRONMENT ?? 'local', operation: 'rebuild' };
-    return await this.serialize(async () => {
-      const bootstrap = new OperationTrace(bootstrapContext);
-      try { await this.repairCoordinator().recover(bootstrap, true); }
-      catch (error) { if (['repair_pending', 'repair_stalled'].includes(asHttpError(error).code)) return; throw error; }
-      let ids: string[];
-      let job: RebuildJob | null | undefined;
-      try {
-        const head = await this.rebuildHead(bootstrap, bootstrapContext);
-        ({ ids, job } = head);
-        if (job) bootstrapContext.job_id = job.id;
-        if (head.skipped) await bootstrap.run('rebuild_queue_repair', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
-          await storage.put('jobs', ids);
-        })));
-      } catch (error) {
-        emit('rebuild_alarm_failed', bootstrapContext, { stage: bootstrap.failed_stage, error_code: asHttpError(error).code, ...safeError(error) }, 'error');
-        // Leave recovery to bounded platform redelivery, then manual resume.
-        throw error;
-      }
-      if (!job || job.status === 'failed' || job.manual_resume || job.scheduling === 'manual') return;
-      if (job.next_retry_at && Date.parse(job.next_retry_at) > Date.now()) {
-        await boundary('storage', () => this.ctx.storage.setAlarm(Date.parse(job!.next_retry_at!)));
-        return;
-      }
-      const context: OperationContext = { request_id: job.context?.request_id ?? job.id, ...job.context, worker_version: this.env.CF_VERSION_METADATA?.id ?? 'local', environment: this.env.ENVIRONMENT ?? 'local', operation: 'rebuild', job_id: job.id };
-      const trace = new OperationTrace(context);
-      // Receipt reads/finalization fail through platform redelivery, never the
-      // pre-commit failure path. The marker survives later index replacements.
-      const finalization = await trace.run('rebuild_finalization_read', () => boundary('storage', () => this.ctx.storage.get<{ migration?: Migration }>(`rebuild-finalization:${job!.id}`)));
-      if (finalization) {
-        const index = await trace.run('rebuild_receipt_read', () => boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')));
-        if (index?.customMetadata?.[REBUILD_MARKER] === job.id) {
-          trace.publication_status = 'committed';
-          await this.finalizeRebuild(job, ids, finalization.migration, undefined, trace); return;
-        }
-      }
-      try {
-        delete job.next_retry_at;
-        job.status = 'running';
-        job.started_at ??= new Date().toISOString();
-        await trace.run('rebuild_start', () => boundary('storage', () => this.ctx.storage.put(`job:${job.id}`, job)));
-        let migrationBefore = initialMigration();
-        const migration = await trace.run('migration', async () => {
-          migrationBefore = await boundary('storage', () => this.ctx.storage.get<Migration>('migration')) ?? initialMigration();
-          return migrateBatch(this.env.SITE_BUCKET, migrationBefore);
-        });
-        // Capture any legacy bootstrap selection before confirming migration
-        // completion; later operations must not discover raw sources again.
-        let bootstrap = false;
-        const baseline = migration.complete ? await trace.run('publication_loading', async () => {
-          const snapshot = await committedSnapshot(this.env.SITE_BUCKET);
-          bootstrap = !snapshot.index?.customMetadata?.manifest;
-          return { snapshot, publication: await currentPublication(this.env.SITE_BUCKET, migrationBefore.complete ? async () => [] : undefined, snapshot, migrationBefore.complete, trace) };
-        }) : undefined;
-        job.processed = migration.processed;
-        job.phase = migration.complete ? 'render' : 'migration';
-        await trace.run('rebuild_checkpoint', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
-          // Without a committed manifest a failed initial render must be able
-          // to repeat discovery. Replaying the final import batch is idempotent.
-          await storage.put('migration', bootstrap ? migrationBefore : migration);
-          await storage.put(`job:${job.id}`, job);
-          if (!migration.complete) await storage.setAlarm(Date.now() + 1000);
-        })));
-        if (!migration.complete) return;
-        const checkpoint = await trace.run('rebuild_archive_state', () => boundary('storage', () => this.ctx.storage.get<string>(`rebuild:${job.id}`)));
-        const rebuilt = await rebuildHomepage(this.env.SITE_BUCKET, job.origin, trace, migration.complete, baseline, { jobId: job.id, checkpoint,
-          beforeCommit: () => trace.run('rebuild_finalization_checkpoint', () => boundary('storage', () => this.ctx.storage.put(`rebuild-finalization:${job!.id}`, { ...(bootstrap ? { migration } : {}) }))) });
-        if (rebuilt.progress) job.archive_progress = rebuilt.progress;
-        switch (rebuilt.kind) {
-          case 'pending':
-          case 'reconcile':
-            await trace.run('rebuild_archive_progress', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
-              if (rebuilt.kind === 'pending') await storage.put(`rebuild:${job.id}`, rebuilt.checkpoint);
-              const delay = rebuilt.kind === 'reconcile' ? Math.min(30, 2 ** Math.min(job.conflict_count ?? 0, 5)) : 1;
-              if (rebuilt.kind === 'reconcile') {
-                job.conflict_count = (job.conflict_count ?? 0) + 1;
-                job.next_retry_at = new Date(Date.now() + delay * 1000).toISOString();
-              }
-              await storage.put(`job:${job.id}`, job);
-              await storage.setAlarm(Date.now() + delay * 1000);
-            })));
-            return;
-          case 'committed': break;
-          default: {
-            const unexpected: never = rebuilt;
-            throw new Error(`Unexpected rebuild result kind: ${String((unexpected as { kind?: unknown })?.kind)}`);
-          }
-        }
-        await this.finalizeRebuild(job, ids, bootstrap ? migration : undefined, rebuilt.conditionsAvailable, trace);
-      } catch (error) {
-        if (trace.publication_status === 'committed' || trace.publication_status === 'unknown') {
-          emit('rebuild_finalization_pending', context, { stage: trace.failed_stage, publication_status: trace.publication_status, ...safeError(error) }, 'error');
+      const bootstrapContext: OperationContext = { request_id: crypto.randomUUID(), worker_version: this.env.CF_VERSION_METADATA?.id ?? 'local', environment: this.env.ENVIRONMENT ?? 'local', operation: 'rebuild' };
+      return await this.serialize(async () => {
+        const bootstrap = new OperationTrace(bootstrapContext);
+        try { await this.repairCoordinator().recover(bootstrap, true); }
+        catch (error) { if (['repair_pending', 'repair_stalled'].includes(asHttpError(error).code)) return; throw error; }
+        let ids: string[];
+        let job: RebuildJob | null | undefined;
+        try {
+          const head = await this.rebuildHead(bootstrap, bootstrapContext);
+          ({ ids, job } = head);
+          if (job) bootstrapContext.job_id = job.id;
+          if (head.skipped) await bootstrap.run('rebuild_queue_repair', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
+            await storage.put('jobs', ids);
+          })));
+        } catch (error) {
+          emit('rebuild_alarm_failed', bootstrapContext, { stage: bootstrap.failed_stage, error_code: asHttpError(error).code, ...safeError(error) }, 'error');
+          // Leave recovery to bounded platform redelivery, then manual resume.
           throw error;
         }
-        const failedStage = trace.failed_stage ?? trace.stage ?? 'rebuild_processing';
-        const failure = asHttpError(error);
-        emit('rebuild_failed', context, { stage: failedStage, error_code: failure.code, publication_status: trace.publication_status, ...safeError(error) }, 'error');
-        job.status = 'failed';
-        job.finished_at = new Date().toISOString();
-        job.error = 'Rebuild failed; inspect Worker logs, repair the cause, then resume this job';
-        job.error_code = failure.code;
-        job.failed_stage = failedStage;
-        try {
-          await trace.run('rebuild_failure_record', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
-            await storage.put(`job:${job.id}`, job);
-            await storage.deleteAlarm();
-          })));
-        } catch (recordError) {
-          emit('rebuild_failure_record_failed', context, { stage: 'rebuild_failure_record', error_code: asHttpError(recordError).code,
-            original_failed_stage: failedStage, original_error_code: failure.code, publication_status: trace.publication_status, ...safeError(recordError) }, 'error');
-          throw recordError;
+        if (!job || job.status === 'failed' || job.manual_resume || job.scheduling === 'manual') return;
+        if (job.next_retry_at && Date.parse(job.next_retry_at) > Date.now()) {
+          await boundary('storage', () => this.ctx.storage.setAlarm(Date.parse(job!.next_retry_at!)));
+          return;
         }
-        // Handled failures stop here. Platform redelivery sees the persisted failed state.
-      }
-    }, bootstrapContext);
+        const context: OperationContext = { request_id: job.context?.request_id ?? job.id, ...job.context, worker_version: this.env.CF_VERSION_METADATA?.id ?? 'local', environment: this.env.ENVIRONMENT ?? 'local', operation: 'rebuild', job_id: job.id };
+        const trace = new OperationTrace(context);
+        // Receipt reads/finalization fail through platform redelivery, never the
+        // pre-commit failure path. The marker survives later index replacements.
+        const finalization = await trace.run('rebuild_finalization_read', () => boundary('storage', () => this.ctx.storage.get<{ version: 1; migration?: Migration }>(`rebuild-finalization:${job!.id}`)));
+        if (finalization !== undefined) {
+          if (!record(finalization) || finalization.version !== 1 || finalization.migration !== undefined && (!record(finalization.migration)
+            || finalization.migration.complete !== true || !Number.isSafeInteger(finalization.migration.processed) || finalization.migration.processed < 0)) {
+            throw new HttpError(503, 'Rebuild finalization checkpoint is damaged. Restore the checkpoint from a verified backup before resuming.', {}, { code: 'rebuild_checkpoint_damaged' });
+          }
+          const index = await trace.run('rebuild_receipt_read', () => boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')));
+          if (index?.customMetadata?.[REBUILD_MARKER] === job.id) {
+            trace.publication_status = 'committed';
+            await this.finalizeRebuild(job, ids, finalization.migration, undefined, trace); return;
+          }
+        }
+        try {
+          delete job.next_retry_at;
+          job.status = 'running';
+          job.started_at ??= new Date().toISOString();
+          await trace.run('rebuild_start', () => boundary('storage', () => this.ctx.storage.put(`job:${job.id}`, job)));
+          let migrationBefore = initialMigration();
+          const migration = await trace.run('migration', async () => {
+            migrationBefore = await boundary('storage', () => this.ctx.storage.get<Migration>('migration')) ?? initialMigration();
+            return migrateBatch(this.env.SITE_BUCKET, migrationBefore);
+          });
+          // Capture any legacy bootstrap selection before confirming migration
+          // completion; later operations must not discover raw sources again.
+          let bootstrap = false;
+          const baseline = migration.complete ? await trace.run('publication_loading', async () => {
+            const snapshot = await committedSnapshot(this.env.SITE_BUCKET);
+            bootstrap = !snapshot.index?.customMetadata?.manifest;
+            return { snapshot, publication: await currentPublication(this.env.SITE_BUCKET, migrationBefore.complete ? async () => [] : undefined, snapshot, migrationBefore.complete, trace) };
+          }) : undefined;
+          job.processed = migration.processed;
+          job.phase = migration.complete ? 'render' : 'migration';
+          await trace.run('rebuild_checkpoint', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
+            // Without a committed manifest a failed initial render must be able
+            // to repeat discovery. Replaying the final import batch is idempotent.
+            await storage.put('migration', bootstrap ? migrationBefore : migration);
+            await storage.put(`job:${job.id}`, job);
+            if (!migration.complete) await storage.setAlarm(Date.now() + 1000);
+          })));
+          if (!migration.complete) return;
+          const checkpoint = await trace.run('rebuild_archive_state', () => boundary('storage', () => this.ctx.storage.get<string>(`rebuild:${job.id}`)));
+          const rebuilt = await rebuildHomepage(this.env.SITE_BUCKET, job.origin, trace, migration.complete, baseline, { jobId: job.id, checkpoint,
+            beforeCommit: () => trace.run('rebuild_finalization_checkpoint', () => boundary('storage', () => this.ctx.storage.put(`rebuild-finalization:${job!.id}`, { version: 1, ...(bootstrap ? { migration } : {}) }))) });
+          if (rebuilt.progress) job.archive_progress = rebuilt.progress;
+          switch (rebuilt.kind) {
+            case 'pending':
+            case 'reconcile':
+              await trace.run('rebuild_archive_progress', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
+                if (rebuilt.kind === 'pending') await storage.put(`rebuild:${job.id}`, rebuilt.checkpoint);
+                const delay = rebuilt.kind === 'reconcile' ? Math.min(30, 2 ** Math.min(job.conflict_count ?? 0, 5)) : 1;
+                if (rebuilt.kind === 'reconcile') {
+                  job.conflict_count = (job.conflict_count ?? 0) + 1;
+                  job.next_retry_at = new Date(Date.now() + delay * 1000).toISOString();
+                }
+                await storage.put(`job:${job.id}`, job);
+                await storage.setAlarm(Date.now() + delay * 1000);
+              })));
+              return;
+            case 'committed': break;
+            default: {
+              const unexpected: never = rebuilt;
+              throw new Error(`Unexpected rebuild result kind: ${String((unexpected as { kind?: unknown })?.kind)}`);
+            }
+          }
+          await this.finalizeRebuild(job, ids, bootstrap ? migration : undefined, rebuilt.conditionsAvailable, trace);
+        } catch (error) {
+          if (trace.publication_status === 'committed' || trace.publication_status === 'unknown') {
+            emit('rebuild_finalization_pending', context, { stage: trace.failed_stage, publication_status: trace.publication_status, ...safeError(error) }, 'error');
+            throw error;
+          }
+          const failedStage = trace.failed_stage ?? trace.stage ?? 'rebuild_processing';
+          const failure = asHttpError(error);
+          emit('rebuild_failed', context, { stage: failedStage, error_code: failure.code, publication_status: trace.publication_status, ...safeError(error) }, 'error');
+          job.status = 'failed';
+          job.finished_at = new Date().toISOString();
+          job.error = 'Rebuild failed; inspect Worker logs, repair the cause, then resume this job';
+          job.error_code = failure.code;
+          job.failed_stage = failedStage;
+          try {
+            await trace.run('rebuild_failure_record', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
+              await storage.put(`job:${job.id}`, job);
+              await storage.deleteAlarm();
+            })));
+          } catch (recordError) {
+            emit('rebuild_failure_record_failed', context, { stage: 'rebuild_failure_record', error_code: asHttpError(recordError).code,
+              original_failed_stage: failedStage, original_error_code: failure.code, publication_status: trace.publication_status, ...safeError(recordError) }, 'error');
+            throw recordError;
+          }
+          // Handled failures stop here. Platform redelivery sees the persisted failed state.
+        }
+      }, bootstrapContext);
     } finally { this.alarmDeliveries--; }
   }
 }
