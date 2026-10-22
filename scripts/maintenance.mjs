@@ -60,6 +60,20 @@ export async function maintenance(operation, environment, id, options = {}) {
   if (typeof result?.job?.id !== 'string' || !/^[a-f0-9-]{36}$/.test(result.job.id) || !['queued', 'running', 'completed', 'failed'].includes(result.job.status)) throw new Error(`Invalid maintenance response (${response.status}): expected a rebuild job`);
   return result.job;
 }
+export async function waitForRebuild(job, environment, options = {}) {
+  const deadline = performance.now() + (options.timeoutMs ?? 1800000);
+  let attempts = 0;
+  while (!['completed', 'failed'].includes(job.status) && !job.blocked_by) {
+    if (performance.now() >= deadline) throw new Error(`Rebuild ${job.id} exceeded the wait deadline. Inspect its status; no resume was issued.`);
+    const next = Date.parse(job.next_retry_at) - Date.now();
+    await (options.sleep ?? sleep)(Math.min(Math.max(1000, next > 0 ? next : 2 ** Math.min(attempts, 5) * 1000), 30000, Math.max(1, deadline - performance.now())));
+    try { job = await maintenance('status', environment, job.id, options); attempts = 0; options.onProgress?.(job); }
+    catch (error) { if (!error.transport && !error.retryable) throw error; attempts++; }
+  }
+  if (job.status !== 'completed') throw new Error(`Rebuild ${job.id} failed or is blocked. Inspect its status before deployment acceptance.`);
+  return job;
+}
+
 export async function repairAndFollow(environment, file, options = {}) {
   const payload = options.payload ?? JSON.parse(await readFile(file, 'utf8'));
   const timeoutMs = options.timeoutMs ?? 1800000;

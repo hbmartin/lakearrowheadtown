@@ -456,7 +456,7 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
     if (drafts.length && !dryRun) {
       if (beforeCommit) await trace.run('alert_homepage_intent', beforeCommit);
       const artifacts = drafts.flatMap(draft => [{ key: confirmationKey(draft.node), body: JSON.stringify(draft.node), stage: 'alert_confirmation_write' }, { key: draft.key, body: JSON.stringify(draft.root), stage: 'alert_revision_write' }]);
-      for await (const { result } of settledInOrder(artifacts, artifact => trace.run(artifact.stage, () => boundary('storage', () => bucket.put(artifact.key, artifact.body, jsonOptions)), { bytes_written: new TextEncoder().encode(artifact.body).length }))) if (result.status === 'rejected') throw result.reason;
+      for await (const { result } of settledInOrder(artifacts, async artifact => { const child = new OperationTrace(context); try { return await child.run(artifact.stage, () => boundary('storage', () => bucket.put(artifact.key, artifact.body, jsonOptions)), { bytes_written: new TextEncoder().encode(artifact.body).length }); } catch (error) { trace.failed_stage ??= child.failed_stage; throw error; } })) if (result.status === 'rejected') throw result.reason;
       const revised = new Map(drafts.map(draft => [draft.ref.alert_id, draft.ref]));
       await commitManifest(bucket, { version: 1, published_at: now.toISOString(), alerts: manifest.alerts.map(ref => revised.get(ref.alert_id) ?? ref), receipts }, trace);
     }

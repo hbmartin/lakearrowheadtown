@@ -1,6 +1,6 @@
 import type { PublicationStatus, Suggestion } from './types';
 import { committedFailureAdvice } from './errors';
-import { publicationOperation } from './operations';
+import { publicationOperation, alertMutation } from './operations';
 
 export const reviewStory: Suggestion = { action: 'review_existing_story', message: 'Read the 30-day history and inspect the returned post_id and item_index before choosing another source.', method: 'GET', path: '/api/posts?days=30' };
 export const duplicateMessage = 'This exact source URL already belongs to a retained story. No content was changed.';
@@ -9,7 +9,7 @@ export function errorSuggestion(code: string, retryable: boolean, dryRun = false
   if (operation === 'changes_read' && ['invalid_cursor', 'resync_required'].includes(code)) return { action: 'bootstrap_changes', message: 'Bootstrap a fresh reconciliation read without since or cursor, apply every page, then save the final sync_cursor.', method: 'GET', path: '/api/changes' };
   if (retryable && ['alerts_read', 'events_read', 'changes_read', 'posts_read'].includes(operation ?? '')) return { action: 'retry_read', message: 'Retry the unchanged read. No publication was attempted.' };
   if (dryRun && retryable) return { action: 'retry_preview', message: 'Retry the unchanged preview. No publication was attempted.' };
-  if (['alert', 'alert_retract', 'alert_confirm', 'alerts_read'].includes(operation ?? '')) {
+  if ((alertMutation(operation) || operation === 'alerts_read')) {
     if (code === 'client_ref_conflict') return { action: 'look_up_alert', message: 'Look up the exact client_ref before choosing a new reference for an intentional new submission.', method: 'GET', path: '/api/alerts' };
     if (['invalid_cursor', 'invalid_days', 'invalid_fields', 'invalid_history'].includes(code)) return { action: 'restart_read', message: 'Start a fresh alert read with days between 1 and 30, choose fields=full or fields=index, and follow next_cursor without changing its representation or history mode.', method: 'GET', path: '/api/alerts?days=30' };
     if (['alert_not_found', 'alert_entry_not_found', 'alert_reference_not_found', 'stale_observation', 'alert_closed', 'alert_identity_conflict', 'retraction_dependency_conflict'].includes(code)) return { action: 'reconcile_alert', message: 'Read alert history before sending a fresh observation, correcting dependent fields, or opening a new occurrence.', method: 'GET', path: '/api/alerts?days=30' };

@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkEnvironment, readPublishingCredential, validateCredential } from './credentials.mjs';
-import { maintenance, maintenanceTarget } from './maintenance.mjs';
+import { maintenance, maintenanceTarget, waitForRebuild } from './maintenance.mjs';
 
 export async function deploy(environment, options = {}) {
   checkEnvironment(environment);
@@ -18,8 +18,10 @@ export async function deploy(environment, options = {}) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const environment = process.argv[2];
-    const job = await deploy(environment);
-    console.log(`Deployment complete; rebuild ${job.id} durably queued (not yet completed).`);
+    const queued = await deploy(environment);
+    console.log(`Deployment complete; waiting for rebuild ${queued.id}.`);
+    const job = await waitForRebuild(queued, environment, { onProgress: job => console.log(`Rebuild ${job.id}: ${job.status}, ${job.phase}, ${job.processed} processed`) });
+    console.log(`Deployment complete; rebuild ${job.id} completed.`);
     console.log(`Check: npm run rebuild:status -- ${environment} ${job.id}`);
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

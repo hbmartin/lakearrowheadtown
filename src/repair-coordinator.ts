@@ -39,9 +39,9 @@ const pending = (record: RepairRecord, status = certainty(record)) => new HttpEr
 const damaged = () => new HttpError(503, 'The repair journal is damaged. Restore the active journal and its referenced record from a verified backup before resuming. Do not force-clear an unknown write.', {}, { code: 'repair_journal_damaged', retryable: false });
 function valid(value: unknown): value is RepairRecord {
   if (!object(value) || typeof value.id !== 'string' || typeof value.key !== 'string' || !/^repair-request:[a-f0-9]{64}$/.test(value.key)
-    || !object(value.job) || typeof value.job.id !== 'string' || typeof value.etag !== 'string' || !['pending', 'committed', 'conflict'].includes(String(value.state))
+    || !object(value.job) || typeof value.job.id !== 'string' || !/^[a-f0-9-]{36}$/.test(value.job.id) || value.job.status !== 'queued' || !['migration', 'render'].includes(String(value.job.phase)) || !Number.isSafeInteger(value.job.processed) || typeof value.etag !== 'string' || !['pending', 'committed', 'conflict'].includes(String(value.state))
     || !Number.isSafeInteger(value.attempts) || Number(value.attempts) < 0) return false;
-  try { validateRepair(value.input); return true; } catch { return false; }
+  try { const input = validateRepair(value.input); return value.key === `repair-request:${fingerprint(JSON.stringify([input.expected_version, input.manifest, input.rss, input.archives]))}` && (value.phase === undefined || ['prepared', 'writing', 'activation'].includes(String(value.phase))); } catch { return false; }
 }
 export class RepairCoordinator {
   constructor(private bucket: ContentBucket, private storage: DurableObjectStorage,

@@ -372,14 +372,19 @@ export class DigestPublisher extends DurableObject<Env> {
   }
 
   async jobStatus(id: string, context?: OperationContext): Promise<RebuildJob | null> {
-    const trace = new OperationTrace(this.executingContext(context));
-    return trace.run('rebuild_status_read', async () => {
+    context = this.executingContext(context);
+    if (context) context = { ...context, job_id: id };
+    const trace = new OperationTrace(context);
+    try { return await trace.run('rebuild_status_read', async () => {
       const job = await boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`));
       if (!job) return null;
       const ids = await boundary('storage', () => this.ctx.storage.get<string[]>('jobs')) ?? [];
       const head = await queueHead(ids, id => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`)));
-      return { ...job, ...(job.status === 'queued' && head.job?.status === 'failed' && head.job.id !== id ? { blocked_by: head.job.id } : {}) };
-    });
+      return { ...job, ...(job.status === 'queued' && (head.job?.status === 'failed' || head.job?.manual_resume) && head.job.id !== id ? { blocked_by: head.job.id } : {}) };
+    }); } catch (error) {
+      emit('rebuild_request_failed', context, { stage: trace.failed_stage ?? 'rebuild_status_read', error_code: asHttpError(error).code, ...safeError(error) }, 'error');
+      throw error;
+    }
   }
 
   async resumeRebuild(id: string, context?: OperationContext): Promise<RebuildJob | 'conflict' | null> {

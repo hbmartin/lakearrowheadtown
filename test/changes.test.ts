@@ -171,3 +171,19 @@ it('supports an alert-only homepage and rejects known missing committed manifest
   const response = await request('/api/changes', { headers: auth }); expect(response.status).toBe(200); expect((await response.json<any>()).changes).toEqual([expect.objectContaining({ resource: 'alert', operation: 'upsert' })]);
   await expect(captureChanges(bucket, at, true)).rejects.toMatchObject({ code: 'legacy_recovery_required' });
 });
+
+it('limits nested body streaming, not merely the requests returning headers', async () => {
+  for (let i = 0; i < 4; i++) {
+    const a = await alert(); await confirmAlerts(bucket, [{ client_ref: `stream-check-${i}`, alert_id: a.alert_id, source: 'caltrans', source_url: 'https://example.com/138', observed_at: at.toISOString() }], at);
+    for (let j = 0; j < 4; j++) await submitAlert(bucket, validateAlertInput({ client_ref: `stream-update-${i}-${j}`, alert_id: a.alert_id, phase: 'update', source: 'caltrans', source_url: 'https://example.com/138', observed_at: at.toISOString(), detail: `Details ${j}` }), owner, at, undefined, false, undefined, 'coalesced');
+  }
+  let active = 0; let peak = 0;
+  const store = wrap({ get: async key => {
+    const object = await bucket.get(key); if (!object) return null;
+    return new Proxy(object, { get(target, property) {
+      if (property === 'arrayBuffer') return async () => { active++; peak = Math.max(peak, active); try { await new Promise(resolve => setTimeout(resolve, 3)); return await target.arrayBuffer(); } finally { active--; } };
+      const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+    } });
+  } });
+  expect((await collect('', at, store)).changes).toHaveLength(4); expect(peak).toBeLessThanOrEqual(4); expect(active).toBe(0);
+});
