@@ -49,7 +49,14 @@ export function renderCalendarPage(origin: string, result: EventsResult, images:
         if (document.visibilityState === 'hidden') return;
         const parts = formatter.formatToParts(new Date());
         const part = name => parts.find(value => value.type === name).value;
-        if (part('year') + '-' + part('month') + '-' + part('day') !== date) location.reload();
+        const today = part('year') + '-' + part('month') + '-' + part('day');
+        if (today <= date) return;
+        try {
+          const key = 'lakearrowhead-calendar-refresh'; const marker = date + ':' + today;
+          if (sessionStorage.getItem(key) === marker) return;
+          sessionStorage.setItem(key, marker);
+        } catch { return; }
+        location.reload();
       }
       setInterval(refresh, 60000);
       document.addEventListener('visibilitychange', refresh);

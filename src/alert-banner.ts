@@ -16,6 +16,10 @@ function renderAlert(alert: AlertView): string {
     <div class="alert-details">
       ${alert.detail ? `<div class="markdown">${markdown.render(alert.detail)}</div>` : ''}
       <dl class="alert-facts">
+        <div><dt>Condition</dt><dd>${escapeHtml(alert.kind.replaceAll('-', ' '))}</dd></div>
+        ${alert.upcoming ? '<div><dt>Timing</dt><dd>Upcoming</dd></div>' : ''}
+        ${alert.chain_level ? `<div><dt>Chain controls</dt><dd>${escapeHtml(alert.chain_level)}</dd></div>` : ''}
+        ${alert.power ? `<div><dt>Power stage</dt><dd>${escapeHtml(alert.power.stage.replaceAll('-', ' '))}</dd></div>` : ''}
         <div><dt>Last reported</dt><dd>${time(alert.observed_at)}</dd></div>
         ${alert.expires_at ? `<div><dt>Confirmation expires</dt><dd>${time(alert.expires_at)}</dd></div>` : ''}
         ${alert.starts_at ? `<div><dt>Starts</dt><dd>${time(alert.starts_at)}</dd></div>` : ''}

@@ -1,3 +1,5 @@
+import { fingerprint, canonicalJson } from './primitives';
+import { localDate } from './feed';
 import { archivePath, loadArchiveDay, loadCatalog } from './archives';
 import { committedSnapshot } from './committed';
 import { dateLabel } from './dates';
@@ -8,16 +10,25 @@ import { resourceResponse } from './public-metadata';
 import { RESOURCE_PAGES } from './resources';
 import { HTML_CACHE } from './publishing';
 import { renderCalendarPage } from './calendar';
-import { readEvents } from './events';
+import { readEvents, currentEvents } from './events';
 import { createImageResolver } from './image-metadata';
 import type { ContentBucket } from './types';
+
+const calendars = new WeakMap<ContentBucket, Map<string, Promise<string>>>();
 
 export async function pageResource(request: Request, bucket: ContentBucket, origin: string): Promise<Response | undefined> {
   const path = new URL(request.url).pathname;
   if (path === '/calendar' || path === '/calendar/') {
-    const events = await readEvents(bucket);
-    const images = await createImageResolver(bucket, origin)(events.events);
-    return resourceResponse(request, { body: renderCalendarPage(origin, events, images), type: 'text/html; charset=utf-8', cache: HTML_CACHE });
+    const publication = await currentEvents(bucket); const now = new Date();
+    const key = canonicalJson([fingerprint(canonicalJson(publication)), localDate(now), origin]);
+    let cache = calendars.get(bucket); if (!cache) { cache = new Map(); calendars.set(bucket, cache); }
+    let rendering = cache.get(key);
+    if (!rendering) {
+      rendering = (async () => { const events = await readEvents(bucket, new URLSearchParams(), now, publication); const images = await createImageResolver(bucket, origin)(events.events); return renderCalendarPage(origin, events, images); })();
+      cache.set(key, rendering); if (cache.size > 16) cache.delete(cache.keys().next().value!);
+      const pending = rendering; rendering.catch(() => { if (cache!.get(key) === pending) cache!.delete(key); });
+    }
+    return resourceResponse(request, { body: await rendering, type: 'text/html; charset=utf-8', cache: HTML_CACHE });
   }
   const resource = RESOURCE_PAGES.find(page => page.path === path);
   if (resource) return resourceResponse(request, {
