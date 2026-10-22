@@ -246,7 +246,10 @@ export class RepairCoordinator {
           if (alarm === null && !this.alarmDelivered()) for (const id of ids) {
             const existing = await storage.get<RebuildJob>(`job:${id}`);
             if (!existing || existing.status === 'completed') continue;
-            if (existing.status !== 'failed' && existing.scheduling === undefined) await storage.put(`job:${id}`, { ...existing, manual_resume: true, scheduling: 'manual' });
+            // Preserve genuinely unscheduled work, including automatic jobs
+            // whose platform redeliveries were exhausted. A consumed delivery
+            // waiting in our queue is distinguished by alarmDelivered().
+            if (existing.status !== 'failed' && existing.scheduling !== 'manual') await storage.put(`job:${id}`, { ...existing, manual_resume: true, scheduling: 'manual' });
             break;
           }
           await storage.put(key, saved); await storage.put(ACTIVE, key);

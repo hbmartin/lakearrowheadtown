@@ -360,10 +360,10 @@ it('never attributes a blocking repair commit to a different request', async () 
   const other = await request({ ...input, manifest: `publications/${crypto.randomUUID()}.json` });
   expect(await other.json()).toMatchObject({ code: 'repair_blocked', publication_status: 'not_committed', details: { blocking_repair: { repair_id: expect.any(String) } } });
 });
-it('does not revive an unrelated queued rebuild awaiting manual resume', async () => {
+it.each([undefined, 'automatic'] as const)('does not revive an unrelated unscheduled rebuild with scheduling=%s', async scheduling => {
   const { input } = await seed(); const id = crypto.randomUUID();
   await inside(publisher(), async (_, state) => {
-    await state.storage.put('jobs', [id]); await state.storage.put(`job:${id}`, { id, origin, status: 'running', phase: 'render', processed: 0, created_at: new Date().toISOString() }); await state.storage.deleteAlarm();
+    await state.storage.put('jobs', [id]); await state.storage.put(`job:${id}`, { id, origin, status: 'running', phase: 'render', processed: 0, ...(scheduling ? { scheduling } : {}), created_at: new Date().toISOString() }); await state.storage.deleteAlarm();
   });
   const repaired = await (await request(input)).json<any>(); expect(repaired.ok).toBe(true);
   expect(await publisher().jobStatus(repaired.job.id)).toMatchObject({ status: 'queued', blocked_by: id });
