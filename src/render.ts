@@ -34,7 +34,8 @@ markdown.renderer.rules.image = (tokens, index, options, environment, renderer) 
   }
   token.attrSet('loading', env.counter.value++ === 0 ? 'eager' : 'lazy');
   token.attrSet('decoding', 'async');
-  return defaultImage(tokens, index, options, environment, renderer);
+  const img = defaultImage(tokens, index, options, environment, renderer);
+  return thumbnail ? `<picture><source type="image/webp" srcset="${escapeHtml(thumbnail.webp)}" sizes="${escapeHtml(thumbnail.sizes)}">${img}</picture>` : img;
 };
 const timeFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
 const fullTimeFormat = new Intl.DateTimeFormat('en-US', { timeZone: TIME_ZONE, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });

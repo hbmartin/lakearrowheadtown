@@ -57,7 +57,7 @@ describe('responsive thumbnail geometry', () => {
     const size = { width, height, type: 'image/jpeg' };
     expect(THUMBNAIL_EDGES.map(edge => thumbnailWidth(size, edge))).toEqual(expected);
     const thumbnail = responsiveThumbnail(imageUrl, origin, size)!;
-    expect(thumbnail.src).toBe(origin + path);
+    expect(thumbnail.src).toBe(`${origin}/thumbnails/v2/${hash}.jpg/${Math.max(width, height) < 96 ? 96 : 160}.jpg`);
     expect(thumbnail.sizes).toBe(`(max-width: 600px) ${sizes}`);
     const descriptors = thumbnail.srcset.split(', ').map(candidate => Number(candidate.match(/ (\d+)w$/)![1]));
     expect(descriptors).toEqual([...new Set(expected)]);
@@ -86,16 +86,16 @@ describe('responsive article rendering', () => {
     }] };
     const images = { [imageUrl]: landscape };
     const html = renderPage([post], { origin, images });
-    expect(html).toContain('src="' + origin + path + '"');
+    expect(html).toContain('src="' + origin + `/thumbnails/v2/${hash}.jpg/160.jpg` + '"');
     expect(html).toContain('alt="Photo &amp; caption" width="1920" height="1280"');
-    expect(html.match(/srcset=/g)).toHaveLength(2);
+    expect(html.match(/srcset=/g)).toHaveLength(4);
     expect(html.match(/loading="eager"/g)).toHaveLength(1);
     expect(html.match(/loading="lazy"/g)).toHaveLength(2);
     expect(html).toContain('<img src="https://example.com/remote.jpg" alt="Remote" loading="lazy" decoding="async">');
-    expect(html).toContain('href="https://example.com/story" rel="noopener noreferrer"><img');
+    expect(html).toContain('href="https://example.com/story" rel="noopener noreferrer"><picture>');
     const archive = renderArchivePage(origin, { date: post.date, images, stories: [{ item: post.items[0], itemIndex: 0, timestamp: Date.parse(post.received_at), postId: post.id, date: post.date, activity: post.received_at }] },
       { key: 'archive-days/test.json', image: '/assets/daily/test.png', identities: [] });
-    expect(archive.match(/srcset=/g)).toHaveLength(2);
+    expect(archive.match(/srcset=/g)).toHaveLength(4);
     const rss = renderRss([post], { origin, images });
     expect(rss).toContain(imageUrl);
     expect(rss).not.toContain('/thumbnails/');
@@ -204,4 +204,19 @@ describe('thumbnail serving', () => {
     expect(mock.input).not.toHaveBeenCalled();
     expect((await fetch(path, { method: 'POST' }, mock)).status).toBe(405);
   });
+});
+
+it('serves canonical v2 formats independently of Accept and skips source bodies for HEAD and 304', async () => {
+  await source(); const mock = encoder(); const v2 = `/thumbnails/v2/${hash}.jpg/160.webp`;
+  for (const Accept of ['image/webp;q=0', 'application/arbitrary', 'image/jpeg']) {
+    const response = await fetch(v2, { headers: { Accept } }, mock); expect(response.headers.get('content-type')).toBe('image/webp'); expect(response.headers.get('vary')).toBeNull(); await response.arrayBuffer();
+  }
+  const full = await fetch(v2, {}, mock); const etag = full.headers.get('etag')!; await full.arrayBuffer();
+  const get = vi.fn((key: string) => { if (key.startsWith('images/')) throw new Error('Original body must not load'); return bindings.SITE_BUCKET.get(key); });
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) { if (property === 'get') return get; const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value; } });
+  const count = mock.output.mock.calls.length;
+  expect((await fetch(v2, { method: 'HEAD' }, { ...mock, SITE_BUCKET: store })).status).toBe(200);
+  expect((await fetch(v2, { headers: { 'If-None-Match': etag } }, { ...mock, SITE_BUCKET: store })).status).toBe(304);
+  expect(mock.output).toHaveBeenCalledTimes(count);
+  expect((await fetch(v2.replace('.webp', '.png'), {}, mock)).status).toBe(404);
 });

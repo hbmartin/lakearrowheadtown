@@ -1,3 +1,5 @@
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { readFile, writeFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -7,14 +9,13 @@ import { readPublishingCredential } from './credentials.mjs';
 import { maintenanceTarget } from './maintenance.mjs';
 
 // Writes fixtures only to the allowlisted preview environment, never production.
-const origin = maintenanceTarget('preview', process.argv[2]);
+export async function smokeThumbnails(args = process.argv.slice(2)) {
+const origin = maintenanceTarget('preview', args[0]);
+if (new URL(origin).hostname === 'localhost') throw new Error('Thumbnail acceptance requires the deployed preview Images binding and Workers Cache');
 const secret = readPublishingCredential('preview');
 const auth = { Authorization: `Bearer ${secret}` };
 const directory = await mkdtemp(join(tmpdir(), 'lakearrowhead-thumbnails-'));
-const photoUrl = 'https://lakearrowhead.town/images/afbc50b8eef368050ef72c259299410e5abeaf0687566aa875592db84c42eb0e.jpg';
-const photoResponse = await fetch(photoUrl);
-assert.equal(photoResponse.status, 200);
-const photo = Buffer.from(await photoResponse.arrayBuffer());
+const photo = await readFile(new URL('../test/fixtures/thumbnail-pattern.jpg', import.meta.url));
 assert.deepEqual(imageSize(photo), { width: 1920, height: 1280, type: 'jpg' });
 const fixtures = [
   { name: 'photo', extension: 'jpg', type: 'image/jpeg', bytes: photo },
@@ -30,7 +31,7 @@ function chunks(bytes) {
   }
   return result;
 }
-const thumbnail = (fixture, edge) => `${origin}/thumbnails/v1/${fixture.url.split('/').at(-1)}/${edge}`;
+const thumbnail = (fixture, edge, format = 'webp') => `${origin}/thumbnails/v2/${fixture.url.split('/').at(-1)}/${edge}.${format}`;
 for (const fixture of fixtures) {
   const form = new FormData();
   form.append('file', new File([fixture.bytes], `${fixture.name}.${fixture.extension}`, { type: fixture.type }));
@@ -43,13 +44,13 @@ for (const fixture of fixtures) {
   const modern = await fetch(url, { headers: { Accept: 'image/webp' }, redirect: 'manual' });
   assert.equal(modern.status, 200, `Expected optimized ${fixture.name}, got ${modern.status}`);
   assert.equal(modern.headers.get('content-type'), 'image/webp');
-  assert.match(modern.headers.get('vary') ?? '', /\bAccept\b/i);
+  assert(!modern.headers.get('vary')?.split(',').some(value => value.trim().toLowerCase() === 'accept'));
   const bytes = Buffer.from(await modern.arrayBuffer());
   await writeFile(join(directory, `${fixture.name}.webp`), bytes);
   const encoded = imageSize(bytes);
   const scale = Math.min(1, 480 / Math.max(upload.width, upload.height));
   assert.equal(encoded.width, Math.max(1, Math.floor(upload.width * scale)));
-  const legacy = await fetch(url, { headers: { Accept: 'image/webp;q=0,*/*;q=1' }, redirect: 'manual' });
+  const legacy = await fetch(thumbnail(fixture, 480, fixture.extension), { headers: { Accept: 'image/webp;q=0,*/*;q=1' }, redirect: 'manual' });
   assert.equal(legacy.status, 200);
   assert.equal(legacy.headers.get('content-type'), fixture.type);
   assert.notEqual(legacy.headers.get('etag'), modern.headers.get('etag'));
@@ -94,6 +95,14 @@ const digest = await fetch(`${origin}/api/digests`, { method: 'POST', headers: {
 }) });
 assert.equal(digest.status, 200);
 const homepage = await (await fetch(origin)).text();
-assert(homepage.includes('/thumbnails/v1/'));
+assert(homepage.includes('/thumbnails/v2/'));
+assert(homepage.includes('<picture>'));
+const v1 = await fetch(`${origin}/thumbnails/v1/${fixtures[0].url.split('/').at(-1)}/160`, { headers: { Accept: 'image/webp' } });
+assert.equal(v1.status, 200); await v1.arrayBuffer();
 assert(homepage.includes('sizes="(max-width: 600px) 96px, 160px"'));
 console.log(JSON.stringify({ preview: origin, artifacts: directory, status: 'passed' }));
+
+}
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try { await smokeThumbnails(); } catch (error) { console.error(error.message); process.exitCode = 1; }
+}
