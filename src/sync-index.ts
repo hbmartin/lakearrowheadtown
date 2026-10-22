@@ -24,8 +24,9 @@ export function storyData(post: StoredPost, itemIndex: number, metadata: IndexIt
 export const eventData = (post: EventPost, itemIndex: number) => ({ ...post.items[itemIndex], post_id: post.id, item_index: itemIndex });
 export function storyRows(posts: StoredPost[], refs: PostReference[], indexed?: ReturnType<typeof indexPost>[]): SyncRow[] {
   const byId = new Map(posts.map(post => [post.id, post]));
+  const metadataById = new Map(indexed?.map(item => [item.post_id, item]));
   return refs.flatMap(ref => {
-    const post = byId.get(ref.id)!; const metadata = indexed?.find(item => item.post_id === ref.id) ?? indexPost(post);
+    const post = byId.get(ref.id)!; const metadata = metadataById.get(ref.id) ?? indexPost(post);
     return post.items.map((_item, item_index) => {
       const data = storyData(post, item_index, metadata.items[item_index]);
       return { resource: 'story' as const, identity: { post_id: ref.id, item_index }, revision: fingerprint(canonicalJson(data)), source_key: ref.key, last_received_at: data.last_received_at };

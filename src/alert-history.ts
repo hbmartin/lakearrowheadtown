@@ -37,13 +37,14 @@ export function confirmationEntry(alertId: string, run: ConfirmationRun, node = 
     input: { phase: 'update', alert_id: alertId, client_ref: node.client_ref, source: run.source, source_url: run.source_url, observed_at: node.observed_at },
     ...(coalesced ? { confirmation_run: { run_id, count, first_observed_at, last_observed_at, first_received_at, last_received_at } } : {}) };
 }
-export async function expandHistory(root: HistoryRoot, mode: HistoryMode, read: (key: string) => Promise<unknown>, validate: (value: unknown) => StoredEntry): Promise<StoredEntry[]> {
+export async function expandHistory(root: HistoryRoot, mode: HistoryMode, read: (key: string) => Promise<unknown>, validate: (value: unknown) => StoredEntry, material = new Map<string, StoredEntry>()): Promise<StoredEntry[]> {
   const groups: StoredEntry[][] = [];
   for (let i = 0; i < root.timeline.length; i += 4) {
     const settled = await Promise.allSettled(root.timeline.slice(i, i + 4).map(async item => {
       if (item.type === 'entry') {
-        const entry = validate(await read(item.key));
+        const entry = material.get(item.key) ?? validate(await read(item.key));
         if (entry.entry_id !== item.entry_id || entry.input.alert_id !== root.alert_id || entry.input.phase === 'open') throw new DamagedSource(item.key, root.alert_id, 'invalid_digest');
+        material.set(item.key, entry);
         return [entry];
       }
       if (mode === 'coalesced') return [confirmationEntry(root.alert_id, item, item.latest, true)];
