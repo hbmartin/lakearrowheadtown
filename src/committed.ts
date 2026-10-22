@@ -6,6 +6,7 @@ import type { ContentBucket, Publication } from './types';
 export const archiveUnavailable = () => new HttpError(503, 'News archives are damaged. An operator must repair them before retrying.', {}, { code: 'archive_damaged', retryable: false });
 export const legacyRecoveryRequired = () => new HttpError(503, 'Migration is complete but no committed manifest exists. An operator must restore or explicitly reconstruct the bootstrap manifest before retrying.', {}, { code: 'legacy_recovery_required', retryable: false });
 export const validArchiveKey = (key: unknown): key is string => typeof key === 'string' && /^archive-catalogs\/[a-f0-9]{64}\.json$/.test(key);
+export const validRssKey = (key: unknown): key is string => typeof key === 'string' && /^publications\/[a-f0-9-]{36}\.rss\.xml$/.test(key);
 export const isLegacyId = (id: string) => /^legacy-\d{4}-\d{2}-\d{2}$/.test(id) && isDate(id.slice(7));
 
 function isPublication(value: unknown): value is Publication {

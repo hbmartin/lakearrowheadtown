@@ -135,7 +135,7 @@ it.each([['a', 'b'], ['b', 'a']])('keeps stage and error attribution together wh
   const trace = new OperationTrace(); const written: string[] = [];
   const prepared = prepareWrites(store({ put: key => { written.push(key); return new Promise((_resolve, reject) => { rejects.set(key, reject); }); } }), trace);
   for (const key of ['a', 'b', 'pages/index.html']) await trace.run(key, () => prepared.bucket.put(key, key));
-  const outcome = prepared.commit().then(() => undefined, error => error);
+  const outcome = prepared.commit(null).then(() => undefined, error => error);
   rejects.get(first)!(errors[first as keyof typeof errors]); rejects.get(second)!(errors[second as keyof typeof errors]);
   expect((await outcome).cause).toBe(errors[first as keyof typeof errors]);
   expect(trace.failed_stage).toBe(first); expect(trace.phase).toBeUndefined();

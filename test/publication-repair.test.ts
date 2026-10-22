@@ -126,7 +126,8 @@ it('preserves index bytes and metadata, durably schedules regeneration first, an
     const bucket: ContentBucket = instance.env.SITE_BUCKET; const put = bucket.put.bind(bucket);
     const spy = vi.spyOn(bucket, 'put').mockImplementation(async (key: string, bytes: any, options?: R2PutOptions) => {
       if (key === 'pages/index.html') {
-        expect((await state.storage.get<string[]>('jobs'))?.length).toBeGreaterThan(0);
+        expect(await state.storage.get('publication_repair_pending')).toEqual(expect.any(String));
+        expect(await state.storage.get('jobs')).toBeUndefined();
         expect(await state.storage.getAlarm()).not.toBeNull();
       }
       return put(key, bytes, options);
@@ -136,7 +137,7 @@ it('preserves index bytes and metadata, durably schedules regeneration first, an
   });
   const repaired = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
   expect(await repaired.text()).toBe(body);
-  expect(repaired.customMetadata).toEqual({ ...customMetadata, manifest: input.manifest });
+  expect(repaired.customMetadata).toEqual({ ...customMetadata, manifest: input.manifest, lakearrowhead_repair_id: expect.any(String) });
   expect(repaired.httpMetadata?.contentLanguage).toBe('en-US');
   const response = await request('POST', input);
   expect(response.status).toBe(200);
@@ -208,7 +209,7 @@ it.each(['manifest', 'source', 'history', 'catalogue'] as const)('validates the 
   if (damaged === 'history') await bindings.SITE_BUCKET.delete(publication.history_index!);
   if (damaged === 'catalogue') await bindings.SITE_BUCKET.delete(input.archives!);
   const response = await request('POST', input);
-  expect(response.status).toBe(damaged === 'catalogue' ? 503 : 500);
+  expect(response.status).toBe(400);
   expect(await response.json()).toMatchObject({ retryable: false, publication_status: 'not_committed' });
   expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(input.expected_version);
   await inside(publisher(), async (_instance, state) => expect(await state.storage.get('jobs')).toBeUndefined());
@@ -249,16 +250,17 @@ it('serializes pointer repair behind a rebuild commit and rejects the now-stale 
   });
 });
 
-it('returns a repair conflict with retry timing and leaves a durable rebuild queued for the current snapshot', async () => {
+it('returns a review-required conflict without activating regeneration', async () => {
   await seed(); const input = await repairInput();
   await inside(publisher(), async (instance, state) => {
     const bucket: ContentBucket = instance.env.SITE_BUCKET; const put = bucket.put.bind(bucket);
     const spy = vi.spyOn(bucket, 'put').mockImplementation((key, body, options) => key === 'pages/index.html' ? Promise.resolve(null) : put(key, body, options));
     try {
       const response = await request('POST', input, true, { PUBLISHER: { getByName: () => instance } as unknown as Env['PUBLISHER'] });
-      expect(response.status).toBe(503); expect(response.headers.get('Retry-After')).toBe('1');
-      expect(await response.json()).toMatchObject({ code: 'publication_conflict', retry_at: expect.any(String), publication_status: 'not_committed' });
-      expect((await state.storage.get<string[]>('jobs'))).toHaveLength(1);
+      expect(response.status).toBe(409); expect(response.headers.get('Retry-After')).toBeNull();
+      expect(await response.json()).toMatchObject({ code: 'publication_changed', retryable: false, publication_status: 'not_committed' });
+      expect(await state.storage.get('jobs')).toBeUndefined();
+      expect(await state.storage.getAlarm()).toBeNull();
     } finally { spy.mockRestore(); }
   });
   expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(input.expected_version);

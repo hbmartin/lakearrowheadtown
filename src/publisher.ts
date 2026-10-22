@@ -6,8 +6,8 @@ import { committedSnapshot, requireCommittedManifest, type CommittedSnapshot } f
 import { asHttpError, boundary, HttpError, publicationFailure } from './errors';
 import { alertRpcFailure, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type AlertsReply } from './alerts';
 import { readPosts, type PostsReply } from './posts';
-import { indexNotFound, publicationHead, validateRepair, validateRepairTargets, type RepairReply } from './publication-repair';
-import { prepareWrites } from './prepared-writes';
+import { validateRepair, type RepairReply } from './publication-repair';
+import { RepairCoordinator, restartRebuild } from './repair-coordinator';
 import type { AppendReply, BatchReply, Digest, Env, Migration, OperationContext, PublishFailure, PublishReply, RebuildJob, RetractReply, StoryUpdate } from './types';
 
 // Inspection is read-only. Callers choose when to prune missing/completed references.
@@ -53,6 +53,7 @@ export class DigestPublisher extends DurableObject<Env> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
+        await this.repairCoordinator().recover(new OperationTrace(context));
         const migration = await new OperationTrace(context).run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
         let snapshot: CommittedSnapshot | undefined;
         // Internal publishing helpers may bootstrap a new bucket; only persisted
@@ -135,57 +136,44 @@ export class DigestPublisher extends DurableObject<Env> {
     return this.mutation('append', context, (complete, executing, snapshot) => appendUpdate(this.env.SITE_BUCKET, postId, itemIndex, update, origin, new Date(), complete, executing, { snapshot }));
   }
 
+  private repairCoordinator(): RepairCoordinator {
+    return new RepairCoordinator(this.env.SITE_BUCKET, this.ctx.storage, async (origin, trace, context) => {
+      const head = await this.rebuildHead(trace, context, 'repair');
+      if (head.job?.status === 'failed') {
+        if (!['manifest_damaged', 'legacy_recovery_required', 'source_damaged', 'archive_damaged'].includes(head.job.error_code ?? '')) {
+          throw new HttpError(409, 'An unrelated failed rebuild blocks regeneration.', {}, { code: 'rebuild_blocked' });
+        }
+        return restartRebuild(head.job);
+      }
+      const migration = await boundary('storage', () => this.ctx.storage.get<Migration>('migration')) ?? initialMigration();
+      const id = crypto.randomUUID();
+      return { id, origin, status: 'queued', phase: migration.complete ? 'render' : 'migration', processed: migration.processed,
+        created_at: new Date().toISOString(), ...(context ? { context: { ...context, job_id: id } } : {}) };
+    });
+  }
+
   async publicationRepairV1(input: unknown, origin: string, context?: OperationContext): Promise<RepairReply> {
     context = this.executingContext(context);
-    return this.serialize(async () => {
+    const action = async (): Promise<RepairReply> => {
       const trace = new OperationTrace(context);
-      const prepared = prepareWrites(this.env.SITE_BUCKET, trace);
       try {
-        const index = await trace.run('repair_index_loading', () => boundary('storage', () => this.env.SITE_BUCKET.get('pages/index.html')));
-        if (!index) throw indexNotFound();
-        if (input === undefined) return { ok: true, result: { publication: publicationHead(index), unchanged: true } };
-        const repair = validateRepair(input);
-        const same = ['manifest', 'rss', 'archives'].every(key => (index.customMetadata?.[key] ?? null) === repair[key as keyof typeof repair]);
-        if (same) {
-          const receipt = await boundary('storage', () => this.ctx.storage.get<string>(`repair:${index.version}`));
-          const job = receipt ? await boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${receipt}`)) : undefined;
-          return { ok: true, result: { publication: publicationHead(index), unchanged: true, ...(job ? { job } : {}) } };
-        }
-        if (index.version !== repair.expected_version) throw new HttpError(409,
-          'The index changed since this repair was prepared. Read its current version before submitting a new repair.', {}, { code: 'publication_changed' });
-        await trace.run('repair_validation', () => validateRepairTargets(this.env.SITE_BUCKET, repair));
-        const body = await trace.run('repair_body_loading', () => boundary('storage', () => index.arrayBuffer()));
-        const metadata: Record<string, string> = { ...index.customMetadata, manifest: repair.manifest, rss: repair.rss };
-        if (repair.archives === null) delete metadata.archives; else metadata.archives = repair.archives;
-        // A validated repair may unblock a head that failed on the repaired pointers.
-        const head = await this.rebuildHead(trace, context, 'repair');
-        let recovery: RebuildJob | undefined;
-        if (head.job?.status === 'failed') {
-          if (!['manifest_damaged', 'legacy_recovery_required', 'source_damaged', 'archive_damaged'].includes(head.job.error_code ?? '')) {
-            throw new HttpError(409, 'An unrelated failed rebuild blocks regeneration.', {}, { code: 'rebuild_blocked' });
-          }
-          recovery = { ...head.job, status: 'queued' };
-          delete recovery.error; delete recovery.error_code; delete recovery.failed_stage; delete recovery.finished_at;
-        }
-        // Schedule durable regeneration before changing the pointers. If the
-        // conditional PUT rejects, that job safely rebuilds the current snapshot.
-        const job = await this.enqueueRebuildUnlocked(crypto.randomUUID(), origin, trace, context, recovery);
-        await trace.run('index_write', () => prepared.bucket.put('pages/index.html', body,
-          { httpMetadata: index.httpMetadata, customMetadata: metadata }));
-        const committed = (await prepared.commit(index))!;
-        await trace.run('repair_receipt', () => boundary('storage', () => this.ctx.storage.put(`repair:${committed.version}`, job.id)));
-        return { ok: true, result: { publication: publicationHead(committed), unchanged: false, job } };
+        const repairs = this.repairCoordinator();
+        const result = input === undefined ? await repairs.snapshot(trace) : await repairs.submit(validateRepair(input), origin, trace, context);
+        emit('repair_result', context, { repair_id: result.repair_id, job_id: result.job?.id,
+          publication_status: result.unchanged ? 'not_attempted' : 'committed', publication_outcome: result.unchanged ? 'unchanged' : 'repaired' });
+        return { ok: true, result };
       } catch (error) {
         const failure = asHttpError(error);
-        const publication_status = input === undefined ? 'not_attempted' : trace.publication_status;
-        emit('repair_failed', context, { stage: trace.failed_stage ?? 'repair_validation', error_code: failure.code, publication_status, ...safeError(error) }, 'error');
-        return { ok: false, failure: { status: failure.status, code: failure.code,
-          error: publication_status === 'unknown' ? 'Repair outcome is unknown. Read the publication snapshot; retrying already-installed pointers is a no-op.'
-            : publication_status === 'committed' ? 'Repair committed and regeneration is queued. Read rebuild status to confirm completion.' : failure.message,
-          retryable: publication_status === 'unknown' || failure.retryable, publication_status,
-          stage: trace.failed_stage ?? 'repair_validation', ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) } };
-      } finally { prepared.close(); }
-    }, context);
+        const publication_status = input === undefined ? 'not_attempted' : failure.publication_status ?? trace.publication_status;
+        emit('repair_failed', context, { stage: trace.failed_stage ?? 'repair_validation', error_code: failure.code,
+          publication_status, ...safeError(error) }, failure.status >= 500 ? 'error' : 'warn');
+        return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message,
+          retryable: failure.retryable, publication_status, stage: trace.failed_stage ?? 'repair_validation',
+          details: failure.details, details_truncated: failure.details_truncated, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) } };
+      }
+    };
+    // Inspection pins its own R2 HEAD and must not wait for rendering or writes.
+    return input === undefined ? action() : this.serialize(action, context);
   }
 
   private cursorKey?: Promise<string>;
@@ -237,7 +225,7 @@ export class DigestPublisher extends DurableObject<Env> {
     });
   }
 
-  private async enqueueRebuildUnlocked(id: string, origin: string, trace: OperationTrace, context?: OperationContext, recovery?: RebuildJob): Promise<RebuildJob> {
+  private async enqueueRebuildUnlocked(id: string, origin: string, trace: OperationTrace, context?: OperationContext): Promise<RebuildJob> {
     const migration = await trace.run('rebuild_enqueue_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration'))) ?? initialMigration();
     const jobContext = context ? { ...context, job_id: id } : undefined;
     if (jobContext) delete jobContext.candidate_job_id;
@@ -245,10 +233,9 @@ export class DigestPublisher extends DurableObject<Env> {
     await trace.run('rebuild_enqueue', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
       const ids = await storage.get<string[]>('jobs') ?? [];
       const head = await queueHead(ids, id => storage.get<RebuildJob>(`job:${id}`));
-      if (recovery) await storage.put(`job:${recovery.id}`, recovery);
       await storage.put(`job:${job.id}`, job);
       await storage.put('jobs', [...ids, job.id]);
-      if (recovery || head.job?.status !== 'failed') await storage.setAlarm(Date.now() + 1000);
+      if (head.job?.status !== 'failed') await storage.setAlarm(Date.now() + 1000);
     })));
     emit('rebuild_queued', jobContext, { job_id: job.id });
     return job;
@@ -256,6 +243,7 @@ export class DigestPublisher extends DurableObject<Env> {
 
   async jobStatus(id: string, context?: OperationContext): Promise<RebuildJob | null> {
     return this.rebuildRequest(context, { job_id: id }, trace => trace.run('rebuild_status_read', async () => {
+      await this.repairCoordinator().recover(trace);
       const job = await boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`));
       if (!job) return null;
       const ids = await boundary('storage', () => this.ctx.storage.get<string[]>('jobs')) ?? [];
@@ -266,16 +254,13 @@ export class DigestPublisher extends DurableObject<Env> {
 
   async resumeRebuild(id: string, context?: OperationContext): Promise<RebuildJob | 'conflict' | null> {
     return this.rebuildRequest(context, { job_id: id }, async (trace, context) => {
-      const job = await trace.run('rebuild_resume_read', () => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`)));
-      if (!job) return null;
+      await this.repairCoordinator().recover(trace);
+      const saved = await trace.run('rebuild_resume_read', () => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`)));
+      if (!saved) return null;
+      const job = restartRebuild(saved);
       const head = await this.rebuildHead(trace, context, 'rebuild_resume');
-      if (head.job?.id !== id || !['failed', 'queued', 'running'].includes(job.status)) return 'conflict';
-      if (job.status !== 'failed' && await trace.run('rebuild_resume_alarm_read', () => boundary('storage', () => this.ctx.storage.getAlarm())) !== null) return 'conflict';
-      job.status = 'queued';
-      delete job.error;
-      delete job.finished_at;
-      delete job.error_code;
-      delete job.failed_stage;
+      if (head.job?.id !== id || !['failed', 'queued', 'running'].includes(saved.status)) return 'conflict';
+      if (saved.status !== 'failed' && await trace.run('rebuild_resume_alarm_read', () => boundary('storage', () => this.ctx.storage.getAlarm())) !== null) return 'conflict';
       if (context) job.context = context;
       // The repair timing encloses this write; failures retain the inner write stage.
       const write = () => trace.run('rebuild_resume_write', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
@@ -303,6 +288,8 @@ export class DigestPublisher extends DurableObject<Env> {
     const bootstrapContext: OperationContext = { request_id: crypto.randomUUID(), worker_version: this.env.CF_VERSION_METADATA?.id ?? 'local', environment: this.env.ENVIRONMENT ?? 'local', operation: 'rebuild' };
     return this.serialize(async () => {
       const bootstrap = new OperationTrace(bootstrapContext);
+      try { await this.repairCoordinator().recover(bootstrap, true); }
+      catch (error) { if (asHttpError(error).code === 'repair_pending') return; throw error; }
       let ids: string[];
       let job: RebuildJob | null | undefined;
       try {

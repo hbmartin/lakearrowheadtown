@@ -30,7 +30,7 @@ export function prepareWrites(bucket: ContentBucket, trace: OperationTrace) {
   return {
     bucket: view,
     close() { trace.phase = previousPhase; },
-    async commit(index: R2Object | null = null) {
+    async commit(index: R2Object | null) {
       let committedIndex: R2Object | undefined;
       // A child trace per write avoids concurrent stage-stack mutation.
       const persist = async (write: typeof writes[number]) => {

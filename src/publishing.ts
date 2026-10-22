@@ -20,6 +20,7 @@ export const HTML_CACHE = 'public, max-age=0, must-revalidate';
 export const initialMigration = (): Migration => ({ processed: 0, complete: false });
 // Internal inputs pin a guarded operation without changing its public RPC payload.
 type PublishingOptions = PublishOptions & { snapshot?: CommittedSnapshot };
+export const rebuildReference = (ref: PostReference): PostReference => ref.key.startsWith('digests/') ? { ...ref, key: postKey(ref) } : ref;
 export const postKey = (post: Pick<PostReference, 'date' | 'id'>) => `posts/${post.date}/${post.id}.json`;
 const reference = (post: StoredPost): PostReference => ({ id: post.id, key: postKey(post), date: post.date, received_at: post.received_at,
   last_received_at: post.items.reduce((latest, item) => Date.parse(lastReceivedAt(post, item)) > Date.parse(latest) ? lastReceivedAt(post, item) : latest, post.received_at) });
@@ -137,11 +138,12 @@ async function retainedSources(bucket: ContentBucket, now: Date, migrationComple
   const legacyDays = recentDates(now);
   let discovery: Promise<PostReference[]> | undefined;
   const discover = () => discovery ??= migrationComplete ? Promise.resolve([]) : trace.run('legacy_discovery', () => legacyReferences(bucket));
-  let pinned = snapshot;
-  const previous = provided ?? await trace.run('publication_loading', async () => {
-    pinned ??= await committedSnapshot(bucket);
-    return currentPublication(bucket, discover, pinned);
-  });
+  const load = async () => {
+    const pinned = snapshot ?? await committedSnapshot(bucket);
+    return { previous: provided ?? await currentPublication(bucket, discover, pinned), snapshot: pinned };
+  };
+  const { previous, snapshot: pinned } = provided && snapshot
+    ? { previous: provided, snapshot } : await trace.run('publication_loading', load);
   // Preserve the established legacy migration window; never backfill old raw sources.
   const receipts = legacyReceipts(previous);
   const legacy = (await discover()).filter(ref => legacyDays.includes(ref.date) && !Object.hasOwn(receipts, ref.id));
@@ -162,7 +164,7 @@ async function retainedSources(bucket: ContentBucket, now: Date, migrationComple
       }
     }
   });
-  return { posts, selected, omitted, days, previous, snapshot: pinned!, sources: new Map(selected.map((ref, i) => [ref.key, posts[i]])) };
+  return { posts, selected, omitted, days, previous, snapshot: pinned, sources: new Map(selected.map((ref, i) => [ref.key, posts[i]])) };
 }
 
 function knownSources(posts: StoredPost[], days: string[]): Map<string, StoryIdentity> {
@@ -347,7 +349,7 @@ export async function rebuildHomepage(bucket: ContentBucket, origin: string, tra
     });
     const { snapshot, publication: previous } = baseline;
     // Migration finishes before rendering; imported sources now have canonical keys.
-    const publication = { ...previous, posts: previous.posts.map(ref => ref.key.startsWith('digests/') ? { ...ref, key: postKey(ref) } : ref) };
+    const publication = { ...previous, posts: previous.posts.map(rebuildReference) };
     const posts: StoredPost[] = [];
     await trace.run('source_loading', async () => {
       for await (const { result } of settledInOrder(publication.posts, ref => loadPost(bucket, ref))) {
