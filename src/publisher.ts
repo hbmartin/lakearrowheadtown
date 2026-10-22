@@ -5,7 +5,7 @@ import { findBatch, loadHistoryIndex } from './history-index';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { committedSnapshot, requireCommittedManifest, type CommittedSnapshot } from './committed';
 import { asHttpError, boundary, HttpError, publicationFailure } from './errors';
-import { alertRpcFailure, confirmAlerts, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type AlertsReply } from './alerts';
+import { alertRpcFailure, confirmAlerts, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type HistoryMode, type AlertsReply } from './alerts';
 import { readPosts, type PostsReply } from './posts';
 import { publishEvents, readEvents, type EventDigest, type EventsReply } from './events';
 import { validateRepair, type RepairReply } from './publication-repair';
@@ -156,12 +156,12 @@ export class DigestPublisher extends DurableObject<Env> {
     }
   }
 
-  async submitAlertV1(input: AlertInput, owner: string, context?: OperationContext, dryRun = false): Promise<AlertsReply> {
+  async submitAlertV1(input: AlertInput, owner: string, context?: OperationContext, dryRun = false, history: HistoryMode = 'full'): Promise<AlertsReply> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
         const result = await submitAlert(this.env.SITE_BUCKET, input, owner, new Date(), context, dryRun,
-          () => this.ctx.storage.put('conditions:pending', true));
+          () => this.ctx.storage.put('conditions:pending', true), history);
         if (!dryRun) await this.finishConditions(undefined, context);
         return { ok: true, result };
       }
@@ -169,12 +169,12 @@ export class DigestPublisher extends DurableObject<Env> {
     }, context);
   }
 
-  async retractAlertEntryV1(alertId: string, entryId: string, owner: string, context?: OperationContext, dryRun = false): Promise<AlertsReply> {
+  async retractAlertEntryV1(alertId: string, entryId: string, owner: string, context?: OperationContext, dryRun = false, history: HistoryMode = 'full'): Promise<AlertsReply> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
         const result = await retractAlertEntry(this.env.SITE_BUCKET, alertId, entryId, owner, new Date(), context,
-          () => this.ctx.storage.put('conditions:pending', true), dryRun);
+          () => this.ctx.storage.put('conditions:pending', true), dryRun, history);
         if (!dryRun) await this.finishConditions(undefined, context);
         return { ok: true, result };
       }

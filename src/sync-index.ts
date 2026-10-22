@@ -22,10 +22,10 @@ export function storyData(post: StoredPost, itemIndex: number, metadata: IndexIt
     updates: (item.updates ?? []).map((update, i) => ({ ...update, ...metadata.updates[i] })) };
 }
 export const eventData = (post: EventPost, itemIndex: number) => ({ ...post.items[itemIndex], post_id: post.id, item_index: itemIndex });
-export function storyRows(posts: StoredPost[], refs: PostReference[]): SyncRow[] {
+export function storyRows(posts: StoredPost[], refs: PostReference[], indexed?: ReturnType<typeof indexPost>[]): SyncRow[] {
   const byId = new Map(posts.map(post => [post.id, post]));
   return refs.flatMap(ref => {
-    const post = byId.get(ref.id)!; const metadata = indexPost(post);
+    const post = byId.get(ref.id)!; const metadata = indexed?.find(item => item.post_id === ref.id) ?? indexPost(post);
     return post.items.map((_item, item_index) => {
       const data = storyData(post, item_index, metadata.items[item_index]);
       return { resource: 'story' as const, identity: { post_id: ref.id, item_index }, revision: fingerprint(canonicalJson(data)), source_key: ref.key, last_received_at: data.last_received_at };
@@ -40,10 +40,10 @@ export function eventRows(posts: EventPost[], refs: PostReference[], dates: (ite
       source_key: ref.key, first_date: bounds.first, last_date: bounds.last };
   }));
 }
-export async function writeSyncIndex(bucket: ContentBucket, resource: IndexedResource, refs: PostReference[], rows: SyncRow[]): Promise<string> {
+export async function writeSyncIndex(bucket: ContentBucket, resource: IndexedResource, refs: PostReference[], rows: SyncRow[], previous?: string): Promise<string> {
   const serialized = canonicalJson({ version: 1, binding: refsBinding(refs), rows } satisfies SyncIndex);
   const key = `sync-index/${resource}/${fingerprint(serialized)}.json`;
-  await boundary('storage', () => bucket.put(key, serialized, options)); return key;
+  if (key !== previous) await boundary('storage', () => bucket.put(key, serialized, options)); return key;
 }
 async function readIndex(bucket: ContentBucket, key: string, resource: IndexedResource, refs: PostReference[]): Promise<SyncIndex> {
   if (!validSyncIndexKey(key, resource)) throw new DamagedManifest(key, 'invalid_manifest');

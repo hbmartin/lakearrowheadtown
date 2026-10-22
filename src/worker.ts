@@ -9,7 +9,7 @@ import { HTML_CACHE } from './publishing';
 import { htmlResponse } from './html-response';
 import { renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
-import { isAlertsReply, validateAlertInput, validateConfirmationBatch } from './alerts';
+import { isAlertsReply, validateAlertInput, validateConfirmationBatch, type HistoryMode } from './alerts';
 import { isPostsReply } from './posts';
 import { isEventsReply, validateEvents, type EventDigest } from './events';
 import { isRepairReply, validateRepair, type RepairInput } from './publication-repair';
@@ -165,8 +165,8 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (!received.ok) throw failureError(received.failure);
       if (!('counts' in received.result) || !('confirmed' in received.result.counts)) throw new OperationFailure('rpc', new Error('Invalid confirmations result'));
       if (state.dry_run && (received.result.dry_run !== true || received.result.committed !== false || !isTimestamp(received.result.checked_at))) throw new OperationFailure('rpc', new Error('Invalid confirmations preview'));
-      state.publication_status = state.dry_run ? 'not_attempted' : received.result.counts.confirmed ? 'committed' : undefined;
-      state.publication_outcome = state.dry_run ? 'preview' : received.result.counts.confirmed ? 'published' : 'duplicate';
+      state.publication_status = state.dry_run || received.result.counts.failed && !received.result.counts.confirmed ? 'not_attempted' : received.result.counts.confirmed ? 'committed' : undefined;
+      state.publication_outcome = state.dry_run ? 'preview' : received.result.counts.confirmed ? 'published' : received.result.counts.failed ? 'failed' : 'duplicate';
       return reply({ ok: true, ...received.result });
     }
     const alertRetraction = /^\/api\/alerts\/([^/]+)\/entries\/([^/]+)\/retract$/.exec(path);
@@ -180,10 +180,10 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
         state.dry_run = query.get('dry_run') === 'true';
       }
+      if (!reading && (query.getAll('history').length > 1 || query.has('history') && !['full', 'coalesced'].includes(query.get('history')!))) throw new HttpError(400, 'history must be full or coalesced.', {}, { code: 'invalid_history' });
+      const history = (query.get('history') ?? 'full') as HistoryMode;
       let payload;
       if (!reading && !alertRetraction) {
-        if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
-        state.dry_run = query.get('dry_run') === 'true';
         if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json');
         state.bytes_received = 0; state.body_complete = false;
         state.declared_body_bytes = declaredBodyBytes(request);
@@ -196,8 +196,8 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (!reading) state.publication_status = state.dry_run ? 'not_attempted' : 'unknown';
       const received: unknown = await trace.run('alerts_rpc', () => boundary('rpc', async () => reading
         ? await publisher.readAlertsV1(query.toString(), context, alertRead?.[1])
-        : alertRetraction ? await publisher.retractAlertEntryV1(alertRetraction[1], alertRetraction[2], fingerprint(env.API_SECRET!), context, state.dry_run)
-        : await publisher.submitAlertV1(payload!, fingerprint(env.API_SECRET!), context, state.dry_run)));
+        : alertRetraction ? await publisher.retractAlertEntryV1(alertRetraction[1], alertRetraction[2], fingerprint(env.API_SECRET!), context, state.dry_run, history)
+        : await publisher.submitAlertV1(payload!, fingerprint(env.API_SECRET!), context, state.dry_run, history)));
       if (!isAlertsReply(received)) throw new OperationFailure('rpc', new Error('Invalid alerts reply'));
       if (!received.ok) {
         throw failureError(received.failure);
@@ -437,12 +437,12 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
   }
 }
 
-function routeFor(path: string): { route: string; operation: string } {
+function routeFor(path: string, method: string): { route: string; operation: string } {
   if (path === '/api/changes') return { route: path, operation: 'changes_read' };
-  if (path === '/api/events') return { route: path, operation: 'event' };
+  if (path === '/api/events') return { route: path, operation: ['GET', 'HEAD'].includes(method) ? 'events_read' : 'event' };
   if (path === '/api/alerts/confirmations') return { route: path, operation: 'alert_confirm' };
   if (/^\/api\/alerts\/[^/]+$/.test(path)) return { route: '/api/alerts/:id', operation: 'alerts_read' };
-  if (path === '/api/alerts') return { route: path, operation: 'alert' };
+  if (path === '/api/alerts') return { route: path, operation: ['GET', 'HEAD'].includes(method) ? 'alerts_read' : 'alert' };
   if (/^\/api\/alerts\/[^/]+\/entries\/[^/]+\/retract$/.test(path)) return { route: '/api/alerts/:id/entries/:entry/retract', operation: 'alert_retract' };
   if (path === '/api/publication/repair') return { route: path, operation: 'publication_repair' };
   if (path === '/api/digests') return { route: path, operation: 'digest' };
@@ -464,7 +464,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const started = performance.now();
     const path = new URL(request.url).pathname;
-    const route = routeFor(path);
+    const route = routeFor(path, request.method);
     const ray = request.headers.get('cf-ray');
     const context: OperationContext = { request_id: crypto.randomUUID(), worker_version: env.CF_VERSION_METADATA?.id ?? 'local', environment: env.ENVIRONMENT ?? 'local', operation: route.operation,
       ...(ray && /^[a-f0-9]{16,32}(?:-[A-Z]{3})?$/.test(ray) ? { cf_ray: ray } : {}) };

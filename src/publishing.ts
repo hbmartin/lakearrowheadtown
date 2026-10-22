@@ -126,7 +126,7 @@ async function prepareHomepage(bucket: ContentBucket, publication: Publication, 
   const indexBody = stableJson(index);
   publication.history_index = `history-index/${fingerprint(indexBody)}.json`;
   if (publication.history_index !== previous.history_index) await trace.run('history_index_write', () => boundary('storage', () => bucket.put(publication.history_index!, indexBody, { httpMetadata: { contentType: 'application/json' } })));
-  publication.sync_index = await trace.run('sync_index_write', () => writeSyncIndex(bucket, 'story', publication.posts, storyRows(posts, publication.posts)));
+  publication.sync_index = await trace.run('sync_index_write', () => writeSyncIndex(bucket, 'story', publication.posts, storyRows(posts, publication.posts, index.posts), previous.sync_index));
   const serialized = JSON.stringify(publication);
   await trace.run('manifest_write', () => boundary('storage', () => bucket.put(manifest, serialized, { httpMetadata: { contentType: 'application/json' } })));
   await trace.run('rss_write', () => boundary('storage', () => bucket.put(rss, feed, { httpMetadata: { contentType: RSS_TYPE, cacheControl: HTML_CACHE } })));

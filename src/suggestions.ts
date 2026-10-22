@@ -7,6 +7,7 @@ export const duplicateMessage = 'This exact source URL already belongs to a reta
 
 export function errorSuggestion(code: string, retryable: boolean, dryRun = false, operation?: string, publicationStatus?: PublicationStatus): Suggestion {
   if (operation === 'changes_read' && ['invalid_cursor', 'resync_required'].includes(code)) return { action: 'bootstrap_changes', message: 'Bootstrap a fresh reconciliation read without since or cursor, apply every page, then save the final sync_cursor.', method: 'GET', path: '/api/changes' };
+  if (retryable && ['alerts_read', 'events_read', 'changes_read', 'posts_read'].includes(operation ?? '')) return { action: 'retry_read', message: 'Retry the unchanged read. No publication was attempted.' };
   if (dryRun && retryable) return { action: 'retry_preview', message: 'Retry the unchanged preview. No publication was attempted.' };
   if (['alert', 'alert_retract', 'alert_confirm', 'alerts_read'].includes(operation ?? '')) {
     if (code === 'client_ref_conflict') return { action: 'look_up_alert', message: 'Look up the exact client_ref before choosing a new reference for an intentional new submission.', method: 'GET', path: '/api/alerts' };

@@ -1,6 +1,7 @@
+import { settledInOrder } from './batches';
 import { Buffer } from 'node:buffer';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { asHttpError, boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply, type ValidationIssue } from './errors';
+import { asHttpError, boundary, OperationFailure, DamagedManifest, DamagedSource, HttpError, isPublishReply, type ValidationIssue } from './errors';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { localDate, recentDates } from './feed';
 import { canonicalJson as canonical, fingerprint, httpUrl, record, text } from './primitives';
@@ -39,7 +40,7 @@ export interface AlertInput extends Omit<NullablePatch<AlertFields>, 'category' 
 export interface StoredEntry { entry_id: string; received_at: string; input: AlertInput; publisher_fingerprint: string;
   entry_type?: 'confirmation'; retractable?: false; confirmation_run?: PublicConfirmationRun }
 export interface Retraction { entry_id: string; retracted_at: string }
-export interface AlertRecord { version: 1; alert_id: string; entries: StoredEntry[]; retractions: Retraction[]; storage?: HistoryRoot; pending_entries?: StoredEntry[] }
+export interface AlertRecord { version: 1; alert_id: string; entries: StoredEntry[]; retractions: Retraction[]; storage?: HistoryRoot; pending_entries?: StoredEntry[]; base_entries?: StoredEntry[]; history_mode?: HistoryMode }
 export type HistoryMode = 'full' | 'coalesced';
 export interface PublicConfirmationRun { run_id: string; count: number; first_observed_at: string; last_observed_at: string; first_received_at: string; last_received_at: string }
 export interface AlertView extends AlertFields {
@@ -174,8 +175,9 @@ function validateEffective(value: AlertFields): void {
 
 function atTime(alert: AlertView, now: Date): AlertView {
   const open = alert.state === 'open' || alert.state === 'expired-unconfirmed';
-  return { ...alert, state: open ? Date.parse(alert.expires_at!) <= now.getTime() ? 'expired-unconfirmed' : 'open' : alert.state,
-    upcoming: open && !!alert.starts_at && Date.parse(alert.starts_at) > now.getTime() };
+  const state = open ? Date.parse(alert.expires_at!) <= now.getTime() ? 'expired-unconfirmed' : 'open' : alert.state;
+  return { ...alert, state,
+    upcoming: state === 'open' && !!alert.starts_at && Date.parse(alert.starts_at) > now.getTime() };
 }
 
 export function deriveAlert(value: AlertRecord, now: Date): AlertView {
@@ -188,8 +190,21 @@ export function deriveAlert(value: AlertRecord, now: Date): AlertView {
     fields = applyFields(fields, entry.input);
     if (entry.input.phase === 'resolved') state = 'resolved';
   }
-  const expires_at = state === 'open' ? new Date(Date.parse(fields.expected_end ?? fields.observed_at) + ALERT_DAY).toISOString() : null;
+  const expires_at = expiry(fields, state);
   return atTime({ ...fields, alert_id: value.alert_id, state, expires_at, upcoming: false }, now);
+}
+
+function expiry(fields: AlertFields, state: AlertView['state']): string | null {
+  return state === 'open' ? new Date(Date.parse(fields.expected_end ?? fields.observed_at) + ALERT_DAY).toISOString() : null;
+}
+function referenceFor(value: AlertRecord, key: string, now: Date, alert = deriveAlert(value, now)): AlertReference {
+  const runs = value.storage?.timeline.filter((item): item is ConfirmationRun => item.type === 'confirmations') ?? [];
+  return { alert_id: value.alert_id, key, last_received_at: now.toISOString(), alert, revision: key.slice('alerts/revisions/'.length, -5),
+    confirmation_count: runs.reduce((count, run) => count + run.count, 0), ...(runs.length ? { last_confirmed_at: runs.at(-1)!.last_observed_at } : {}) };
+}
+async function responseRecord(bucket: ContentBucket, value: AlertRecord, history: HistoryMode): Promise<AlertRecord> {
+  if (!value.storage || history === 'coalesced' || value.history_mode === 'full') return value;
+  return { ...value, entries: [...value.base_entries!, ...await expandHistory(value.storage, 'full', key => readAlertJson(bucket, key, value.alert_id), storedEntry), ...(value.pending_entries ?? [])], history_mode: 'full' };
 }
 
 function publicEntry(value: AlertRecord, entry: StoredEntry): PublicEntry {
@@ -269,22 +284,30 @@ function storedEntry(value: unknown): StoredEntry {
     || typeof value.publisher_fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(value.publisher_fingerprint)) throw new Error('Invalid stored entry');
   return { entry_id: value.entry_id, received_at: value.received_at, publisher_fingerprint: value.publisher_fingerprint, input: validateAlertInput(value.input) };
 }
+async function readAlertJson(bucket: ContentBucket, key: string, alertId: string): Promise<unknown> {
+  try { return await readJson(bucket, key); }
+  catch (error) {
+    if (error instanceof DamagedManifest) throw new DamagedSource(key, alertId, error.reason === 'invalid_manifest' ? 'invalid_digest' : error.reason);
+    throw error;
+  }
+}
+
 export async function loadAlertRecord(bucket: ContentBucket, ref: AlertReference, history: HistoryMode = 'full'): Promise<AlertRecord> {
-  const value = await readJson(bucket, ref.key);
+  const value = await readAlertJson(bucket, ref.key, ref.alert_id);
   try {
     if (record(value) && value.version === 2) {
       if (!isHistoryRoot(value, ref.alert_id)) throw new Error();
       // The shared base is always v1, so malformed references cannot form cycles.
-      const baseValue = await readJson(bucket, value.base);
+      const baseValue = await readAlertJson(bucket, value.base, ref.alert_id);
       if (!record(baseValue) || baseValue.version !== 1) throw new Error();
       const base = validateRecord(baseValue, ref.alert_id);
-      const entries = [...base.entries, ...await expandHistory(value, history, key => readJson(bucket, key), storedEntry)];
+      const entries = [...base.entries, ...await expandHistory(value, history, key => readAlertJson(bucket, key, ref.alert_id), storedEntry)];
       validateRetractions(value.retractions, entries.filter(entry => !entry.entry_type));
-      return { version: 1, alert_id: ref.alert_id, entries, retractions: value.retractions, storage: value };
+      return { version: 1, alert_id: ref.alert_id, entries, retractions: value.retractions, storage: value, base_entries: base.entries, history_mode: history };
     }
     return validateRecord(value, ref.alert_id);
   } catch (error) {
-    if (error instanceof DamagedManifest || error instanceof DamagedSource) throw error;
+    if (error instanceof OperationFailure || error instanceof DamagedManifest || error instanceof DamagedSource) throw error;
     throw new DamagedSource(ref.key, ref.alert_id, 'invalid_digest');
   }
 }
@@ -316,9 +339,7 @@ async function writeRecord(bucket: ContentBucket, value: AlertRecord, now: Date,
   }
   const serialized = JSON.stringify(stored); const key = `alerts/revisions/${fingerprint(serialized)}.json`;
   await trace.run('alert_revision_write', () => boundary('storage', () => bucket.put(key, serialized, jsonOptions)));
-  const runs = value.storage?.timeline.filter((item): item is ConfirmationRun => item.type === 'confirmations') ?? [];
-  return { alert_id: value.alert_id, key, last_received_at: now.toISOString(), alert: deriveAlert(value, now), revision: fingerprint(serialized),
-    confirmation_count: runs.reduce((count, run) => count + run.count, 0), ...(runs.length ? { last_confirmed_at: runs.at(-1)!.last_observed_at } : {}) };
+  return referenceFor(value, key, now);
 }
 async function commitManifest(bucket: ContentBucket, manifest: AlertManifest, trace: OperationTrace): Promise<void> {
   const serialized = JSON.stringify(manifest); const key = `alerts/snapshots/${fingerprint(serialized)}.json`;
@@ -349,7 +370,7 @@ function validateConfirmation(value: unknown): ConfirmationInput {
   return { client_ref: input.client_ref, alert_id: input.alert_id!, source: input.source, source_url: input.source_url, observed_at: input.observed_at };
 }
 async function rootForConfirmation(bucket: ContentBucket, ref: AlertReference): Promise<HistoryRoot> {
-  const raw = await readJson(bucket, ref.key);
+  const raw = await readAlertJson(bucket, ref.key, ref.alert_id);
   if (record(raw) && raw.version === 2) {
     if (!isHistoryRoot(raw, ref.alert_id)) throw new DamagedSource(ref.key, ref.alert_id, 'invalid_digest');
     return { ...raw, timeline: [...raw.timeline] };
@@ -360,10 +381,10 @@ async function rootForConfirmation(bucket: ContentBucket, ref: AlertReference): 
       content_revision: fingerprint(canonical([ref.key, [], base.retractions])) };
   } catch { throw new DamagedSource(ref.key, ref.alert_id, 'invalid_digest'); }
 }
-async function confirmationReceipt(bucket: ContentBucket, ref: AlertReference, receipt: Receipt) {
+async function confirmationReceipt(bucket: ContentBucket, ref: AlertReference, receipt: Receipt, prepared?: HistoryRoot) {
   if (!receipt.confirmation_key || !/^alerts\/confirmations\/[a-f0-9]{64}\.json$/.test(receipt.confirmation_key)) throw new DamagedManifest(ALERTS_KEY, 'invalid_manifest');
-  const root = await rootForConfirmation(bucket, ref);
-  const node = await readJson(bucket, receipt.confirmation_key);
+  const root = prepared ?? await rootForConfirmation(bucket, ref);
+  const node = await readAlertJson(bucket, receipt.confirmation_key, ref.alert_id);
   if (!isConfirmationNode(node, ref.alert_id) || node.client_ref !== receipt.client_ref || node.entry_id !== receipt.entry_id || node.received_at !== receipt.received_at) throw new DamagedSource(receipt.confirmation_key, ref.alert_id, 'invalid_digest');
   const run = root.timeline.find((item): item is ConfirmationRun => item.type === 'confirmations' && item.run_id === node.run_id);
   if (!run) throw new DamagedSource(ref.key, ref.alert_id, 'invalid_digest');
@@ -380,6 +401,11 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
     const claimed = new Set<string>();
     const drafts: { root: HistoryRoot; node: ConfirmationNode; key: string; ref: AlertReference }[] = [];
     const items: ConfirmationsResult['items'] = [];
+    const roots = new Map<string, PromiseSettledResult<HistoryRoot>>();
+    const refs = new Map<string, AlertReference>();
+    for (const raw of inputs) { try { const input = validateConfirmation(raw); const ref = manifest.alerts.find(ref => ref.alert_id === input.alert_id); if (ref) refs.set(ref.alert_id, ref); } catch { /* Item validation below reports the error. */ } }
+    for await (const { input: ref, result } of settledInOrder([...refs.values()], ref => rootForConfirmation(bucket, ref))) roots.set(ref.alert_id, result);
+    const rootFor = (ref: AlertReference) => { const result = roots.get(ref.alert_id)!; if (result.status === 'rejected') throw result.reason; return result.value; };
     for (let index = 0; index < inputs.length; index++) {
       try {
         const input = validateConfirmation(inputs[index]);
@@ -391,7 +417,7 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
         if (receipt) {
           if (receipt.kind !== 'confirmation') throw new HttpError(409, 'client_ref identifies a different alert submission.', {}, { code: 'client_ref_conflict' });
           if (receipt.alert_id !== input.alert_id) throw new HttpError(409, 'client_ref identifies another alert.', {}, { code: 'client_ref_conflict' });
-          const prior = await confirmationReceipt(bucket, ref, receipt);
+          const prior = await confirmationReceipt(bucket, ref, receipt, rootFor(ref));
           const { phase: _phase, ...original } = prior.entry.input;
           if (receipt.payload_hash !== payload_hash && canonical(timestampPayload(original)) !== canonical(timestampPayload(input))) throw new HttpError(409, 'client_ref identifies a different confirmation.', {}, { code: 'client_ref_conflict' });
           claimed.add(input.alert_id);
@@ -403,7 +429,7 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
         if (instant(input.observed_at) < instant(effective.observed_at)) throw new HttpError(409, 'Observation precedes the latest surviving observation.', {}, { code: 'stale_observation' });
         const nextFields = applyFields(effective, { ...input, phase: 'update' });
         validateEffective(nextFields);
-        const root = await rootForConfirmation(bucket, ref);
+        const root = rootFor(ref);
         const last = root.timeline.at(-1);
         const extend = last?.type === 'confirmations' && last.content_revision === root.content_revision && last.source === input.source && last.source_url === input.source_url;
         const node: ConfirmationNode = { version: 1, alert_id: input.alert_id, run_id: extend ? last.run_id : crypto.randomUUID(), entry_id: crypto.randomUUID(),
@@ -415,28 +441,22 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
           latest: { entry_id: node.entry_id, client_ref: node.client_ref, observed_at: node.observed_at, received_at: node.received_at } };
         if (extend) root.timeline[root.timeline.length - 1] = run; else root.timeline.push(run);
         const serialized = JSON.stringify(root); const key = `alerts/revisions/${fingerprint(serialized)}.json`;
-        const runs = root.timeline.filter((item): item is ConfirmationRun => item.type === 'confirmations');
-        const alert = atTime({ ...nextFields, state: 'open', alert_id: input.alert_id, upcoming: false,
-          expires_at: new Date(Date.parse(nextFields.expected_end ?? nextFields.observed_at) + ALERT_DAY).toISOString() }, now);
-        const next: AlertReference = { alert_id: input.alert_id, key, last_received_at: now.toISOString(), alert, revision: fingerprint(serialized),
-          confirmation_count: runs.reduce((count, item) => count + item.count, 0), last_confirmed_at: node.observed_at };
+        const alert = atTime({ ...nextFields, state: 'open', alert_id: input.alert_id, upcoming: false, expires_at: expiry(nextFields, 'open') }, now);
+        const next = referenceFor({ version: 1, alert_id: input.alert_id, entries: [], retractions: root.retractions, storage: root }, key, now, alert);
         drafts.push({ root, node, key, ref: next }); claimed.add(input.alert_id);
         receipts.push({ client_ref: input.client_ref, payload_hash, alert_id: input.alert_id, entry_id: node.entry_id, received_at: node.received_at, kind: 'confirmation', confirmation_key: nodeKey });
         items.push({ index, ok: true, status: 'confirmed', client_ref: input.client_ref, alert_id: input.alert_id, entry_id: node.entry_id, received_at: node.received_at, alert: alertIndex(next, now) });
       } catch (error) {
         const failure = asHttpError(error);
         // Storage/transport failures invalidate the operation, not just one item.
-        if (failure.status >= 500) throw error;
+        if (failure.status >= 500 && !(error instanceof DamagedSource)) throw error;
         items.push({ index, ok: false, status: failure.status, code: failure.code, error: failure.message, retryable: failure.retryable, details: failure.details });
       }
     }
     if (drafts.length && !dryRun) {
       if (beforeCommit) await trace.run('alert_homepage_intent', beforeCommit);
-      for (const draft of drafts) {
-        const node = JSON.stringify(draft.node); const root = JSON.stringify(draft.root);
-        await trace.run('alert_confirmation_write', () => boundary('storage', () => bucket.put(confirmationKey(draft.node), node, jsonOptions)), { bytes_written: new TextEncoder().encode(node).length });
-        await trace.run('alert_revision_write', () => boundary('storage', () => bucket.put(draft.key, root, jsonOptions)), { bytes_written: new TextEncoder().encode(root).length });
-      }
+      const artifacts = drafts.flatMap(draft => [{ key: confirmationKey(draft.node), body: JSON.stringify(draft.node), stage: 'alert_confirmation_write' }, { key: draft.key, body: JSON.stringify(draft.root), stage: 'alert_revision_write' }]);
+      for await (const { result } of settledInOrder(artifacts, artifact => trace.run(artifact.stage, () => boundary('storage', () => bucket.put(artifact.key, artifact.body, jsonOptions)), { bytes_written: new TextEncoder().encode(artifact.body).length }))) if (result.status === 'rejected') throw result.reason;
       const revised = new Map(drafts.map(draft => [draft.ref.alert_id, draft.ref]));
       await commitManifest(bucket, { version: 1, published_at: now.toISOString(), alerts: manifest.alerts.map(ref => revised.get(ref.alert_id) ?? ref), receipts }, trace);
     }
@@ -446,7 +466,7 @@ export async function confirmAlerts(bucket: ContentBucket, inputs: unknown[], no
   } catch (error) { throw alertFailure(error, trace, dryRun); }
 }
 
-export async function submitAlert(bucket: ContentBucket, input: AlertInput, owner: string, now = new Date(), context?: OperationContext, dryRun = false, beforeCommit?: () => Promise<void>): Promise<AlertMutationResult> {
+export async function submitAlert(bucket: ContentBucket, input: AlertInput, owner: string, now = new Date(), context?: OperationContext, dryRun = false, beforeCommit?: () => Promise<void>, history: HistoryMode = 'full'): Promise<AlertMutationResult> {
   const trace = new OperationTrace(context);
   try {
     // Revalidate at the serialized boundary, not just in the public Worker.
@@ -460,20 +480,20 @@ export async function submitAlert(bucket: ContentBucket, input: AlertInput, owne
       if (receipt.kind === 'confirmation') throw new HttpError(409, 'client_ref identifies a confirmation.', {}, { code: 'client_ref_conflict' });
       const ref = manifest.alerts.find(ref => ref.alert_id === receipt.alert_id);
       if (!ref) throw new DamagedManifest(ALERTS_KEY, 'invalid_manifest');
-      const value = await trace.run('alert_revision_loading', () => loadAlertRecord(bucket, ref));
+      const value = await trace.run('alert_revision_loading', () => loadAlertRecord(bucket, ref, 'coalesced'));
       const entry = value.entries.find(entry => entry.entry_id === receipt.entry_id);
       if (!entry) throw new DamagedSource(ref.key, ref.alert_id, 'invalid_digest');
       if (receipt.payload_hash !== payload_hash && canonical(timestampPayload(entry.input)) !== canonical(timestampPayload(input))) {
         throw new HttpError(409, 'client_ref identifies a different alert submission.', {}, { code: 'client_ref_conflict' });
       }
-      result = mutationResult(value, entry, 'duplicate', now);
+      result = mutationResult(await responseRecord(bucket, value, history), entry, 'duplicate', now);
     } else {
       let value: AlertRecord;
       if (input.phase === 'open') value = { version: 1, alert_id: crypto.randomUUID(), entries: [], retractions: [] };
       else {
         const ref = manifest.alerts.find(ref => ref.alert_id === input.alert_id);
         if (!ref) throw new HttpError(404, 'Alert not found.', {}, { code: 'alert_not_found' });
-        value = await trace.run('alert_revision_loading', () => loadAlertRecord(bucket, ref));
+        value = await trace.run('alert_revision_loading', () => loadAlertRecord(bucket, ref, 'coalesced'));
         const effective = deriveAlert(value, now);
         if (effective.state === 'resolved' || effective.state === 'retracted') throw new HttpError(409, 'A resolved or retracted alert requires a new opening.', {}, { code: 'alert_closed' });
         if (input.category !== undefined && input.category !== effective.category || input.kind !== undefined && input.kind !== effective.kind) throw new HttpError(409, 'Alert category and kind cannot be changed.', {}, { code: 'alert_identity_conflict' });
@@ -482,7 +502,7 @@ export async function submitAlert(bucket: ContentBucket, input: AlertInput, owne
       }
       const entry: StoredEntry = { entry_id: crypto.randomUUID(), received_at: now.toISOString(), input, publisher_fingerprint: owner };
       value = { ...value, entries: [...value.entries, entry], ...(value.storage ? { pending_entries: [entry] } : {}) };
-      result = mutationResult(value, entry, 'published', now);
+      result = mutationResult(await responseRecord(bucket, value, history), entry, 'published', now);
       const warnings = duplicateWarnings(input, manifest, now);
       if (warnings.length) result.warnings = warnings;
       if (!dryRun) {
@@ -504,19 +524,23 @@ function alertFailure(error: unknown, trace: OperationTrace, dryRun = false): Ht
   { alert_stage: trace.failed_stage ?? 'alerts' });
 }
 
-export async function retractAlertEntry(bucket: ContentBucket, alertId: string, entryId: string, owner: string, now = new Date(), context?: OperationContext, beforeCommit?: () => Promise<void>, dryRun = false): Promise<AlertMutationResult> {
+export async function retractAlertEntry(bucket: ContentBucket, alertId: string, entryId: string, owner: string, now = new Date(), context?: OperationContext, beforeCommit?: () => Promise<void>, dryRun = false, history: HistoryMode = 'full'): Promise<AlertMutationResult> {
   const trace = new OperationTrace(context);
   try {
     const manifest = await trace.run('alert_manifest_loading', () => loadAlertManifest(bucket));
     const ref = manifest.alerts.find(ref => ref.alert_id === alertId);
     if (!ref) throw new HttpError(404, 'Alert not found.', {}, { code: 'alert_not_found' });
-    const value = await trace.run('alert_revision_loading', () => loadAlertRecord(bucket, ref));
+    let value = await trace.run('alert_revision_loading', () => loadAlertRecord(bucket, ref, 'coalesced'));
+    if (!value.entries.some(entry => entry.entry_id === entryId)) {
+      if (manifest.receipts.some(receipt => receipt.entry_id === entryId && receipt.alert_id === alertId && receipt.kind === 'confirmation')) throw new HttpError(403, 'Confirmations cannot be retracted.', {}, { code: 'confirmation_not_retractable' });
+      value = await responseRecord(bucket, value, 'full');
+    }
     const entry = value.entries.find(entry => entry.entry_id === entryId);
     if (!entry) throw new HttpError(404, 'Alert entry not found.', {}, { code: 'alert_entry_not_found' });
     if (entry.entry_type === 'confirmation') throw new HttpError(403, 'Confirmations cannot be retracted. Submit a corrective observation.', {}, { code: 'confirmation_not_retractable' });
     if (entry.publisher_fingerprint !== owner) throw new HttpError(403, 'Retraction requires the original publishing token.', {}, { code: 'retract_forbidden' });
     const preview = dryRun ? { dry_run: true as const, committed: false as const, checked_at: now.toISOString() } : {};
-    if (value.retractions.some(change => change.entry_id === entryId)) return { ...mutationResult(value, entry, 'already_retracted', now), ...preview };
+    if (value.retractions.some(change => change.entry_id === entryId)) return { ...mutationResult(await responseRecord(bucket, value, history), entry, 'already_retracted', now), ...preview };
     if (now.getTime() - Date.parse(entry.received_at) >= ALERT_DAY) throw new HttpError(403, 'The entry retraction window has expired.', {}, { code: 'retract_window_expired' });
     const next = { ...value, retractions: [...value.retractions, { entry_id: entryId, retracted_at: now.toISOString() }] };
     const effective = deriveAlert(next, now);
@@ -524,11 +548,12 @@ export async function retractAlertEntry(bucket: ContentBucket, alertId: string, 
       try { validateEffective(effective); }
       catch { throw new HttpError(409, 'Later entries depend on this change. Correct their fields before retracting it.', {}, { code: 'retraction_dependency_conflict' }); }
     }
+    const response = await responseRecord(bucket, next, history);
     if (!dryRun) {
       if (beforeCommit) await trace.run('alert_homepage_intent', beforeCommit);
       await commitRecord(bucket, manifest, next, now, trace);
     }
-    return { ...mutationResult(next, entry, 'retracted', now), ...preview };
+    return { ...mutationResult(response, entry, 'retracted', now), ...preview };
   } catch (error) { throw alertFailure(error, trace, dryRun); }
 }
 

@@ -1,3 +1,4 @@
+import { asHttpError } from '../src/errors';
 import { env } from 'cloudflare:workers';
 import { reset, runInDurableObject } from 'cloudflare:test';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -139,4 +140,33 @@ it('recovers pending homepage composition on an unchanged confirmation retry', a
       const retry = await instance.confirmAlertsV1([input]); expect(retry.ok).toBe(true); expect(retry.result.counts.duplicates).toBe(1); expect(await state.storage.get('conditions:pending')).toBeUndefined();
     } finally { instance.env = original; }
   });
+});
+
+it('preserves transient nested storage errors and isolates damaged alert roots', async () => {
+  const a = await open(); const b = await open(); await confirmAlerts(bucket, [check(a.alert_id)], later(1));
+  const manifest = await (await bucket.get((await (await bucket.get(ALERTS_KEY))!.json<any>()).snapshot))!.json<any>();
+  const ref = manifest.alerts.find((ref: any) => ref.alert_id === a.alert_id);
+  const root = await (await bucket.get(ref.key))!.json<any>();
+  const transient = wrap({ get: key => { if (key === root.base) throw new Error('transient'); return bucket.get(key); } });
+  await expect(readAlerts(transient, new URLSearchParams(), 'key', later(2), a.alert_id).catch(error => { throw asHttpError(error); })).rejects.toMatchObject({ code: 'storage_error', retryable: true });
+  const damaged = wrap({ get: key => key === ref.key ? Promise.resolve(null) : bucket.get(key) });
+  const result = await confirmAlerts(damaged, [check(a.alert_id, 2), check(b.alert_id, 2)], later(2));
+  expect(result.counts).toMatchObject({ failed: 1, confirmed: 1 });
+  expect(result.items[0]).toMatchObject({ ok: false, code: 'source_damaged' });
+});
+it('coalesces mutation replies without reading confirmation payloads and still forbids old confirmation targets', async () => {
+  const a = await open(); const first = await confirmAlerts(bucket, [check(a.alert_id)], later(1));
+  await confirmAlerts(bucket, [check(a.alert_id, 2)], later(2));
+  const store = wrap({ get: key => { if (key.startsWith('alerts/confirmations/')) throw new Error('Must not expand'); return bucket.get(key); } });
+  const update = validateAlertInput({ ...check(a.alert_id, 3), phase: 'update', detail: 'Changed' });
+  const result = await submitAlert(store, update, owner, later(3), undefined, false, undefined, 'coalesced');
+  expect(result.alert.history).toHaveLength(3); expect(result.alert.history[1].confirmation_run?.count).toBe(2);
+  await expect(retractAlertEntry(store, a.alert_id, (first.items[0] as any).entry_id, owner, later(4), undefined, undefined, false, 'coalesced')).rejects.toMatchObject({ code: 'confirmation_not_retractable' });
+  const undone = await retractAlertEntry(store, a.alert_id, result.entry_id, owner, later(4), undefined, undefined, true, 'coalesced');
+  expect(undone.alert.detail).toBeUndefined(); expect(undone.committed).toBe(false);
+});
+it('never marks expired alerts as upcoming', async () => {
+  const a = await open({ starts_at: later(72).toISOString() });
+  const result = await readAlerts(bucket, new URLSearchParams('fields=index'), 'key', later(25), a.alert_id) as AlertReadResult;
+  expect(result.alert).toMatchObject({ state: 'expired-unconfirmed', upcoming: false });
 });
