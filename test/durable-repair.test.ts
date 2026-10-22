@@ -119,7 +119,7 @@ it.each(['preparation_ack', 'index_ack', 'activation', 'activation_ack', 'result
       const response = await request(input); expect(response.status).toBe(503);
       failed = await response.json<any>();
       expect(failed).toMatchObject({ code: 'repair_pending', retryable: true,
-        publication_status: ['preparation_ack', 'index_ack'].includes(fault) ? 'unknown' : 'committed',
+        publication_status: fault === 'preparation_ack' ? 'not_committed' : fault === 'index_ack' ? 'unknown' : 'committed',
         details: { repair_id: expect.any(String), job_id: expect.any(String) }, retry_at: expect.any(String) });
     } finally { spies.forEach(spy => spy.mockRestore()); }
   });
@@ -308,4 +308,47 @@ it('rejects deletion between snapshot selection and repair write without recreat
   expect((await request()).status).toBe(404);
   await runDurableObjectAlarm(publisher());
   expect(await bindings.SITE_BUCKET.head('pages/index.html')).toBeNull();
+});
+
+it('stalls after ten failures, keeps status reads pure, and requires guarded explicit recovery', async () => {
+  const { input } = await seed(); let result: any;
+  await inside(publisher(), async (instance, state) => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const fail = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') throw new Error('offline'); return put(key, ...args); });
+    try { for (let i = 0; i < 10; i++) result = await instance.publicationRepairV1(input, origin); }
+    finally { fail.mockRestore(); }
+    expect(result).toMatchObject({ ok: false, failure: { code: 'repair_stalled', retryable: false } });
+    expect(await state.storage.getAlarm()).toBeNull();
+    const recordKey = await state.storage.get<string>('publication_repair_pending');
+    const saved = await state.storage.get<any>(recordKey!);
+    const read = await instance.jobStatus(saved.job.id); expect(read).toBeNull();
+    expect(await state.storage.get(recordKey!)).toEqual(saved);
+  });
+  const inspected = await (await request()).json<any>();
+  expect(inspected.recovery).toMatchObject({ state: 'stalled', attempts: 10, publication_status: 'unknown' });
+  const payload = { expected_version: inspected.publication.version, expected_recovery_token: inspected.recovery.recovery_token };
+  expect((await request(payload, '/cancel')).status).toBe(409);
+  const resumed = await request(payload, '/resume'); expect(resumed.status).toBe(200);
+  expect((await resumed.json<any>()).recovery).toMatchObject({ state: 'pending', attempts: 0 });
+  expect((await request(payload, '/resume')).status).toBe(409);
+  await advanceRecovery();
+  expect((await (await request()).json<any>()).recovery).toBeNull();
+  expect(await publisher().jobStatus(inspected.recovery.job_id)).toMatchObject({ status: 'completed' });
+});
+it('inspects damaged journals without triggering writes and never force-cancels them', async () => {
+  await seed();
+  await inside(publisher(), async (_instance, state) => { await state.storage.put('publication_repair_pending', 'missing-journal'); await state.storage.deleteAlarm(); });
+  const inspected = await (await request()).json<any>(); expect(inspected.recovery).toMatchObject({ state: 'damaged', publication_status: 'unknown' });
+  const cancelled = await request({ expected_version: inspected.publication.version, expected_recovery_token: inspected.recovery.recovery_token }, '/cancel');
+  expect(await cancelled.json()).toMatchObject({ code: 'repair_journal_damaged', retryable: false });
+});
+it('never attributes a blocking repair commit to a different request', async () => {
+  const { input } = await seed();
+  await inside(publisher(), async instance => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const fail = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') throw new Error('offline'); return put(key, ...args); });
+    try { await instance.publicationRepairV1(input, origin); } finally { fail.mockRestore(); }
+  });
+  const other = await request({ ...input, manifest: `publications/${crypto.randomUUID()}.json` });
+  expect(await other.json()).toMatchObject({ code: 'repair_blocked', publication_status: 'not_committed', details: { blocking_repair: { repair_id: expect.any(String) } } });
 });

@@ -21,6 +21,7 @@ export function errorSuggestion(code: string, retryable: boolean, dryRun = false
       ? 'Read alert history or retry the same retraction promptly with its original token.'
       : 'Look up the exact client_ref or retry the unchanged submission within its original 30 Los Angeles receipt-date reference window.', method: 'GET', path: '/api/alerts' };
   }
+  if (['repair_blocked', 'repair_stalled', 'repair_journal_damaged', 'unsafe_repair_cancellation', 'repair_recovery_changed'].includes(code)) return { action: 'inspect_repair', message: 'Inspect publication repair recovery. Resume only after correcting its cause; unknown writes cannot be force-cancelled.', method: 'GET', path: '/api/publication/repair' };
   if (code === 'repair_pending') return { action: 'retry_unchanged', message: 'Retry the identical repair request after retry_at to recover its result and regeneration job.' };
   if (code === 'publication_conflict') return { action: 'retry_unchanged', message: 'Retry the unchanged request after retry_at or Retry-After.' };
   if (code === 'publication_changed') return { action: 'refresh_publication', message: 'Read GET /api/publication/repair and review the current version before submitting a repair.', method: 'GET', path: '/api/publication/repair' };

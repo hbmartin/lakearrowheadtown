@@ -219,6 +219,18 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (!received.ok) throw failureError(received.failure);
       return reply({ ok: true, ...received.result });
     }
+    const repairControl = /^\/api\/publication\/repair\/(resume|cancel)$/.exec(path);
+    if (repairControl) {
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
+      const input = parseDigestJson(await readLimited(request, 16384));
+      if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json');
+      const publisher = await publisherFor(env, trace);
+      const result: unknown = await boundary('rpc', () => publisher.publicationRepairControlV1(repairControl[1] as 'resume' | 'cancel', input, context));
+      if (!isRepairReply(result)) throw new OperationFailure('rpc', new Error('Invalid repair response'));
+      if (!result.ok) throw failureError(result.failure);
+      return reply({ ok: true, ...result.result });
+    }
     if (path === '/api/publication/repair') {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       if (!['GET', 'HEAD', 'POST'].includes(request.method)) throw new HttpError(405, 'Method not allowed', { Allow: 'GET, HEAD, POST' });
@@ -444,7 +456,7 @@ function routeFor(path: string, method: string): { route: string; operation: str
   if (/^\/api\/alerts\/[^/]+$/.test(path)) return { route: '/api/alerts/:id', operation: 'alerts_read' };
   if (path === '/api/alerts') return { route: path, operation: ['GET', 'HEAD'].includes(method) ? 'alerts_read' : 'alert' };
   if (/^\/api\/alerts\/[^/]+\/entries\/[^/]+\/retract$/.test(path)) return { route: '/api/alerts/:id/entries/:entry/retract', operation: 'alert_retract' };
-  if (path === '/api/publication/repair') return { route: path, operation: 'publication_repair' };
+  if (/^\/api\/publication\/repair(?:\/(?:resume|cancel))?$/.test(path)) return { route: path, operation: 'publication_repair' };
   if (path === '/api/digests') return { route: path, operation: 'digest' };
   if (path === '/api/images') return { route: path, operation: 'image' };
   if (path === '/api/posts') return { route: path, operation: 'posts_read' };

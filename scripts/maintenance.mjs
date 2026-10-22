@@ -75,7 +75,7 @@ export async function repairAndFollow(environment, file, options = {}) {
     return left;
   };
   const pause = async retryAt => {
-    const delay = Math.min(30000, Math.max(1000, Date.parse(retryAt) - Date.now() || Math.min(30000, 2 ** Math.min(attempts++, 5) * 1000)));
+    const delay = Math.min(30000, Math.max(1000, (Date.parse(retryAt) > Date.now() ? Date.parse(retryAt) - Date.now() : Math.min(30000, 2 ** Math.min(attempts++, 5) * 1000))));
     await wait(Math.min(delay, remaining()));
     remaining();
   };
@@ -92,6 +92,7 @@ export async function repairAndFollow(environment, file, options = {}) {
       await pause(error.retryAt);
     }
   }
+  attempts = 0;
   jobId = result.job?.id;
   options.onProgress?.(result);
   while (result.job && !['completed', 'failed'].includes(result.job.status) && !result.job.blocked_by) {

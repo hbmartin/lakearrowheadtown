@@ -9,7 +9,7 @@ import { alertRpcFailure, confirmAlerts, readAlerts, retractAlertEntry, submitAl
 import { readPosts, type PostsReply } from './posts';
 import { publishEvents, readEvents, type EventDigest, type EventsReply } from './events';
 import { validateRepair, type RepairReply } from './publication-repair';
-import { RepairCoordinator, restartRebuild } from './repair-coordinator';
+import { RepairCoordinator, restartRebuild, newRebuild } from './repair-coordinator';
 import { composeHomepageConditions } from './homepage-conditions';
 import { validateWeather, WEATHER_KEY, WEATHER_URL } from './weather';
 import { readLimited } from './validation';
@@ -38,7 +38,7 @@ export class DigestPublisher extends DurableObject<Env> {
   private async finishConditions(origin = this.conditionsOrigin(), context?: OperationContext): Promise<void> {
     try {
       if (!await this.ctx.storage.get('conditions:pending')) return;
-      await this.repairCoordinator().recover(new OperationTrace(context));
+      await this.repairCoordinator().gate(context);
       await composeHomepageConditions(this.env.SITE_BUCKET, origin);
       await this.ctx.storage.delete('conditions:pending');
       emit('conditions_composed', context, {});
@@ -109,7 +109,7 @@ export class DigestPublisher extends DurableObject<Env> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
-        await this.repairCoordinator().recover(new OperationTrace(context));
+        if (operation !== 'preview') await this.repairCoordinator().gate(context);
         const migration = await new OperationTrace(context).run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
         let snapshot: CommittedSnapshot | undefined;
         // Internal publishing helpers may bootstrap a new bucket; only persisted
@@ -124,7 +124,7 @@ export class DigestPublisher extends DurableObject<Env> {
         }
         return { ok: true, result: await action(migration?.complete, context, snapshot) };
       } catch (error) {
-        const stage = error instanceof PublicationError ? error.stage : 'migration_state';
+        const stage = error instanceof PublicationError ? error.stage : asHttpError(error).code === 'repair_blocked' ? 'repair_recovery' : 'migration_state';
         const publication_status = operation === 'preview' ? 'not_attempted' : error instanceof PublicationError ? error.publication_status : 'not_committed';
         const cause = error instanceof PublicationError ? error.cause : error;
         const failure = operation === 'preview' ? { ...publicationFailure(cause, stage, publication_status), error: asHttpError(cause).message } : publicationFailure(cause, stage, publication_status, operation);
@@ -244,8 +244,7 @@ export class DigestPublisher extends DurableObject<Env> {
       }
       const migration = await boundary('storage', () => this.ctx.storage.get<Migration>('migration')) ?? initialMigration();
       const id = crypto.randomUUID();
-      return { id, origin, status: 'queued', phase: migration.complete ? 'render' : 'migration', processed: migration.processed,
-        created_at: new Date().toISOString(), ...(context ? { context: { ...context, job_id: id } } : {}) };
+      return newRebuild(id, origin, migration, context);
     });
   }
 
@@ -271,6 +270,15 @@ export class DigestPublisher extends DurableObject<Env> {
     };
     // Inspection pins its own R2 HEAD and must not wait for rendering or writes.
     return input === undefined ? action() : this.serialize(action, context);
+  }
+
+  async publicationRepairControlV1(action: 'resume' | 'cancel', input: unknown, context?: OperationContext): Promise<RepairReply> {
+    context = this.executingContext(context);
+    return this.serialize(async () => {
+      const trace = new OperationTrace(context);
+      try { return { ok: true, result: await this.repairCoordinator().control(action, input, trace) }; }
+      catch (error) { const failure = asHttpError(error); return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, details: failure.details, retryable: failure.retryable, stage: trace.failed_stage ?? 'repair_recovery', publication_status: failure.publication_status ?? 'not_attempted' } }; }
+    }, context);
   }
 
   private cursorKey?: Promise<string>;
@@ -341,29 +349,28 @@ export class DigestPublisher extends DurableObject<Env> {
 
   private async enqueueRebuildUnlocked(id: string, origin: string, trace: OperationTrace, context?: OperationContext): Promise<RebuildJob> {
     const migration = await trace.run('rebuild_enqueue_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration'))) ?? initialMigration();
-    const jobContext = context ? { ...context, job_id: id } : undefined;
-    if (jobContext) delete jobContext.candidate_job_id;
-    const job: RebuildJob = { id, origin, status: 'queued', phase: migration.complete ? 'render' : 'migration', processed: migration.processed, created_at: new Date().toISOString(), ...(jobContext ? { context: jobContext } : {}) };
+    const job = newRebuild(id, origin, migration, context);
+    const jobContext = job.context;
     await trace.run('rebuild_enqueue', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
       const ids = await storage.get<string[]>('jobs') ?? [];
       const head = await queueHead(ids, id => storage.get<RebuildJob>(`job:${id}`));
       await storage.put(`job:${job.id}`, job);
       await storage.put('jobs', [...ids, job.id]);
-      if (head.job?.status !== 'failed') await storage.setAlarm(Date.now() + 1000);
+      if (head.job?.status !== 'failed' && !head.job?.manual_resume) await storage.setAlarm(Date.now() + 1000);
     })));
     emit('rebuild_queued', jobContext, { job_id: job.id });
     return job;
   }
 
   async jobStatus(id: string, context?: OperationContext): Promise<RebuildJob | null> {
-    return this.rebuildRequest(context, { job_id: id }, trace => trace.run('rebuild_status_read', async () => {
-      await this.repairCoordinator().recover(trace);
+    const trace = new OperationTrace(this.executingContext(context));
+    return trace.run('rebuild_status_read', async () => {
       const job = await boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`));
       if (!job) return null;
       const ids = await boundary('storage', () => this.ctx.storage.get<string[]>('jobs')) ?? [];
       const head = await queueHead(ids, id => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`)));
       return { ...job, ...(job.status === 'queued' && head.job?.status === 'failed' && head.job.id !== id ? { blocked_by: head.job.id } : {}) };
-    }));
+    });
   }
 
   async resumeRebuild(id: string, context?: OperationContext): Promise<RebuildJob | 'conflict' | null> {
@@ -403,7 +410,7 @@ export class DigestPublisher extends DurableObject<Env> {
     return this.serialize(async () => {
       const bootstrap = new OperationTrace(bootstrapContext);
       try { await this.repairCoordinator().recover(bootstrap, true); }
-      catch (error) { if (asHttpError(error).code === 'repair_pending') return; throw error; }
+      catch (error) { if (['repair_pending', 'repair_stalled'].includes(asHttpError(error).code)) return; throw error; }
       let ids: string[];
       let job: RebuildJob | null | undefined;
       try {
@@ -418,7 +425,7 @@ export class DigestPublisher extends DurableObject<Env> {
         // Leave recovery to bounded platform redelivery, then manual resume.
         throw error;
       }
-      if (!job || job.status === 'failed') return;
+      if (!job || job.status === 'failed' || job.manual_resume) return;
       if (job.next_retry_at && Date.parse(job.next_retry_at) > Date.now()) {
         await boundary('storage', () => this.ctx.storage.setAlarm(Date.parse(job!.next_retry_at!)));
         return;
