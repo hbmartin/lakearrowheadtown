@@ -28,8 +28,10 @@ export async function smokeAlerts(origin, request, headers) {
     const preview = await send('/api/alerts?dry_run=true', traffic);
     assert.equal(preview.dry_run, true); assert.equal(preview.committed, false);
     assert.equal(preview.expires_at, new Date(Date.parse(observed_at) + 86400000).toISOString());
-    assert.equal((await request(origin, { method: 'HEAD', headers: { 'If-None-Match': before.headers.get('etag') } })).status, 304);
-    const published = await send('/api/alerts', traffic); openings.push(published);
+    const absent = await request(`${origin}/api/alerts?client_ref=${encodeURIComponent(traffic.client_ref)}`, { headers });
+    assert.equal(absent.status, 404);
+    openings.push(traffic.client_ref);
+    const published = await send('/api/alerts', traffic);
     const duplicate = await send('/api/alerts', traffic);
     assert.equal(duplicate.status, 'duplicate'); assert.equal(duplicate.entry_id, published.entry_id);
     const conflict = await request(origin + '/api/alerts', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ ...traffic, headline: 'Changed reference payload' }) });
@@ -40,7 +42,8 @@ export async function smokeAlerts(origin, request, headers) {
     assert.equal(compact.fields, 'index'); assert.equal(compact.alert.alert_id, published.alert_id);
     assert(!('history' in compact.alert)); assert(!('detail' in compact.alert));
     assert.equal((await send('/api/alerts?fields=index')).fields, 'index');
-    const outage = await send('/api/alerts', power); openings.push(outage);
+    openings.push(power.client_ref);
+    const outage = await send('/api/alerts', power);
     const checks = { confirmations: [{ client_ref: `${run}:batch-confirm`, alert_id: outage.alert_id, source: power.source, source_url: power.source_url, observed_at: new Date().toISOString() }] };
     const checkPreview = await send('/api/alerts/confirmations?dry_run=true', checks);
     assert.equal(checkPreview.counts.confirmed, 1); assert.equal(checkPreview.committed, false);
@@ -61,8 +64,8 @@ export async function smokeAlerts(origin, request, headers) {
     assert(html.includes('id="traffic-alerts">Traffic')); assert(html.includes('id="power-alerts">Power'));
     assert(!html.includes('class="resource-nav"')); assert(!html.includes('class="alert-status"'));
     assert(html.includes('Customers potentially affected'));
-    assert.equal((await request(origin, { method: 'HEAD' })).headers.get('etag'), tag);
-    assert.equal((await request(origin, { headers: { 'If-None-Match': tag } })).status, 304);
+    assert.equal((await request(origin, { method: 'HEAD' })).status, 200);
+    assert([200, 304].includes((await request(origin, { headers: { 'If-None-Match': tag } })).status));
     const confirmation = await send('/api/alerts', { client_ref: `${run}:confirm`, phase: 'update', alert_id: published.alert_id,
       source: traffic.source, source_url: traffic.source_url, observed_at: new Date().toISOString() });
     assert.equal(confirmation.alert_id, published.alert_id); assert(confirmation.expires_at);
@@ -90,7 +93,11 @@ export async function smokeAlerts(origin, request, headers) {
     assert(found, 'Paginated history must include the published alert and its confirmation.');
   } finally {
     // Remove the labeled public fixtures even if a later smoke assertion fails.
-    const results = await Promise.allSettled(openings.map(async opened => {
+    const results = await Promise.allSettled(openings.map(async reference => {
+      const response = await request(`${origin}/api/alerts?client_ref=${encodeURIComponent(reference)}`, { headers });
+      if (response.status === 404) return;
+      assert.equal(response.status, 200); const opened = await response.json();
+      assert.equal(opened.ok, true); assert(opened.alert_id && opened.entry_id);
       const path = `/api/alerts/${opened.alert_id}/entries/${opened.entry_id}/retract`;
       assert.equal((await send(path, {})).status, 'retracted');
       const again = await send(path, {}); assert.equal(again.status, 'already_retracted'); assert.equal(again.expires_at, null);

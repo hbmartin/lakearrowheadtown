@@ -172,6 +172,7 @@ export interface Migration {
 export interface ArchiveProgress { completed_days: number; total_days: number }
 
 export interface RebuildJob {
+  manual_resume?: boolean;
   id: string;
   origin: string;
   status: 'queued' | 'running' | 'completed' | 'failed';

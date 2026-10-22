@@ -10,7 +10,8 @@ import type { ContentBucket, PublishFailure, RebuildJob } from './types';
 export interface RepairPointers { manifest: string; rss: string; archives: string | null }
 export interface RepairInput extends RepairPointers { expected_version: string }
 export interface PublicationHead { version: string; manifest: string | null; rss: string | null; archives: string | null }
-export interface RepairResult { publication: PublicationHead; unchanged: boolean; repair_id?: string; job?: RebuildJob }
+export interface RecoverySummary { state: 'pending' | 'stalled' | 'damaged'; recovery_token: string; publication_status: import('./types').PublicationStatus; attempts: number; repair_id?: string; job_id?: string; next_retry_at?: string; last_error?: { code: string; stage: string; retryable: boolean } }
+export interface RepairResult { recovery?: RecoverySummary | null; publication: PublicationHead; unchanged: boolean; repair_id?: string; job?: RebuildJob }
 export type RepairReply = { ok: true; result: RepairResult } | { ok: false; failure: PublishFailure };
 
 export function publicationHead(index: R2Object): PublicationHead {
@@ -31,11 +32,11 @@ export function validateRepair(input: unknown): RepairInput {
   return input as unknown as RepairInput;
 }
 
-export async function validateRepairTargets(bucket: ContentBucket, input: RepairInput): Promise<void> {
+export async function validateRepairTargets(bucket: ContentBucket, input: RepairInput, migrationComplete = true): Promise<void> {
   try {
     const publication = await loadPublication(bucket, input.manifest);
     if ((publication.archives ?? null) !== input.archives) throw new HttpError(400, 'The archive pointer must match the selected manifest.');
-    for await (const { result } of settledInOrder(publication.posts, ref => loadPost(bucket, rebuildReference(ref)))) {
+    for await (const { result } of settledInOrder(publication.posts, async ref => { const canonical = rebuildReference(ref); if (!migrationComplete && canonical.key !== ref.key && !await boundary('storage', () => bucket.head(canonical.key))) return loadPost(bucket, ref); return loadPost(bucket, canonical); })) {
       if (result.status === 'rejected') throw result.reason;
     }
     await loadHistoryIndex(bucket, publication);

@@ -31,6 +31,14 @@ export const metadataKey = (hash: string) => `image-metadata/${hash}.json`;
 export const validImageMetadata = (value: ImageMetadata): boolean => !!value && Number.isSafeInteger(value.width) && value.width > 0
   && Number.isSafeInteger(value.height) && value.height > 0 && ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(value.type);
 
+export async function readImageMetadata(bucket: ContentBucket, hash: string): Promise<ImageMetadata | undefined> {
+  const saved = await boundary('storage', () => bucket.get(metadataKey(hash)));
+  if (!saved) return;
+  const body = await boundary('storage', () => saved.text());
+  let value: ImageMetadata; try { value = JSON.parse(body); } catch { return; }
+  return validImageMetadata(value) ? value : undefined;
+}
+
 export type ImageResolver = (items: StoredItem[]) => Promise<ImageMetadataMap>;
 
 // Share values and admission across staging views, never the views themselves.
@@ -57,13 +65,8 @@ export type ImageResolutionCache = ReturnType<typeof createImageResolutionCache>
 export function createImageResolver(bucket: ContentBucket, origin: string, cache = createImageResolutionCache()): ImageResolver {
   async function read(path: string, hash: string): Promise<ImageMetadata | undefined> {
     const key = metadataKey(hash);
-    const saved = await boundary('storage', () => bucket.get(key));
-    if (saved) {
-      let value: ImageMetadata | undefined;
-      try { value = JSON.parse(await boundary('storage', () => saved.text())); }
-      catch (error) { if (!(error instanceof SyntaxError)) throw error; }
-      if (value && validImageMetadata(value)) return value;
-    }
+    const metadata = await readImageMetadata(bucket, hash);
+    if (metadata) return metadata;
     const object = await boundary('storage', () => bucket.get(path));
     if (!object) return;
     const bytes = new Uint8Array(await boundary('storage', () => object.arrayBuffer()));

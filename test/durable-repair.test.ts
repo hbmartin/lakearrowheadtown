@@ -119,7 +119,7 @@ it.each(['preparation_ack', 'index_ack', 'activation', 'activation_ack', 'result
       const response = await request(input); expect(response.status).toBe(503);
       failed = await response.json<any>();
       expect(failed).toMatchObject({ code: 'repair_pending', retryable: true,
-        publication_status: ['preparation_ack', 'index_ack'].includes(fault) ? 'unknown' : 'committed',
+        publication_status: fault === 'preparation_ack' ? 'not_committed' : fault === 'index_ack' ? 'unknown' : 'committed',
         details: { repair_id: expect.any(String), job_id: expect.any(String) }, retry_at: expect.any(String) });
     } finally { spies.forEach(spy => spy.mockRestore()); }
   });
@@ -308,4 +308,75 @@ it('rejects deletion between snapshot selection and repair write without recreat
   expect((await request()).status).toBe(404);
   await runDurableObjectAlarm(publisher());
   expect(await bindings.SITE_BUCKET.head('pages/index.html')).toBeNull();
+});
+
+it('stalls after ten failures, keeps status reads pure, and requires guarded explicit recovery', async () => {
+  const { input } = await seed(); let result: any;
+  await inside(publisher(), async (instance, state) => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const fail = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') throw new Error('offline'); return put(key, ...args); });
+    try { for (let i = 0; i < 10; i++) result = await instance.publicationRepairV1(input, origin); }
+    finally { fail.mockRestore(); }
+    expect(result).toMatchObject({ ok: false, failure: { code: 'repair_stalled', retryable: false } });
+    expect(await state.storage.getAlarm()).toBeNull();
+    const recordKey = await state.storage.get<string>('publication_repair_pending');
+    const saved = await state.storage.get<any>(recordKey!);
+    const read = await instance.jobStatus(saved.job.id); expect(read).toBeNull();
+    expect(await state.storage.get(recordKey!)).toEqual(saved);
+  });
+  const inspected = await (await request()).json<any>();
+  expect(inspected.recovery).toMatchObject({ state: 'stalled', attempts: 10, publication_status: 'unknown' });
+  const payload = { expected_version: inspected.publication.version, expected_recovery_token: inspected.recovery.recovery_token };
+  expect((await request(payload, '/cancel')).status).toBe(409);
+  const resumed = await request(payload, '/resume'); expect(resumed.status).toBe(200);
+  expect((await resumed.json<any>()).recovery).toMatchObject({ state: 'pending', attempts: 0 });
+  expect((await request(payload, '/resume')).status).toBe(409);
+  await advanceRecovery();
+  expect((await (await request()).json<any>()).recovery).toBeNull();
+  expect(await publisher().jobStatus(inspected.recovery.job_id)).toMatchObject({ status: 'completed' });
+});
+it('inspects damaged journals without triggering writes and never force-cancels them', async () => {
+  await seed();
+  await inside(publisher(), async (_instance, state) => { await state.storage.put('publication_repair_pending', 'missing-journal'); await state.storage.deleteAlarm(); });
+  const inspected = await (await request()).json<any>(); expect(inspected.recovery).toMatchObject({ state: 'damaged', publication_status: 'unknown' });
+  const cancelled = await request({ expected_version: inspected.publication.version, expected_recovery_token: inspected.recovery.recovery_token }, '/cancel');
+  expect(await cancelled.json()).toMatchObject({ code: 'repair_journal_damaged', retryable: false });
+});
+it('never attributes a blocking repair commit to a different request', async () => {
+  const { input } = await seed();
+  await inside(publisher(), async instance => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const fail = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') throw new Error('offline'); return put(key, ...args); });
+    try { await instance.publicationRepairV1(input, origin); } finally { fail.mockRestore(); }
+  });
+  const other = await request({ ...input, manifest: `publications/${crypto.randomUUID()}.json` });
+  expect(await other.json()).toMatchObject({ code: 'repair_blocked', publication_status: 'not_committed', details: { blocking_repair: { repair_id: expect.any(String) } } });
+});
+it('does not revive an unrelated queued rebuild awaiting manual resume', async () => {
+  const { input } = await seed(); const id = crypto.randomUUID();
+  await inside(publisher(), async (_, state) => {
+    await state.storage.put('jobs', [id]); await state.storage.put(`job:${id}`, { id, origin, status: 'running', phase: 'render', processed: 0, created_at: new Date().toISOString() }); await state.storage.deleteAlarm();
+  });
+  const repaired = await (await request(input)).json<any>(); expect(repaired.ok).toBe(true);
+  expect(await publisher().jobStatus(repaired.job.id)).toMatchObject({ status: 'queued', blocked_by: id });
+  await inside(publisher(), async (_, state) => { expect(await state.storage.getAlarm()).toBeNull(); expect(await state.storage.get(`job:${id}`)).toMatchObject({ manual_resume: true }); });
+});
+it('propagates a failed recovery backoff write instead of acknowledging alarm delivery', async () => {
+  const { input } = await seed();
+  await inside(publisher(), async (instance, state) => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const failedPut = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') throw new Error('offline'); return put(key, ...args); });
+    try {
+      await instance.publicationRepairV1(input, origin);
+      const key = (await state.storage.get<string>('publication_repair_pending'))!;
+      const saved = await state.storage.get<any>(key); vi.setSystemTime(new Date(saved.next_retry_at));
+      const transaction = state.storage.transaction.bind(state.storage);
+      const failedSchedule = vi.spyOn(state.storage, 'transaction').mockImplementation(callback => transaction(async storage => callback(new Proxy(storage, { get(target, property) {
+        if (property === 'put') return (name: any, value: any) => { if (value?.attempts === 2) throw new Error('schedule unavailable'); return target.put(name, value); };
+        const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+      } }))));
+      try { await expect(instance.alarm()).rejects.toBeInstanceOf(OperationFailure); }
+      finally { failedSchedule.mockRestore(); }
+    } finally { failedPut.mockRestore(); }
+  });
 });

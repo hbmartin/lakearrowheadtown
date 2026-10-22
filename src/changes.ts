@@ -78,7 +78,18 @@ function observedBucket(bucket: ContentBucket) {
       else active++;
       try {
         if (/^(?:posts\/|post-revisions\/|events\/batches\/|alerts\/(?:revisions|entries|confirmations)\/)/.test(key)) stats.source_reads++;
-        return await bucket.get(key);
+        const object = await bucket.get(key);
+        if (!object) return null;
+        // Keep the slot until the body is consumed, not merely until headers arrive.
+        const bytes = await object.arrayBuffer();
+        return new Proxy(object, { get(target, property) {
+          if (property === 'text') return async () => new TextDecoder().decode(bytes);
+          if (property === 'json') return async () => JSON.parse(new TextDecoder().decode(bytes));
+          if (property === 'arrayBuffer') return async () => bytes.slice(0);
+          if (property === 'body') return new Blob([bytes]).stream();
+          if (property === 'bodyUsed') return false;
+          const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+        } });
       } finally { const next = waiting.shift(); if (next) next(); else active--; }
     },
     head: key => bucket.head(key), list: options => bucket.list(options),

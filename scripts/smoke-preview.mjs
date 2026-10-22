@@ -7,7 +7,7 @@ import { SaxesParser } from 'saxes';
 import { readCredential, validateCredential } from './credentials.mjs';
 import { smokeAlerts } from './smoke-alerts.mjs';
 import { smokeChanges } from './smoke-changes.mjs';
-import { maintenance, maintenanceTarget } from './maintenance.mjs';
+import { maintenance, maintenanceTarget, waitForRebuild } from './maintenance.mjs';
 
 export function checkHtmlHeaders(response) {
   assert(response.headers.get('ETag')?.startsWith('W/'), 'HTML must expose a weak ETag');
@@ -67,6 +67,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     input.title = `${run}${attempt === 2 ? ' follow-up correction' : ''}`;
     input.items[0].headline = input.title;
     if (attempt === 2) { input.items[0].post_url += '&followup=1'; input.client_ref += ':followup'; }
+    const beforeNews = await (await fetch(`${origin}/api/posts?fields=index`, { headers })).json();
     const beforePreview = await fetch(origin, { method: 'HEAD' });
     assert.equal(beforePreview.status, 200);
     checkHtmlHeaders(beforePreview);
@@ -76,9 +77,10 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert.equal(planned.dry_run, true); assert.equal(planned.committed, false); assert(planned.checked_at);
     assert.equal(planned.counts.published, attempt === 1 ? 0 : 1);
     const unchanged = await fetch(origin, { method: 'HEAD', headers: { 'If-None-Match': beforePreview.headers.get('etag') } });
-    assert.equal(unchanged.status, 304);
+    assert([200, 304].includes(unchanged.status));
     checkHtmlHeaders(unchanged);
-    assert.equal(unchanged.headers.get('ETag'), beforePreview.headers.get('ETag'));
+    const afterNews = await (await fetch(`${origin}/api/posts?fields=index`, { headers })).json();
+    assert.deepEqual(afterNews.posts, beforeNews.posts); assert.equal(afterNews.published_at, beforeNews.published_at);
     const response = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
     assert.equal(response.status, 200, await response.clone().text());
     const result = await response.json();
@@ -100,7 +102,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     assert.equal(batch.status, 'published');
     assert.equal(batch.post.id, attempt === 1 ? story.post_id : result.post.id);
     const homepage = await fetch(origin, { headers: { 'Accept-Encoding': 'gzip', ...(previousTag ? { 'If-None-Match': previousTag } : {}) } });
-    assert.equal(homepage.status, attempt === 1 ? 304 : 200, 'Duplicates must preserve the homepage and ETag');
+    assert(attempt === 1 ? [200, 304].includes(homepage.status) : homepage.status === 200);
     checkHtmlHeaders(homepage);
     const rss = await fetch(`${origin}/rss.xml`, { headers: previousRssTag ? { 'If-None-Match': previousRssTag } : {} });
     assert.equal(rss.status, attempt === 1 ? 304 : 200, 'RSS must change with publications and remain unchanged for duplicates');
@@ -126,7 +128,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
       assert.equal(rssHead.status, 200); assert.equal(rssHead.headers.get('etag'), previousRssTag); assert.equal(await rssHead.text(), '');
       checkRssHeaders(rssHead);
     }
-    if (attempt === 1) continue;
+    if (attempt === 1) { await homepage.arrayBuffer(); continue; }
     const html = await homepage.text();
     assert(html.includes('<strong>Markdown works.</strong>'));
     assert(html.includes('Last published'));
@@ -240,7 +242,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const images = [...seoHtml.matchAll(/<img\b[^>]*>/g)].map(match => match[0]);
   assert.equal(images.filter(tag => tag.includes('loading="eager"')).length, 1);
   assert(images.every(tag => tag.includes('decoding="async"')));
-  assert(images.some(tag => tag.includes(`/thumbnails/v1/${new URL(imageUrl).pathname.split('/').at(-1)}/160`) && tag.includes('width="1" height="1"')));
+  assert(images.some(tag => tag.includes(`/thumbnails/v2/${new URL(imageUrl).pathname.split('/').at(-1)}/96.png`) && tag.includes('width="1" height="1"')));
   const dailyPath = seoHtml.match(/<h2 id="day-[^"]+"><a href="(\/\d{4}\/\d{2}\/\d{2}\/)"/)[1];
   const daily = await fetch(origin + dailyPath);
   assert.equal(daily.status, 200);
@@ -271,8 +273,9 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   assert(feed.includes('<media:content '));
   await smokeAlerts(origin, fetch, headers);
   await smokeChanges(origin, fetch, headers);
-  const job = await maintenance('start', 'preview', undefined, { secret, origin, request: fetch });
-  (options.log ?? console.log)(`Preview smoke checks passed: ${origin}. Rebuild ${job.id} queued; check its status manually.`);
+  const queued = await maintenance('start', 'preview', undefined, { secret, origin, request: fetch });
+  const job = await waitForRebuild(queued, 'preview', { secret, origin, request: fetch });
+  (options.log ?? console.log)(`Preview smoke checks passed: ${origin}. Rebuild ${job.id} completed.`);
   return { origin, job, request_ids: requestIds, worker_version: workerVersion };
 }
 

@@ -9,11 +9,11 @@ import { HTML_CACHE } from './publishing';
 import { htmlResponse } from './html-response';
 import { renderPage } from './render';
 import { renderRss, RSS_TYPE } from './rss';
-import { isAlertsReply, validateAlertInput, validateConfirmationBatch } from './alerts';
+import { isAlertsReply, validateAlertInput, validateConfirmationBatch, type HistoryMode } from './alerts';
 import { isPostsReply } from './posts';
 import { isEventsReply, validateEvents, type EventDigest } from './events';
 import { isRepairReply, validateRepair, type RepairInput } from './publication-repair';
-import { publicationOperation } from './operations';
+import { publicationOperation, sourceMutation } from './operations';
 import { errorSuggestion } from './suggestions';
 import { isIndexable, metadataResource } from './public-metadata';
 import type { AppendReply, Digest, Env, OperationContext, PublicationStatus, PublishReply, PublishResult, RebuildJob, StoryUpdate } from './types';
@@ -122,11 +122,21 @@ interface RequestState {
   declared_body_bytes?: number;
   body_sha256?: string;
   body_complete?: boolean;
-  counts?: PublishResult['counts'];
+  counts?: PublishResult['counts'] | { submitted: number; confirmed: number; duplicates: number; failed: number };
   post_id?: string;
   publication_status?: PublicationStatus;
   publication_outcome?: 'repaired' | 'unchanged' | 'published' | 'duplicate' | 'failed' | 'preview' | 'preview_failed' | 'retracted' | 'already_retracted';
   dry_run?: boolean;
+}
+
+async function jsonBytes(request: Request, state: RequestState, limit = 1024 * 1024): Promise<ArrayBuffer> {
+  await state.trace.run('content_type', () => {
+    if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json');
+  });
+  state.bytes_received = 0; state.body_complete = false; state.declared_body_bytes = declaredBodyBytes(request);
+  const bytes = await state.trace.run('body_reading', () => readLimited(request, limit, size => { state.bytes_received = size; }));
+  state.bytes_received = bytes.byteLength; state.body_complete = true; state.body_sha256 = fingerprint(new Uint8Array(bytes));
+  return bytes;
 }
 
 async function handle(request: Request, env: Env, state: RequestState): Promise<Response> {
@@ -153,10 +163,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
       if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
       state.dry_run = query.get('dry_run') === 'true';
-      if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json');
-      state.bytes_received = 0; state.body_complete = false; state.declared_body_bytes = declaredBodyBytes(request);
-      const bytes = await trace.run('body_reading', () => readLimited(request, 1024 * 1024, bytes => { state.bytes_received = bytes; }));
-      state.bytes_received = bytes.byteLength; state.body_complete = true; state.body_sha256 = fingerprint(new Uint8Array(bytes));
+      const bytes = await jsonBytes(request, state);
       const inputs = await trace.run('validation', () => validateConfirmationBatch(parseDigestJson(bytes)));
       const publisher = await publisherFor(env, trace);
       publicationAttempted = !state.dry_run; state.publication_status = state.dry_run ? 'not_attempted' : 'unknown';
@@ -165,8 +172,9 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (!received.ok) throw failureError(received.failure);
       if (!('counts' in received.result) || !('confirmed' in received.result.counts)) throw new OperationFailure('rpc', new Error('Invalid confirmations result'));
       if (state.dry_run && (received.result.dry_run !== true || received.result.committed !== false || !isTimestamp(received.result.checked_at))) throw new OperationFailure('rpc', new Error('Invalid confirmations preview'));
-      state.publication_status = state.dry_run ? 'not_attempted' : received.result.counts.confirmed ? 'committed' : undefined;
-      state.publication_outcome = state.dry_run ? 'preview' : received.result.counts.confirmed ? 'published' : 'duplicate';
+      state.counts = received.result.counts;
+      state.publication_status = state.dry_run || received.result.counts.failed && !received.result.counts.confirmed ? 'not_attempted' : received.result.counts.confirmed ? 'committed' : undefined;
+      state.publication_outcome = state.dry_run ? 'preview' : received.result.counts.confirmed ? 'published' : received.result.counts.failed ? 'failed' : 'duplicate';
       return reply({ ok: true, ...received.result });
     }
     const alertRetraction = /^\/api\/alerts\/([^/]+)\/entries\/([^/]+)\/retract$/.exec(path);
@@ -180,15 +188,11 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
         state.dry_run = query.get('dry_run') === 'true';
       }
+      if (!reading && (query.getAll('history').length > 1 || query.has('history') && !['full', 'coalesced'].includes(query.get('history')!))) throw new HttpError(400, 'history must be full or coalesced.', {}, { code: 'invalid_history' });
+      const history = (query.get('history') ?? 'full') as HistoryMode;
       let payload;
       if (!reading && !alertRetraction) {
-        if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
-        state.dry_run = query.get('dry_run') === 'true';
-        if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, 'Expected application/json');
-        state.bytes_received = 0; state.body_complete = false;
-        state.declared_body_bytes = declaredBodyBytes(request);
-        const bytes = await trace.run('body_reading', () => readLimited(request, 1024 * 1024, bytes => { state.bytes_received = bytes; }));
-        state.bytes_received = bytes.byteLength; state.body_complete = true; state.body_sha256 = fingerprint(new Uint8Array(bytes));
+        const bytes = await jsonBytes(request, state);
         payload = await trace.run('validation', () => validateAlertInput(parseDigestJson(bytes)));
       }
       const publisher = await publisherFor(env, trace);
@@ -196,8 +200,8 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (!reading) state.publication_status = state.dry_run ? 'not_attempted' : 'unknown';
       const received: unknown = await trace.run('alerts_rpc', () => boundary('rpc', async () => reading
         ? await publisher.readAlertsV1(query.toString(), context, alertRead?.[1])
-        : alertRetraction ? await publisher.retractAlertEntryV1(alertRetraction[1], alertRetraction[2], fingerprint(env.API_SECRET!), context, state.dry_run)
-        : await publisher.submitAlertV1(payload!, fingerprint(env.API_SECRET!), context, state.dry_run)));
+        : alertRetraction ? await publisher.retractAlertEntryV1(alertRetraction[1], alertRetraction[2], fingerprint(env.API_SECRET!), context, state.dry_run, history)
+        : await publisher.submitAlertV1(payload!, fingerprint(env.API_SECRET!), context, state.dry_run, history)));
       if (!isAlertsReply(received)) throw new OperationFailure('rpc', new Error('Invalid alerts reply'));
       if (!received.ok) {
         throw failureError(received.failure);
@@ -218,6 +222,17 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       if (!isEventsReply(received)) throw new OperationFailure('rpc', new Error('Invalid events reply'));
       if (!received.ok) throw failureError(received.failure);
       return reply({ ok: true, ...received.result });
+    }
+    const repairControl = /^\/api\/publication\/repair\/(resume|cancel)$/.exec(path);
+    if (repairControl) {
+      await trace.run('authentication', () => authenticate(request, env.API_SECRET));
+      if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: 'POST' });
+      const input = parseDigestJson(await jsonBytes(request, state, 16384));
+      const publisher = await publisherFor(env, trace);
+      const result: unknown = await boundary('rpc', () => publisher.publicationRepairControlV1(repairControl[1] as 'resume' | 'cancel', input, context));
+      if (!isRepairReply(result)) throw new OperationFailure('rpc', new Error('Invalid repair response'));
+      if (!result.ok) throw failureError(result.failure);
+      return reply({ ok: true, ...result.result });
     }
     if (path === '/api/publication/repair') {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
@@ -412,11 +427,11 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     let failure = asHttpError(error);
     const detailStage = !Array.isArray(failure.details) && typeof failure.details.stage === 'string' ? failure.details.stage : undefined;
     const stage = failure.stage ?? detailStage ?? trace.failed_stage ?? trace.stage ?? 'request_processing';
-    if (publicationOperation(context.operation) || ['alert', 'alert_retract', 'alert_confirm', 'event'].includes(context.operation) || context.operation === 'publication_repair') {
+    if (sourceMutation(context.operation) || context.operation === 'publication_repair') {
       state.publication_status = failure.publication_status ?? state.publication_status ?? 'not_attempted';
       state.publication_outcome = state.dry_run ? 'preview_failed' : 'failed';
       if (state.dry_run) state.publication_status = 'not_attempted';
-      if (publicationAttempted && (publicationOperation(context.operation) || ['alert', 'alert_retract', 'alert_confirm', 'event'].includes(context.operation))) {
+      if (publicationAttempted && (sourceMutation(context.operation))) {
         const f = publicationFailure(error, stage, state.publication_status, context.operation);
         failure = new HttpError(f.status, f.error, failure.headers, { code: f.code, details: failure.details, details_truncated: failure.details_truncated, retryable: f.retryable, publication_status: f.publication_status, retry_at: f.retry_at });
       }
@@ -433,18 +448,18 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     }
     if (!isApi) return json({ ok: false, error: failure.message }, failure.status, failure.headers);
     return reply({ ok: false, error: failure.message, message: failure.message, suggestion: errorSuggestion(failure.code, failure.retryable, state.dry_run, context.operation, state.publication_status), code: failure.code, retryable: failure.retryable, details: failure.details, details_truncated: failure.details_truncated,
-      diagnostics, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}), ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(publicationOperation(context.operation) || ['alert', 'alert_retract', 'alert_confirm', 'event'].includes(context.operation) || context.operation === 'publication_repair' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
+      diagnostics, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}), ...(state.dry_run ? { dry_run: true, committed: false } : {}), ...(sourceMutation(context.operation) || context.operation === 'publication_repair' ? { publication_status: state.publication_status } : {}) }, failure.status, failure.headers);
   }
 }
 
-function routeFor(path: string): { route: string; operation: string } {
+function routeFor(path: string, method: string): { route: string; operation: string } {
   if (path === '/api/changes') return { route: path, operation: 'changes_read' };
-  if (path === '/api/events') return { route: path, operation: 'event' };
+  if (path === '/api/events') return { route: path, operation: ['GET', 'HEAD'].includes(method) ? 'events_read' : 'event' };
   if (path === '/api/alerts/confirmations') return { route: path, operation: 'alert_confirm' };
   if (/^\/api\/alerts\/[^/]+$/.test(path)) return { route: '/api/alerts/:id', operation: 'alerts_read' };
-  if (path === '/api/alerts') return { route: path, operation: 'alert' };
+  if (path === '/api/alerts') return { route: path, operation: ['GET', 'HEAD'].includes(method) ? 'alerts_read' : 'alert' };
   if (/^\/api\/alerts\/[^/]+\/entries\/[^/]+\/retract$/.test(path)) return { route: '/api/alerts/:id/entries/:entry/retract', operation: 'alert_retract' };
-  if (path === '/api/publication/repair') return { route: path, operation: 'publication_repair' };
+  if (/^\/api\/publication\/repair(?:\/(?:resume|cancel))?$/.test(path)) return { route: path, operation: 'publication_repair' };
   if (path === '/api/digests') return { route: path, operation: 'digest' };
   if (path === '/api/images') return { route: path, operation: 'image' };
   if (path === '/api/posts') return { route: path, operation: 'posts_read' };
@@ -464,7 +479,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const started = performance.now();
     const path = new URL(request.url).pathname;
-    const route = routeFor(path);
+    const route = routeFor(path, request.method);
     const ray = request.headers.get('cf-ray');
     const context: OperationContext = { request_id: crypto.randomUUID(), worker_version: env.CF_VERSION_METADATA?.id ?? 'local', environment: env.ENVIRONMENT ?? 'local', operation: route.operation,
       ...(ray && /^[a-f0-9]{16,32}(?:-[A-Z]{3})?$/.test(ray) ? { cf_ray: ray } : {}) };

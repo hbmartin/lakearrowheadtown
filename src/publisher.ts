@@ -5,11 +5,11 @@ import { findBatch, loadHistoryIndex } from './history-index';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { committedSnapshot, requireCommittedManifest, type CommittedSnapshot } from './committed';
 import { asHttpError, boundary, HttpError, publicationFailure } from './errors';
-import { alertRpcFailure, confirmAlerts, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type AlertsReply } from './alerts';
+import { alertRpcFailure, confirmAlerts, readAlerts, retractAlertEntry, submitAlert, type AlertInput, type HistoryMode, type AlertsReply } from './alerts';
 import { readPosts, type PostsReply } from './posts';
 import { publishEvents, readEvents, type EventDigest, type EventsReply } from './events';
 import { validateRepair, type RepairReply } from './publication-repair';
-import { RepairCoordinator, restartRebuild } from './repair-coordinator';
+import { RepairCoordinator, restartRebuild, newRebuild } from './repair-coordinator';
 import { composeHomepageConditions } from './homepage-conditions';
 import { validateWeather, WEATHER_KEY, WEATHER_URL } from './weather';
 import { readLimited } from './validation';
@@ -37,9 +37,10 @@ export class DigestPublisher extends DurableObject<Env> {
 
   private async finishConditions(origin = this.conditionsOrigin(), context?: OperationContext): Promise<void> {
     try {
-      if (!await this.ctx.storage.get('conditions:pending')) return;
-      await this.repairCoordinator().recover(new OperationTrace(context));
-      await composeHomepageConditions(this.env.SITE_BUCKET, origin);
+      if (!await this.ctx.storage.get('conditions:pending') && (await boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')))?.customMetadata?.conditions_status !== 'unavailable') return;
+      await this.repairCoordinator().gate(context);
+      const available = await composeHomepageConditions(this.env.SITE_BUCKET, origin, context);
+      if (!available) { await this.ctx.storage.put('conditions:pending', true); emit('conditions_unavailable', context, {}, 'error'); return; }
       await this.ctx.storage.delete('conditions:pending');
       emit('conditions_composed', context, {});
     } catch (error) {
@@ -51,33 +52,41 @@ export class DigestPublisher extends DurableObject<Env> {
 
   async pullWeatherV1(origin = this.conditionsOrigin()): Promise<void> {
     const context: OperationContext = { request_id: crypto.randomUUID(), operation: 'weather_pull', worker_version: this.env.CF_VERSION_METADATA?.id ?? 'local', environment: this.env.ENVIRONMENT ?? 'local' };
-    return this.serialize(async () => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
+    const parse = (body: string | null) => { try { return body ? validateWeather(JSON.parse(body)) : null; } catch { return null; } };
+    const read = async () => { const object = await boundary('storage', () => this.env.SITE_BUCKET.get(WEATHER_KEY)); return object ? boundary('storage', () => object.text()) : null; };
+    let candidate: { body: string; weather: ReturnType<typeof validateWeather>; etag: string | null } | undefined;
+    const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const prior = parse(await read());
+      const etag = prior ? await boundary('storage', () => this.ctx.storage.get<string>('weather:etag')) : undefined;
+      const response = await fetch(WEATHER_URL, { headers: etag ? { 'If-None-Match': etag } : {}, signal: controller.signal });
+      if (response.status !== 304) {
+        if (!response.ok) throw new Error('Upstream weather request failed');
+        const length = response.headers.get('Content-Length');
+        const headers = length ? { 'Content-Length': length } : undefined;
+        const bytes = await readLimited(new Request(WEATHER_URL, { method: 'POST', body: response.body, headers }), 128 * 1024);
+        const weather = validateWeather(JSON.parse(new TextDecoder().decode(bytes)));
+        if (Date.parse(weather.published_at) > Date.now() + 300_000) throw new Error('Weather publication is ahead of the clock');
+        candidate = { body: JSON.stringify(weather), weather, etag: response.headers.get('etag') };
+      }
+    } catch (error) { emit('weather_pull_failed', context, { ...safeError(error) }, 'error'); }
+    finally { clearTimeout(timer); }
+    await this.serialize(async () => {
       try {
-        const etag = await this.ctx.storage.get<string>('weather:etag');
-        const response = await fetch(WEATHER_URL, { headers: etag ? { 'If-None-Match': etag } : {}, signal: controller.signal });
-        if (response.status !== 304) {
-          if (!response.ok) throw new Error(`Open Sun HTTP ${response.status}`);
-          const bytes = await readLimited(new Request(WEATHER_URL, { method: 'POST', body: response.body }), 128 * 1024);
-          const weather = validateWeather(JSON.parse(new TextDecoder().decode(bytes)));
-          if (Date.parse(weather.published_at) > Date.now() + 300_000) throw new Error('Open Sun publication is ahead of the clock');
-          const previous = await this.env.SITE_BUCKET.get(WEATHER_KEY);
-          const body = JSON.stringify(weather);
-          const priorBody = previous ? await previous.text() : null;
-          if (priorBody !== body) {
-            if (priorBody && Date.parse(weather.published_at) < Date.parse(validateWeather(JSON.parse(priorBody)).published_at)) throw new Error('Open Sun publication went backwards');
-            await this.ctx.storage.put('conditions:pending', true);
-            await this.env.SITE_BUCKET.put(WEATHER_KEY, body, { httpMetadata: { contentType: 'application/json' } });
+        if (candidate) {
+          const priorBody = await read(); const prior = parse(priorBody);
+          if (prior && Date.parse(prior.published_at) > Date.parse(candidate.weather.published_at)) {
+            emit('weather_pull', context, { changed: false, discarded_stale: true });
+          } else {
+            if (priorBody !== candidate.body) {
+              await this.ctx.storage.put('conditions:pending', true);
+              await boundary('storage', () => this.env.SITE_BUCKET.put(WEATHER_KEY, candidate!.body, { httpMetadata: { contentType: 'application/json' } }));
+            }
+            if (candidate.etag) await this.ctx.storage.put('weather:etag', candidate.etag); else await this.ctx.storage.delete('weather:etag');
+            emit('weather_pull', context, { changed: priorBody !== candidate.body, published_at: candidate.weather.published_at });
           }
-          const nextEtag = response.headers.get('etag');
-          if (nextEtag) await this.ctx.storage.put('weather:etag', nextEtag);
-          else await this.ctx.storage.delete('weather:etag');
-          emit('weather_pull', context, { changed: priorBody !== body, published_at: weather.published_at });
         }
-      } catch (error) {
-        emit('weather_pull_failed', context, { ...safeError(error) }, 'error');
-      } finally { clearTimeout(timer); }
+      } catch (error) { emit('weather_pull_failed', context, { ...safeError(error) }, 'error'); }
       await this.finishConditions(origin, context);
     }, context);
   }
@@ -109,7 +118,7 @@ export class DigestPublisher extends DurableObject<Env> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
-        await this.repairCoordinator().recover(new OperationTrace(context));
+        if (operation !== 'preview') await this.repairCoordinator().gate(context);
         const migration = await new OperationTrace(context).run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
         let snapshot: CommittedSnapshot | undefined;
         // Internal publishing helpers may bootstrap a new bucket; only persisted
@@ -124,7 +133,7 @@ export class DigestPublisher extends DurableObject<Env> {
         }
         return { ok: true, result: await action(migration?.complete, context, snapshot) };
       } catch (error) {
-        const stage = error instanceof PublicationError ? error.stage : 'migration_state';
+        const stage = error instanceof PublicationError ? error.stage : asHttpError(error).code === 'repair_blocked' ? 'repair_recovery' : 'migration_state';
         const publication_status = operation === 'preview' ? 'not_attempted' : error instanceof PublicationError ? error.publication_status : 'not_committed';
         const cause = error instanceof PublicationError ? error.cause : error;
         const failure = operation === 'preview' ? { ...publicationFailure(cause, stage, publication_status), error: asHttpError(cause).message } : publicationFailure(cause, stage, publication_status, operation);
@@ -156,12 +165,12 @@ export class DigestPublisher extends DurableObject<Env> {
     }
   }
 
-  async submitAlertV1(input: AlertInput, owner: string, context?: OperationContext, dryRun = false): Promise<AlertsReply> {
+  async submitAlertV1(input: AlertInput, owner: string, context?: OperationContext, dryRun = false, history: HistoryMode = 'full'): Promise<AlertsReply> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
         const result = await submitAlert(this.env.SITE_BUCKET, input, owner, new Date(), context, dryRun,
-          () => this.ctx.storage.put('conditions:pending', true));
+          () => this.ctx.storage.put('conditions:pending', true), history);
         if (!dryRun) await this.finishConditions(undefined, context);
         return { ok: true, result };
       }
@@ -169,12 +178,12 @@ export class DigestPublisher extends DurableObject<Env> {
     }, context);
   }
 
-  async retractAlertEntryV1(alertId: string, entryId: string, owner: string, context?: OperationContext, dryRun = false): Promise<AlertsReply> {
+  async retractAlertEntryV1(alertId: string, entryId: string, owner: string, context?: OperationContext, dryRun = false, history: HistoryMode = 'full'): Promise<AlertsReply> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
         const result = await retractAlertEntry(this.env.SITE_BUCKET, alertId, entryId, owner, new Date(), context,
-          () => this.ctx.storage.put('conditions:pending', true), dryRun);
+          () => this.ctx.storage.put('conditions:pending', true), dryRun, history);
         if (!dryRun) await this.finishConditions(undefined, context);
         return { ok: true, result };
       }
@@ -244,8 +253,7 @@ export class DigestPublisher extends DurableObject<Env> {
       }
       const migration = await boundary('storage', () => this.ctx.storage.get<Migration>('migration')) ?? initialMigration();
       const id = crypto.randomUUID();
-      return { id, origin, status: 'queued', phase: migration.complete ? 'render' : 'migration', processed: migration.processed,
-        created_at: new Date().toISOString(), ...(context ? { context: { ...context, job_id: id } } : {}) };
+      return newRebuild(id, origin, migration, context);
     });
   }
 
@@ -271,6 +279,15 @@ export class DigestPublisher extends DurableObject<Env> {
     };
     // Inspection pins its own R2 HEAD and must not wait for rendering or writes.
     return input === undefined ? action() : this.serialize(action, context);
+  }
+
+  async publicationRepairControlV1(action: 'resume' | 'cancel', input: unknown, context?: OperationContext): Promise<RepairReply> {
+    context = this.executingContext(context);
+    return this.serialize(async () => {
+      const trace = new OperationTrace(context);
+      try { return { ok: true, result: await this.repairCoordinator().control(action, input, trace) }; }
+      catch (error) { const failure = asHttpError(error); return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, details: failure.details, retryable: failure.retryable, stage: trace.failed_stage ?? 'repair_recovery', publication_status: failure.publication_status ?? 'not_attempted' } }; }
+    }, context);
   }
 
   private cursorKey?: Promise<string>;
@@ -341,29 +358,33 @@ export class DigestPublisher extends DurableObject<Env> {
 
   private async enqueueRebuildUnlocked(id: string, origin: string, trace: OperationTrace, context?: OperationContext): Promise<RebuildJob> {
     const migration = await trace.run('rebuild_enqueue_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration'))) ?? initialMigration();
-    const jobContext = context ? { ...context, job_id: id } : undefined;
-    if (jobContext) delete jobContext.candidate_job_id;
-    const job: RebuildJob = { id, origin, status: 'queued', phase: migration.complete ? 'render' : 'migration', processed: migration.processed, created_at: new Date().toISOString(), ...(jobContext ? { context: jobContext } : {}) };
+    const job = newRebuild(id, origin, migration, context);
+    const jobContext = job.context;
     await trace.run('rebuild_enqueue', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
       const ids = await storage.get<string[]>('jobs') ?? [];
       const head = await queueHead(ids, id => storage.get<RebuildJob>(`job:${id}`));
       await storage.put(`job:${job.id}`, job);
       await storage.put('jobs', [...ids, job.id]);
-      if (head.job?.status !== 'failed') await storage.setAlarm(Date.now() + 1000);
+      if (head.job?.status !== 'failed' && !head.job?.manual_resume) await storage.setAlarm(Date.now() + 1000);
     })));
     emit('rebuild_queued', jobContext, { job_id: job.id });
     return job;
   }
 
   async jobStatus(id: string, context?: OperationContext): Promise<RebuildJob | null> {
-    return this.rebuildRequest(context, { job_id: id }, trace => trace.run('rebuild_status_read', async () => {
-      await this.repairCoordinator().recover(trace);
+    context = this.executingContext(context);
+    if (context) context = { ...context, job_id: id };
+    const trace = new OperationTrace(context);
+    try { return await trace.run('rebuild_status_read', async () => {
       const job = await boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`));
       if (!job) return null;
       const ids = await boundary('storage', () => this.ctx.storage.get<string[]>('jobs')) ?? [];
       const head = await queueHead(ids, id => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`)));
-      return { ...job, ...(job.status === 'queued' && head.job?.status === 'failed' && head.job.id !== id ? { blocked_by: head.job.id } : {}) };
-    }));
+      return { ...job, ...(job.status === 'queued' && (head.job?.status === 'failed' || head.job?.manual_resume) && head.job.id !== id ? { blocked_by: head.job.id } : {}) };
+    }); } catch (error) {
+      emit('rebuild_request_failed', context, { stage: trace.failed_stage ?? 'rebuild_status_read', error_code: asHttpError(error).code, ...safeError(error) }, 'error');
+      throw error;
+    }
   }
 
   async resumeRebuild(id: string, context?: OperationContext): Promise<RebuildJob | 'conflict' | null> {
@@ -403,7 +424,7 @@ export class DigestPublisher extends DurableObject<Env> {
     return this.serialize(async () => {
       const bootstrap = new OperationTrace(bootstrapContext);
       try { await this.repairCoordinator().recover(bootstrap, true); }
-      catch (error) { if (asHttpError(error).code === 'repair_pending') return; throw error; }
+      catch (error) { if (['repair_pending', 'repair_stalled'].includes(asHttpError(error).code)) return; throw error; }
       let ids: string[];
       let job: RebuildJob | null | undefined;
       try {
@@ -418,7 +439,7 @@ export class DigestPublisher extends DurableObject<Env> {
         // Leave recovery to bounded platform redelivery, then manual resume.
         throw error;
       }
-      if (!job || job.status === 'failed') return;
+      if (!job || job.status === 'failed' || job.manual_resume) return;
       if (job.next_retry_at && Date.parse(job.next_retry_at) > Date.now()) {
         await boundary('storage', () => this.ctx.storage.setAlarm(Date.parse(job!.next_retry_at!)));
         return;
@@ -479,9 +500,10 @@ export class DigestPublisher extends DurableObject<Env> {
         delete job.next_retry_at; delete job.conflict_count;
         job.status = 'completed';
         job.finished_at = new Date().toISOString();
+        const conditionsAvailable = (await boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')))?.customMetadata?.conditions_status !== 'unavailable';
         await trace.run('rebuild_finalize', () => boundary('storage', () => this.ctx.storage.transaction(async storage => {
           if (bootstrap) await storage.put('migration', migration);
-          await storage.delete('conditions:pending');
+          if (conditionsAvailable) await storage.delete('conditions:pending'); else await storage.put('conditions:pending', true);
           await storage.delete(`rebuild:${job.id}`);
           await storage.put(`job:${job.id}`, job);
           await storage.put('jobs', ids.slice(1));

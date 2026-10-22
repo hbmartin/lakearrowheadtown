@@ -780,7 +780,7 @@ describe('images and public serving', () => {
     expect(image.headers.get('Cloudflare-CDN-Cache-Control')).toContain('immutable');
     expect(new Uint8Array(await image.arrayBuffer())).toEqual(png);
     const input = digest(); input.items[0].body = `![Photo](${result.url})`; await post(input);
-    expect(await (await fetch('/')).text()).toContain(`<img src="${base}/thumbnails/v1/${new URL(result.url).pathname.split('/').at(-1)}/160"`);
+    expect(await (await fetch('/')).text()).toContain(`<img src="${base}/thumbnails/v2/${new URL(result.url).pathname.split('/').at(-1)}/96.png"`);
   });
   it.each([
     ['image/jpeg', [255, 216, 255, 224, 0, 2, 255, 192, 0, 17, 8, 0, 2, 0, 3, 3, 1, 17, 0, 2, 17, 0, 3, 17, 0]],
