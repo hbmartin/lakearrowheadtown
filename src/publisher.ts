@@ -168,23 +168,23 @@ export class DigestPublisher extends DurableObject<Env> {
     }, context);
   }
 
-  async retractAlertEntryV1(alertId: string, entryId: string, owner: string, context?: OperationContext): Promise<AlertsReply> {
+  async retractAlertEntryV1(alertId: string, entryId: string, owner: string, context?: OperationContext, dryRun = false): Promise<AlertsReply> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
         const result = await retractAlertEntry(this.env.SITE_BUCKET, alertId, entryId, owner, new Date(), context,
-          () => this.ctx.storage.put('conditions:pending', true));
-        await this.finishConditions(undefined, context);
+          () => this.ctx.storage.put('conditions:pending', true), dryRun);
+        if (!dryRun) await this.finishConditions(undefined, context);
         return { ok: true, result };
       }
       catch (error) { return alertRpcFailure(error, context); }
     }, context);
   }
 
-  async readAlertsV1(query: string, context?: OperationContext): Promise<AlertsReply> {
+  async readAlertsV1(query: string, context?: OperationContext, alertId?: string): Promise<AlertsReply> {
     context = this.executingContext(context);
     try {
-      return { ok: true, result: await readAlerts(this.env.SITE_BUCKET, new URLSearchParams(query), await this.getCursorKey()) };
+      return { ok: true, result: await readAlerts(this.env.SITE_BUCKET, new URLSearchParams(query), await this.getCursorKey(), new Date(), alertId) };
     } catch (error) { return alertRpcFailure(error, context); }
   }
 

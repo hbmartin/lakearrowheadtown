@@ -55,10 +55,12 @@ export interface Suggestion {
 export interface PublicationWarning {
   index?: number;
   field: string;
-  code: 'unknown_category' | 'posted_at_in_future' | 'posted_at_stale';
+  code: 'unknown_category' | 'posted_at_in_future' | 'posted_at_stale' | 'possible_duplicate_alert';
   message: string;
   value: string;
   server_time?: string;
+  matches?: { alert_id: string; reason: 'source_event_id' | 'location' }[];
+  matches_truncated?: boolean;
 }
 
 export interface AppendResult extends StoryIdentity {

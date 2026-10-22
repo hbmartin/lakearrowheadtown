@@ -249,7 +249,7 @@ describe('API and homepage integration', () => {
     expect(head.status).toBe(200); expect(await head.text()).toBe('');
     const path = `/api/alerts/${result.alert_id}/entries/${result.entry_id}/retract`;
     expect((await request(path, { method: 'POST' })).status).toBe(401);
-    expect((await request(path + '?dry_run=true', { method: 'POST', headers: auth })).status).toBe(400);
+    expect(await (await request(path + '?dry_run=true', { method: 'POST', headers: auth })).json()).toMatchObject({ dry_run: true, committed: false, state: 'retracted' });
     const retracted = await request(path, { method: 'POST', headers: auth });
     expect(await retracted.json()).toMatchObject({ status: 'retracted', expires_at: null });
   });

@@ -5,7 +5,8 @@ import { emit, OperationTrace, safeError } from './diagnostics';
 import { localDate, recentDates } from './feed';
 import { fingerprint, httpUrl, record, text } from './primitives';
 import { isClientRef, isTimestamp, validateClientRef } from './validation';
-import type { ContentBucket, OperationContext, PublishFailure } from './types';
+import { instant, timestampPayload } from './instants';
+import type { ContentBucket, OperationContext, PublicationWarning, PublishFailure } from './types';
 
 export const ALERTS_KEY = 'alerts/current.json';
 export const ALERT_DAY = 24 * 60 * 60 * 1000;
@@ -40,18 +41,21 @@ interface AlertRecord { version: 1; alert_id: string; entries: StoredEntry[]; re
 export interface AlertView extends AlertFields {
   alert_id: string; state: typeof states[number]; expires_at: string | null; upcoming: boolean;
 }
-interface AlertReference { alert_id: string; key: string; last_received_at: string; alert: AlertView }
+interface AlertReference { alert_id: string; key: string; last_received_at: string; alert: AlertView; revision?: string; confirmation_count?: number; last_confirmed_at?: string }
 interface Receipt { client_ref: string; payload_hash: string; alert_id: string; entry_id: string; received_at: string }
 interface Manifest { version: 1; published_at: string | null; alerts: AlertReference[]; receipts: Receipt[] }
 export type PublicEntry = Omit<StoredEntry, 'publisher_fingerprint'> & { client_ref: string; retracted_at?: string };
 export interface ReadAlert extends AlertView { history: PublicEntry[] }
+export interface AlertIndex extends Omit<AlertView, 'detail'> { revision: string; last_received_at: string; confirmation_count: number; last_confirmed_at?: string }
 export interface AlertMutationResult {
   alert_id: string; entry_id: string; client_ref: string; state: AlertView['state']; expires_at: string | null;
   status: 'published' | 'duplicate' | 'found' | 'retracted' | 'already_retracted';
   alert: ReadAlert; entry: PublicEntry; dry_run?: true; committed?: false; checked_at?: string;
+  warnings?: PublicationWarning[];
 }
-export interface AlertListResult { days: number; as_of: string; published_at: string | null; alerts: ReadAlert[]; next_cursor: string | null }
-export type AlertsReply = { ok: true; result: AlertMutationResult | AlertListResult } | { ok: false; failure: PublishFailure & { details?: HttpError['details']; details_truncated?: boolean } };
+export interface AlertListResult<T = ReadAlert> { days: number; fields?: 'full' | 'index'; as_of: string; published_at: string | null; alerts: T[]; next_cursor: string | null }
+export interface AlertReadResult { fields: 'full' | 'index'; as_of: string; alert: ReadAlert | AlertIndex }
+export type AlertsReply = { ok: true; result: AlertMutationResult | AlertListResult | AlertListResult<AlertIndex> | AlertReadResult } | { ok: false; failure: PublishFailure & { details?: HttpError['details']; details_truncated?: boolean } };
 const emptyManifest = (): Manifest => ({ version: 1, published_at: null, alerts: [], receipts: [] });
 const member = (value: unknown, values: readonly string[]): value is string => typeof value === 'string' && values.includes(value);
 
@@ -198,6 +202,31 @@ function canonical(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function alertIndex(ref: AlertReference, now: Date): AlertIndex {
+  const { detail: _detail, ...alert } = atTime(ref.alert, now);
+  return { ...alert, revision: fingerprint(canonical([ref.revision ?? ref.key, alert.state, alert.upcoming])),
+    last_received_at: ref.last_received_at, confirmation_count: ref.confirmation_count ?? 0,
+    ...(ref.last_confirmed_at ? { last_confirmed_at: ref.last_confirmed_at } : {}) };
+}
+
+function duplicateWarnings(input: AlertInput, manifest: Manifest, now: Date): PublicationWarning[] {
+  if (input.phase !== 'open') return [];
+  const location = (value: { routes?: readonly string[] | null; area?: string | null }) => canonical([
+    [...(value.routes ?? [])].sort(), (value.area ?? '').trim().replace(/\s+/g, ' ').toLowerCase()]);
+  const matches = manifest.alerts.flatMap<NonNullable<PublicationWarning['matches']>[number]>(ref => {
+    const alert = atTime(ref.alert, now);
+    if (alert.state !== 'open' || alert.category !== input.category || alert.kind !== input.kind) return [];
+    if (input.source_event_id && alert.source_event_id) {
+      return input.source === alert.source && input.source_event_id === alert.source_event_id
+        ? [{ alert_id: ref.alert_id, reason: 'source_event_id' as const }] : [];
+    }
+    return location(input) === location(alert) ? [{ alert_id: ref.alert_id, reason: 'location' as const }] : [];
+  }).sort((a, b) => a.alert_id.localeCompare(b.alert_id));
+  return matches.length ? [{ field: 'phase', code: 'possible_duplicate_alert', value: 'open',
+    message: 'An existing open alert may describe this condition. Review the matching alert IDs before opening another occurrence.',
+    matches: matches.slice(0, 50), ...(matches.length > 50 ? { matches_truncated: true } : {}) }] : [];
+}
+
 async function readJson(bucket: ContentBucket, key: string): Promise<unknown> {
   const object = await boundary('storage', () => bucket.get(key));
   if (!object) throw new DamagedManifest(key, 'missing');
@@ -250,7 +279,8 @@ async function loadRecord(bucket: ContentBucket, ref: AlertReference): Promise<A
 async function commitRecord(bucket: ContentBucket, manifest: Manifest, value: AlertRecord, now: Date, trace: OperationTrace, receipt?: Receipt): Promise<void> {
   const serialized = JSON.stringify(value);
   const key = `alerts/revisions/${fingerprint(serialized)}.json`;
-  const ref: AlertReference = { alert_id: value.alert_id, key, last_received_at: now.toISOString(), alert: deriveAlert(value, now) };
+  const ref: AlertReference = { alert_id: value.alert_id, key, last_received_at: now.toISOString(), alert: deriveAlert(value, now),
+    revision: fingerprint(canonical(readAlert(value, now))) };
   const days = recentDates(now, 30);
   const next: Manifest = { version: 1, published_at: now.toISOString(), alerts: [...manifest.alerts.filter(prior => prior.alert_id !== value.alert_id), ref],
     receipts: [...manifest.receipts.filter(prior => days.includes(localDate(new Date(prior.received_at)))), ...(receipt ? [receipt] : [])] };
@@ -276,12 +306,14 @@ export async function submitAlert(bucket: ContentBucket, input: AlertInput, owne
     const receipt = manifest.receipts.find(ref => ref.client_ref === input.client_ref && days.includes(localDate(new Date(ref.received_at))));
     let result: AlertMutationResult;
     if (receipt) {
-      if (receipt.payload_hash !== payload_hash) throw new HttpError(409, 'client_ref identifies a different alert submission.', {}, { code: 'client_ref_conflict' });
       const ref = manifest.alerts.find(ref => ref.alert_id === receipt.alert_id);
       if (!ref) throw new DamagedManifest(ALERTS_KEY, 'invalid_manifest');
       const value = await trace.run('alert_revision_loading', () => loadRecord(bucket, ref));
       const entry = value.entries.find(entry => entry.entry_id === receipt.entry_id);
       if (!entry) throw new DamagedSource(ref.key, ref.alert_id, 'invalid_digest');
+      if (receipt.payload_hash !== payload_hash && canonical(timestampPayload(entry.input)) !== canonical(timestampPayload(input))) {
+        throw new HttpError(409, 'client_ref identifies a different alert submission.', {}, { code: 'client_ref_conflict' });
+      }
       result = mutationResult(value, entry, 'duplicate', now);
     } else {
       let value: AlertRecord;
@@ -293,12 +325,14 @@ export async function submitAlert(bucket: ContentBucket, input: AlertInput, owne
         const effective = deriveAlert(value, now);
         if (effective.state === 'resolved' || effective.state === 'retracted') throw new HttpError(409, 'A resolved or retracted alert requires a new opening.', {}, { code: 'alert_closed' });
         if (input.category !== undefined && input.category !== effective.category || input.kind !== undefined && input.kind !== effective.kind) throw new HttpError(409, 'Alert category and kind cannot be changed.', {}, { code: 'alert_identity_conflict' });
-        if (Date.parse(input.observed_at) < Date.parse(effective.observed_at)) throw new HttpError(409, 'Observation precedes the latest surviving observation.', {}, { code: 'stale_observation' });
+        if (instant(input.observed_at) < instant(effective.observed_at)) throw new HttpError(409, 'Observation precedes the latest surviving observation.', {}, { code: 'stale_observation' });
         validateEffective(applyFields(effective, input));
       }
       const entry: StoredEntry = { entry_id: crypto.randomUUID(), received_at: now.toISOString(), input, publisher_fingerprint: owner };
       value = { ...value, entries: [...value.entries, entry] };
       result = mutationResult(value, entry, 'published', now);
+      const warnings = duplicateWarnings(input, manifest, now);
+      if (warnings.length) result.warnings = warnings;
       if (!dryRun) {
         if (beforeCommit) await trace.run('alert_homepage_intent', beforeCommit);
         await commitRecord(bucket, manifest, value, now, trace, { client_ref: input.client_ref, payload_hash, alert_id: value.alert_id, entry_id: entry.entry_id, received_at: entry.received_at });
@@ -318,7 +352,7 @@ function alertFailure(error: unknown, trace: OperationTrace, dryRun = false): Ht
   { alert_stage: trace.failed_stage ?? 'alerts' });
 }
 
-export async function retractAlertEntry(bucket: ContentBucket, alertId: string, entryId: string, owner: string, now = new Date(), context?: OperationContext, beforeCommit?: () => Promise<void>): Promise<AlertMutationResult> {
+export async function retractAlertEntry(bucket: ContentBucket, alertId: string, entryId: string, owner: string, now = new Date(), context?: OperationContext, beforeCommit?: () => Promise<void>, dryRun = false): Promise<AlertMutationResult> {
   const trace = new OperationTrace(context);
   try {
     const manifest = await trace.run('alert_manifest_loading', () => loadManifest(bucket));
@@ -328,7 +362,8 @@ export async function retractAlertEntry(bucket: ContentBucket, alertId: string, 
     const entry = value.entries.find(entry => entry.entry_id === entryId);
     if (!entry) throw new HttpError(404, 'Alert entry not found.', {}, { code: 'alert_entry_not_found' });
     if (entry.publisher_fingerprint !== owner) throw new HttpError(403, 'Retraction requires the original publishing token.', {}, { code: 'retract_forbidden' });
-    if (value.retractions.some(change => change.entry_id === entryId)) return mutationResult(value, entry, 'already_retracted', now);
+    const preview = dryRun ? { dry_run: true as const, committed: false as const, checked_at: now.toISOString() } : {};
+    if (value.retractions.some(change => change.entry_id === entryId)) return { ...mutationResult(value, entry, 'already_retracted', now), ...preview };
     if (now.getTime() - Date.parse(entry.received_at) >= ALERT_DAY) throw new HttpError(403, 'The entry retraction window has expired.', {}, { code: 'retract_window_expired' });
     const next = { ...value, retractions: [...value.retractions, { entry_id: entryId, retracted_at: now.toISOString() }] };
     const effective = deriveAlert(next, now);
@@ -336,17 +371,19 @@ export async function retractAlertEntry(bucket: ContentBucket, alertId: string, 
       try { validateEffective(effective); }
       catch { throw new HttpError(409, 'Later entries depend on this change. Correct their fields before retracting it.', {}, { code: 'retraction_dependency_conflict' }); }
     }
-    if (beforeCommit) await trace.run('alert_homepage_intent', beforeCommit);
-    await commitRecord(bucket, manifest, next, now, trace);
-    return mutationResult(next, entry, 'retracted', now);
-  } catch (error) { throw alertFailure(error, trace); }
+    if (!dryRun) {
+      if (beforeCommit) await trace.run('alert_homepage_intent', beforeCommit);
+      await commitRecord(bucket, manifest, next, now, trace);
+    }
+    return { ...mutationResult(next, entry, 'retracted', now), ...preview };
+  } catch (error) { throw alertFailure(error, trace, dryRun); }
 }
 
 export async function currentAlertViews(bucket: ContentBucket, now = new Date()): Promise<AlertView[]> {
   return (await loadManifest(bucket)).alerts.map(ref => atTime(ref.alert, now)).filter(alert => alert.state === 'open');
 }
 
-interface Cursor { snapshot: string; as_of: string; days: number; offset: number }
+interface Cursor { snapshot: string; as_of: string; days: number; offset: number; fields?: 'full' | 'index' }
 const badCursor = () => new HttpError(400, 'Invalid alert cursor. Start a fresh read.', {}, { code: 'invalid_cursor' });
 const signature = (payload: string, secret: string) => createHmac('sha256', secret).update(`alerts-v1:${payload}`).digest();
 function encodeCursor(value: Cursor, secret: string): string {
@@ -362,11 +399,22 @@ function decodeCursor(value: string, secret: string): Cursor {
   let cursor: unknown;
   try { cursor = JSON.parse(Buffer.from(payload, 'base64url').toString()); } catch { throw badCursor(); }
   if (!record(cursor) || typeof cursor.snapshot !== 'string' || !snapshotKey.test(cursor.snapshot) || !isTimestamp(cursor.as_of)
-    || !Number.isInteger(cursor.days) || Number(cursor.days) < 1 || Number(cursor.days) > 30 || !Number.isSafeInteger(cursor.offset) || Number(cursor.offset) < 0) throw badCursor();
+    || !Number.isInteger(cursor.days) || Number(cursor.days) < 1 || Number(cursor.days) > 30 || !Number.isSafeInteger(cursor.offset) || Number(cursor.offset) < 0
+    || cursor.fields !== undefined && !member(cursor.fields, ['full', 'index'])) throw badCursor();
   return cursor as unknown as Cursor;
 }
 
-export async function readAlerts(bucket: ContentBucket, query: URLSearchParams, secret: string, now = new Date()): Promise<AlertMutationResult | AlertListResult> {
+export async function readAlerts(bucket: ContentBucket, query: URLSearchParams, secret: string, now = new Date(), alertId?: string): Promise<AlertMutationResult | AlertListResult | AlertListResult<AlertIndex> | AlertReadResult> {
+  if (query.getAll('fields').length > 1 || query.has('fields') && !member(query.get('fields'), ['full', 'index'])) throw new HttpError(400, 'fields must be full or index.', {}, { code: 'invalid_fields' });
+  if (alertId !== undefined) {
+    if (!uuid.test(alertId)) throw new HttpError(400, 'Invalid alert UUID.', {}, { code: 'validation_failed' });
+    if (['client_ref', 'cursor', 'days'].some(key => query.has(key))) throw new HttpError(400, 'Direct alert reads do not accept lookup or pagination parameters.');
+    const manifest = await loadManifest(bucket);
+    const ref = manifest.alerts.find(ref => ref.alert_id === alertId);
+    if (!ref) throw new HttpError(404, 'Alert not found.', {}, { code: 'alert_not_found' });
+    const fields = query.get('fields') === 'index' ? 'index' : 'full';
+    return { fields, as_of: now.toISOString(), alert: fields === 'index' ? alertIndex(ref, now) : readAlert(await loadRecord(bucket, ref), now) };
+  }
   if (query.has('client_ref')) {
     if (query.getAll('client_ref').length !== 1 || query.has('cursor') || query.has('days') || query.has('fields')) throw new HttpError(400, 'Use one client_ref without pagination or fields parameters.');
     const clientRef = validateClientRef(query.get('client_ref'));
@@ -383,8 +431,9 @@ export async function readAlerts(bucket: ContentBucket, query: URLSearchParams, 
   }
   if (query.getAll('days').length > 1 || query.has('days') && !/^(?:[1-9]|[12][0-9]|30)$/.test(query.get('days')!)) throw new HttpError(400, 'days must be between 1 and 30.', {}, { code: 'invalid_days' });
   if (query.getAll('cursor').length > 1) throw badCursor();
-  if (query.has('fields')) throw new HttpError(400, 'Alert reads return full history; omit fields.', {}, { code: 'invalid_fields' });
   const cursor = query.has('cursor') ? decodeCursor(query.get('cursor')!, secret) : undefined;
+  const fields = (query.get('fields') ?? cursor?.fields ?? 'full') as 'full' | 'index';
+  if (cursor && (cursor.fields ?? 'full') !== fields) throw badCursor();
   const days = Number(query.get('days') ?? cursor?.days ?? 30);
   if (cursor && cursor.days !== days) throw badCursor();
   const identity: { key?: string } = {};
@@ -399,13 +448,13 @@ export async function readAlerts(bucket: ContentBucket, query: URLSearchParams, 
   const offset = cursor?.offset ?? 0;
   if (offset > selected.length) throw badCursor();
   const refs = selected.slice(offset, offset + 20);
-  const alerts: ReadAlert[] = [];
+  const alerts: (ReadAlert | AlertIndex)[] = [];
   for (let i = 0; i < refs.length; i += 4) {
-    const results = await Promise.allSettled(refs.slice(i, i + 4).map(async ref => readAlert(await loadRecord(bucket, ref), at)));
+    const results = await Promise.allSettled(refs.slice(i, i + 4).map(async ref => fields === 'index' ? alertIndex(ref, at) : readAlert(await loadRecord(bucket, ref), at)));
     for (const result of results) { if (result.status === 'rejected') throw result.reason; alerts.push(result.value); }
   }
-  return { days, as_of, published_at: manifest.published_at, alerts,
-    next_cursor: snapshot && offset + refs.length < selected.length ? encodeCursor({ snapshot, as_of, days, offset: offset + refs.length }, secret) : null };
+  return { days, fields, as_of, published_at: manifest.published_at, alerts,
+    next_cursor: snapshot && offset + refs.length < selected.length ? encodeCursor({ snapshot, as_of, days, offset: offset + refs.length, fields }, secret) : null } as AlertListResult | AlertListResult<AlertIndex>;
 }
 
 export function isAlertsReply(value: unknown): value is AlertsReply {
@@ -413,6 +462,8 @@ export function isAlertsReply(value: unknown): value is AlertsReply {
   if (value.ok === false) return isPublishReply(value);
   if (value.ok !== true || !record(value.result)) return false;
   const r = value.result;
+  if (r.fields && !member(r.fields, ['full', 'index'])) return false;
+  if (r.alert && !r.entry) return member(r.fields, ['full', 'index']) && isTimestamp(r.as_of) && record(r.alert) && typeof r.alert.alert_id === 'string';
   if (Array.isArray(r.alerts)) return Number.isInteger(r.days) && Number(r.days) >= 1 && Number(r.days) <= 30 && isTimestamp(r.as_of)
     && (r.published_at === null || isTimestamp(r.published_at)) && (r.next_cursor === null || typeof r.next_cursor === 'string');
   return typeof r.alert_id === 'string' && uuid.test(r.alert_id) && typeof r.entry_id === 'string' && uuid.test(r.entry_id) && isClientRef(r.client_ref)

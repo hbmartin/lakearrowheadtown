@@ -137,12 +137,16 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
   const reply = (value: Record<string, unknown>, status = 200, headers: HeadersInit = {}) => json({ ...value, ...(isApi ? { request_id: context.request_id } : {}) }, status, headers);
   try {
     const alertRetraction = /^\/api\/alerts\/([^/]+)\/entries\/([^/]+)\/retract$/.exec(path);
-    if (path === '/api/alerts' || alertRetraction) {
+    const alertRead = /^\/api\/alerts\/([^/]+)$/.exec(path);
+    if (path === '/api/alerts' || alertRetraction || alertRead) {
       await trace.run('authentication', () => authenticate(request, env.API_SECRET));
       const reading = !alertRetraction && ['GET', 'HEAD'].includes(request.method);
-      if (!reading && request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: alertRetraction ? 'POST' : 'GET, HEAD, POST' });
+      if (alertRead && !reading || !reading && request.method !== 'POST') throw new HttpError(405, 'Method not allowed', { Allow: alertRead ? 'GET, HEAD' : alertRetraction ? 'POST' : 'GET, HEAD, POST' });
       if (reading) context.operation = 'alerts_read';
-      if (alertRetraction && query.has('dry_run')) throw new HttpError(400, 'dry_run is not supported for retraction.', {}, { code: 'invalid_dry_run' });
+      if (!reading) {
+        if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
+        state.dry_run = query.get('dry_run') === 'true';
+      }
       let payload;
       if (!reading && !alertRetraction) {
         if (query.getAll('dry_run').length > 1 || query.has('dry_run') && !['true', 'false'].includes(query.get('dry_run')!)) throw new HttpError(400, 'dry_run must be true or false.', {}, { code: 'invalid_dry_run' });
@@ -158,8 +162,8 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
       publicationAttempted = !reading && !state.dry_run;
       if (!reading) state.publication_status = state.dry_run ? 'not_attempted' : 'unknown';
       const received: unknown = await trace.run('alerts_rpc', () => boundary('rpc', async () => reading
-        ? await publisher.readAlertsV1(query.toString(), context)
-        : alertRetraction ? await publisher.retractAlertEntryV1(alertRetraction[1], alertRetraction[2], fingerprint(env.API_SECRET!), context)
+        ? await publisher.readAlertsV1(query.toString(), context, alertRead?.[1])
+        : alertRetraction ? await publisher.retractAlertEntryV1(alertRetraction[1], alertRetraction[2], fingerprint(env.API_SECRET!), context, state.dry_run)
         : await publisher.submitAlertV1(payload!, fingerprint(env.API_SECRET!), context, state.dry_run)));
       if (!isAlertsReply(received)) throw new OperationFailure('rpc', new Error('Invalid alerts reply'));
       if (!received.ok) {

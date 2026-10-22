@@ -36,6 +36,10 @@ export async function smokeAlerts(origin, request, headers) {
     assert.equal(conflict.status, 409); assert.equal((await conflict.json()).code, 'client_ref_conflict');
     const lookup = await send(`/api/alerts?client_ref=${encodeURIComponent(traffic.client_ref)}`);
     assert.equal(lookup.entry_id, published.entry_id); assert.equal(lookup.expires_at, published.expires_at);
+    const compact = await send(`/api/alerts/${published.alert_id}?fields=index`);
+    assert.equal(compact.fields, 'index'); assert.equal(compact.alert.alert_id, published.alert_id);
+    assert(!('history' in compact.alert)); assert(!('detail' in compact.alert));
+    assert.equal((await send('/api/alerts?fields=index')).fields, 'index');
     const outage = await send('/api/alerts', power); openings.push(outage);
     const page = await request(origin, { headers: { 'If-None-Match': before.headers.get('etag') } });
     assert.equal(page.status, 200);
@@ -58,7 +62,10 @@ export async function smokeAlerts(origin, request, headers) {
     assert.equal(dryResolution.expires_at, null); assert.equal(dryResolution.committed, false);
     const resolved = await send('/api/alerts', resolving); assert.equal(resolved.expires_at, null);
     assert(!(await (await request(origin)).text()).includes(power.headline));
-    const undone = await send(`/api/alerts/${resolved.alert_id}/entries/${resolved.entry_id}/retract`, {});
+    const retractPath = `/api/alerts/${resolved.alert_id}/entries/${resolved.entry_id}/retract`;
+    const retractPreview = await send(retractPath + '?dry_run=true', {});
+    assert.equal(retractPreview.state, 'open'); assert.equal(retractPreview.committed, false);
+    const undone = await send(retractPath, {});
     assert.equal(undone.state, 'open'); assert(undone.expires_at);
     let cursor;
     let found = false;
