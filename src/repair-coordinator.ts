@@ -18,6 +18,8 @@ interface RepairRecord {
   last_error?: { code: string; stage: string; retryable: boolean };
 }
 export const isPaused = (job: RebuildJob | null | undefined): boolean => !!job && (job.manual_resume === true || job.scheduling === 'manual');
+export const pauseReason = (job: RebuildJob): NonNullable<RebuildJob['pause_reason']> => job.pause_reason
+  ?? (job.recovery?.code === 'rebuild_checkpoint_damaged' ? 'rebuild_checkpoint_damaged' : 'manual_resume');
 
 export function restartRebuild(job: RebuildJob): RebuildJob {
   const next = { ...job, status: 'queued' as const, scheduling: 'automatic' as const };
@@ -255,7 +257,7 @@ export class RepairCoordinator {
             // Preserve genuinely unscheduled work, including automatic jobs
             // whose platform redeliveries were exhausted. A consumed delivery
             // waiting in our queue is distinguished by alarmDelivered().
-            if (existing.status !== 'failed' && existing.scheduling !== 'manual') await storage.put(`job:${id}`, { ...existing, manual_resume: true, scheduling: 'manual', pause_reason: 'manual_resume' });
+            if (existing.status !== 'failed' && existing.scheduling !== 'manual') await storage.put(`job:${id}`, { ...existing, manual_resume: true, scheduling: 'manual', pause_reason: isPaused(existing) ? pauseReason(existing) : 'manual_resume' });
             break;
           }
           await storage.put(key, saved); await storage.put(ACTIVE, key);

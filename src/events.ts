@@ -1,5 +1,5 @@
 import { settledInOrder } from './batches';
-import { asHttpError, boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply, publicationFailure, detailsWithStage, type ValidationIssue } from './errors';
+import { asHttpError, boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply, publicationFailure, type ValidationIssue } from './errors';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { localDate, recentDates } from './feed';
 import { canonicalJson, fingerprint, record } from './primitives';
@@ -217,8 +217,7 @@ export async function publishEvents(bucket: ContentBucket, digest: EventDigest, 
     const stage = trace.failed_stage ?? 'event_publication';
     const failure = publicationFailure(error, stage, dryRun ? 'not_attempted' : trace.publication_status, 'event');
     emit('event_publication_failed', context, { stage, error_code: failure.code, publication_status: failure.publication_status, ...safeError(error) }, 'error');
-    const original = asHttpError(error);
-    return { ok: false, failure: { ...failure, details: detailsWithStage(original.details, stage), details_truncated: original.details_truncated } };
+    return { ok: false, failure };
   }
 }
 

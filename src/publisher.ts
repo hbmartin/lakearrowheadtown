@@ -9,7 +9,7 @@ import { alertRpcFailure, confirmAlerts, readAlerts, retractAlertEntry, submitAl
 import { readPosts, type PostsReply } from './posts';
 import { publishEvents, readEvents, type EventDigest, type EventsReply } from './events';
 import { validateRepair, type RepairReply } from './publication-repair';
-import { RepairCoordinator, restartRebuild, newRebuild, isPaused } from './repair-coordinator';
+import { RepairCoordinator, restartRebuild, newRebuild, isPaused, pauseReason } from './repair-coordinator';
 import { composeHomepageConditions } from './homepage-conditions';
 import { REBUILD_MARKER } from './index-metadata';
 import { record } from './primitives';
@@ -409,7 +409,7 @@ export class DigestPublisher extends DurableObject<Env> {
       const repair = await this.repairCoordinator().blocker();
       if (repair) result.blocked = repair;
       else if (head.job) {
-        const reason = head.job.status === 'failed' ? 'failed_rebuild' : isPaused(head.job) ? head.job.pause_reason ?? (head.job.recovery?.code === 'rebuild_checkpoint_damaged' ? 'rebuild_checkpoint_damaged' : 'manual_resume')
+        const reason = head.job.status === 'failed' ? 'failed_rebuild' : isPaused(head.job) ? pauseReason(head.job)
           : !this.alarmDeliveries && await boundary('storage', () => this.ctx.storage.getAlarm()) === null ? 'unscheduled' : undefined;
         if (reason) {
           result.blocked = { reason, job_id: head.job.id };

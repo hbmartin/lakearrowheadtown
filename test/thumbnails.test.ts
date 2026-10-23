@@ -1,5 +1,5 @@
 import { env } from 'cloudflare:workers';
-import { reset } from 'cloudflare:test';
+import { createExecutionContext, reset, waitOnExecutionContext } from 'cloudflare:test';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/worker';
 import { dimensions, metadataKey, type ImageMetadata } from '../src/image-metadata';
@@ -346,6 +346,7 @@ it.each([false, true])('serves acknowledged fills without a winner reread (condi
 });
 
 it.each([false, true])('reconciles a competing oversized/derivative winner (oversized winner=%s)', async oversizedWinner => {
+  const info = vi.spyOn(console, 'info').mockImplementation(() => {});
   await source(); let injected = false; const url = `/thumbnails/v2/${hash}.jpg/160.webp`;
   const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) {
     if (property === 'put') return async (key: string, body: any, options: any) => {
@@ -361,6 +362,8 @@ it.each([false, true])('reconciles a competing oversized/derivative winner (over
   expect(response.status).toBe(oversizedWinner ? 302 : 200);
   if (!oversizedWinner) expect(new Uint8Array(await response.arrayBuffer())).toEqual(png);
   expect((await bindings.SITE_BUCKET.list({ prefix: 'thumbnail-cache/' })).objects).toHaveLength(1);
+  expect(info.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({ event: 'thumbnail_cache_fill', outcome: 'race' }));
+  expect(info.mock.calls.some(([event]: any) => event.event === 'thumbnail_cache_hit')).toBe(false);
 });
 
 it.each([false, true])('settles parallel cache reads and cancels unused bodies when original existence fails (%s)', async storageError => {
@@ -433,4 +436,40 @@ it('distinguishes cached oversized outcomes from successful image cache hits and
   expect(events).toContainEqual(expect.objectContaining({ event: 'thumbnail_cache_outcome_hit', outcome: 'oversized' }));
   expect(events.some(event => event.event === 'thumbnail_cache_hit')).toBe(false);
   expect(events).toContainEqual(expect.objectContaining({ event: 'request_completed', route: '/thumbnails/v2/:file/:edge.:format' }));
+});
+
+it.each([false, true])('returns a legacy cache hit before optional metadata persistence settles (write failure=%s)', async failure => {
+  await source(); await bindings.SITE_BUCKET.delete(metadataKey(hash)); const mock = encoder();
+  await (await fetch(path, {}, mock)).arrayBuffer();
+  await bindings.SITE_BUCKET.delete(`thumbnail-cache/v1/source-metadata/${hash}.jpg`);
+  const warnings = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  let release!: () => void; let started!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; }); const writing = new Promise<void>(resolve => { started = resolve; });
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) {
+    if (property === 'put') return async (key: string, body: any, options: any) => {
+      if (key.includes('/source-metadata/')) { started(); await blocked; if (failure) throw new Error('Private delayed metadata fault'); }
+      return target.put(key, body, options);
+    };
+    const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const execution = createExecutionContext();
+  const response = worker.fetch(new Request(origin + path), { ...bindings, ...mock, SITE_BUCKET: store }, execution);
+  try {
+    await writing;
+    const hit = await response; expect(hit.status).toBe(200); expect(new Uint8Array(await hit.arrayBuffer())).toEqual(png);
+    expect(mock.output).toHaveBeenCalledTimes(1);
+    expect(await bindings.SITE_BUCKET.head(`thumbnail-cache/v1/source-metadata/${hash}.jpg`)).toBeNull();
+  } finally { release(); await waitOnExecutionContext(execution); }
+  expect(warnings.mock.calls.filter(([event]: any) => event.event === 'thumbnail_source_metadata_write_failed')).toHaveLength(failure ? 1 : 0);
+  expect(JSON.stringify(warnings.mock.calls)).not.toContain('Private delayed metadata fault');
+});
+
+it('reuses the conditional safe-format probe miss without a second derivative read', async () => {
+  await source(); await bindings.SITE_BUCKET.delete(metadataKey(hash)); let reads = 0;
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) {
+    if (property === 'get' || property === 'head') return (key: string) => { if (key.includes('/scale-down-q80-anim-1/') && key.endsWith('/160.webp')) reads++; return (target[property] as any).call(target, key); };
+    const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const result = await fetch(path, { headers: { Accept: 'image/webp', 'If-None-Match': '"old"' } }, { ...encoder(), SITE_BUCKET: store });
+  expect(result.status).toBe(200); await result.arrayBuffer(); expect(reads).toBe(1);
 });

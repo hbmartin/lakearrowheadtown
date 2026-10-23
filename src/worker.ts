@@ -139,7 +139,7 @@ async function jsonBytes(request: Request, state: RequestState, limit = 1024 * 1
   return bytes;
 }
 
-async function handle(request: Request, env: Env, state: RequestState): Promise<Response> {
+async function handle(request: Request, env: Env, state: RequestState, execution?: ExecutionContext): Promise<Response> {
   const { context, trace } = state;
   const path = new URL(request.url).pathname;
   const query = new URL(request.url).searchParams;
@@ -405,7 +405,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     try { origin = originFor(request, env); }
     catch (error) { if (!(error instanceof HttpError && error.status === 503)) throw error; }
     return await trace.run('public_read', async () => {
-      if (path.startsWith('/thumbnails/')) return thumbnailResponse(request, env, trace);
+      if (path.startsWith('/thumbnails/')) return thumbnailResponse(request, env, trace, execution);
       const metadata = await metadataResource(request, env.SITE_BUCKET, origin);
       if (metadata) return metadata;
       const page = await pageResource(request, env.SITE_BUCKET, origin);
@@ -476,7 +476,7 @@ export default {
     const origin = env.SITE_ORIGIN || 'https://lakearrowheadtown-preview.harold-martin.workers.dev';
     await env.PUBLISHER.getByName('site').pullWeatherV1(origin);
   },
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, execution?: ExecutionContext): Promise<Response> {
     const started = performance.now();
     const path = new URL(request.url).pathname;
     const route = routeFor(path, request.method);
@@ -484,7 +484,7 @@ export default {
     const context: OperationContext = { request_id: crypto.randomUUID(), worker_version: env.CF_VERSION_METADATA?.id ?? 'local', environment: env.ENVIRONMENT ?? 'local', operation: route.operation,
       ...(ray && /^[a-f0-9]{16,32}(?:-[A-Z]{3})?$/.test(ray) ? { cf_ray: ray } : {}) };
     const state: RequestState = { context, trace: new OperationTrace(context) };
-    const response = htmlResponse(request, await handle(request, env, state));
+    const response = htmlResponse(request, await handle(request, env, state, execution));
     if (path === '/api' || path.startsWith('/api/')) {
       response.headers.set('X-Request-ID', context.request_id);
       response.headers.set('X-Worker-Version', context.worker_version);

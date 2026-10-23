@@ -54,7 +54,7 @@ async function legacyMetadata(env: Env, hash: string, source: string) {
   return { key, size, saved };
 }
 
-export async function thumbnailResponse(request: Request, env: Env, trace: OperationTrace): Promise<Response> {
+export async function thumbnailResponse(request: Request, env: Env, trace: OperationTrace, context?: Pick<ExecutionContext, 'waitUntil'>): Promise<Response> {
   const url = new URL(request.url);
   const v2 = THUMBNAIL_V2_PATH.exec(url.pathname);
   const match = v2 ?? THUMBNAIL_PATH.exec(url.pathname);
@@ -85,18 +85,18 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
     return new Response(unchanged || request.method === 'HEAD' ? null : bytes, { status: unchanged ? 304 : 200, headers });
   };
   const readCache = (variant: ReturnType<typeof derivative>) => boundary('storage', () => request.method === 'HEAD' || condition ? env.SITE_BUCKET.head(variant.key) : env.SITE_BUCKET.get(variant.key));
-  const cachedResponse = async (cached: R2Object | null, variant: ReturnType<typeof derivative>): Promise<Response | null> => {
+  const cachedResponse = async (cached: R2Object | null, variant: ReturnType<typeof derivative>, initial = true): Promise<Response | null> => {
     if (variant.oversized(cached)) {
       await discard(cached); emit('thumbnail_cache_outcome_hit', trace.context, { edge, format: format(), outcome: 'oversized' });
       return fallback('derivative_oversized');
     }
     if (!variant.valid(cached)) { await discard(cached); return null; }
     if (matchesEtag(condition, headersFor(cached.size).get('ETag')!) || request.method === 'HEAD') {
-      await discard(cached); emit('thumbnail_cache_hit', trace.context, { edge, format: format() }); return response(cached.size, null);
+      await discard(cached); if (initial) emit('thumbnail_cache_hit', trace.context, { edge, format: format() }); return response(cached.size, null);
     }
     const full = 'body' in cached ? cached as R2ObjectBody : await boundary('storage', () => env.SITE_BUCKET.get(variant.key));
     if (!variant.valid(full)) { await discard(full); return null; }
-    emit('thumbnail_cache_hit', trace.context, { edge, format: format() });
+    if (initial) emit('thumbnail_cache_hit', trace.context, { edge, format: format() });
     return response(full!.size, full!.body);
   };
   const loadInput = async () => {
@@ -146,12 +146,10 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
     const hit = await cachedResponse(cached, variant);
     if (detected) {
       const legacy = initial.value.legacy!;
-      try {
-        await boundary('storage', () => env.SITE_BUCKET.put(legacy.key, '', { onlyIf: legacy.saved ? { etagMatches: legacy.saved.etag } : { etagDoesNotMatch: '*' },
-          customMetadata: { version: '1', source: key, width: String(size!.width), height: String(size!.height), type: size!.type } }));
-      } catch (error) {
-        emit('thumbnail_source_metadata_write_failed', trace.context, { edge, error_code: asHttpError(error).code, ...safeError(error) }, 'warn');
-      }
+      const persist = boundary('storage', () => env.SITE_BUCKET.put(legacy.key, '', { onlyIf: legacy.saved ? { etagMatches: legacy.saved.etag } : { etagDoesNotMatch: '*' },
+        customMetadata: { version: '1', source: key, width: String(size!.width), height: String(size!.height), type: size!.type } }))
+        .catch(error => { emit('thumbnail_source_metadata_write_failed', trace.context, { edge, error_code: asHttpError(error).code, ...safeError(error) }, 'warn'); });
+      if (context) context.waitUntil(persist); else await persist;
     }
     if (hit) return hit;
     if (cached) emit('thumbnail_cache_invalid', trace.context, { edge, format: format() }, 'warn');
@@ -187,7 +185,7 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
       if (saved && bytes !== undefined && variant.valid(saved)) return response(bytes.byteLength, bytes);
       // Only a lost race needs a winner read. Never return the losing encoder's bytes.
       phase = 'cache_read';
-      return await cachedResponse(await readCache(variant), variant) ?? fallback('cache_read_failed');
+      return await cachedResponse(await readCache(variant), variant, false) ?? fallback('cache_read_failed');
     } finally { await discard(rendered); }
   } catch (error) {
     if (!originalVerified || error instanceof HttpError && error.status === 404) throw error;

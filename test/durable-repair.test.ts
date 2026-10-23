@@ -789,11 +789,13 @@ it('does not reuse historical checkpoint damage as the reason for an unrelated r
 });
 
 it.each([undefined, 'manual_resume'] as const)('keeps legacy damage-pause fallback but honors an explicit current reason: %s', async pause_reason => {
-  await seed(); const job = await publisher().enqueueRebuild(origin);
+  const { input } = await seed(); const job = await publisher().enqueueRebuild(origin);
   await inside(publisher(), async (instance, state) => {
     await state.storage.put(`job:${job.id}`, { ...job, manual_resume: true, pause_reason,
       recovery: { code: 'rebuild_checkpoint_damaged', stage: 'old', retryable: false, publication_status: 'unknown', failed_at: new Date().toISOString() } });
     expect(await instance.jobStatus(job.id)).toMatchObject({ blocked: { reason: pause_reason ?? 'rebuild_checkpoint_damaged' } });
+    await state.storage.deleteAlarm(); expect(await instance.publicationRepairV1(input, origin)).toMatchObject({ ok: true });
+    expect(await instance.jobStatus(job.id)).toMatchObject({ pause_reason: pause_reason ?? 'rebuild_checkpoint_damaged', blocked: { reason: pause_reason ?? 'rebuild_checkpoint_damaged' } });
   });
 });
 
