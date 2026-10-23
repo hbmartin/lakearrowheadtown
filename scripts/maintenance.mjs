@@ -19,7 +19,8 @@ function withTiming(value, response, retryAt, options) {
 function retryDelay(value, attempts, options) {
   const delay = value?.[retryDeadline] !== undefined ? value[retryDeadline] - monotonic(options)
     : Date.parse(value?.retryAt ?? value?.blocked?.retry_at ?? value?.next_retry_at) - Date.now();
-  return Math.min(30000, Math.max(1000, delay > 0 ? delay : 2 ** Math.min(attempts, 5) * 1000));
+  return Math.max(1000, delay > 0 ? value?.[retryDeadline] !== undefined ? delay : Math.min(30000, delay)
+    : Math.min(30000, 2 ** Math.min(attempts, 5) * 1000));
 }
 export function maintenanceTarget(environment, value = process.env.SITE_URL || defaults[environment]) {
   checkEnvironment(environment);
@@ -88,66 +89,91 @@ const blockedAdvice = job => {
     : `Inspect rebuild ${target} and explicitly resume it after correcting the cause.${recovery}`;
 };
 
-export async function waitForRebuild(job, environment, options = {}) {
-  const deadline = monotonic(options) + (options.timeoutMs ?? 1800000);
-  let attempts = 0; let retry;
-  while (!['completed', 'failed'].includes(job.status) && !blocked(job)) {
-    if (monotonic(options) >= deadline) throw new Error(`Rebuild ${job.id} exceeded the wait deadline. Inspect its status; no resume was issued.`);
-    await (options.sleep ?? sleep)(Math.min(retryDelay(retry ?? job, attempts, options), Math.max(1, deadline - monotonic(options))));
-    if (monotonic(options) >= deadline) throw new Error(`Rebuild ${job.id} exceeded the wait deadline. Inspect its status; no resume was issued.`);
-    try { job = await maintenance('status', environment, job.id, { ...options, requestTimeoutMs: Math.max(1, deadline - monotonic(options)) }); attempts = 0; retry = undefined; options.onProgress?.(job); }
-    catch (error) { if (!error.transport && !error.retryable) throw error; attempts++; retry = error; }
-  }
+const terminal = job => ['completed', 'failed'].includes(job.status) || blocked(job);
+function waitDeadline(options) {
+  const timeout = options.timeoutMs ?? 1800000;
+  if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new Error('timeout-ms must be a positive integer');
+  return monotonic(options) + timeout;
+}
+async function pauseUntilRetry(value, attempts, deadline, options, submission = false) {
+  const delay = retryDelay(value, attempts, options);
+  const until = Math.min(deadline, monotonic(options) + (submission ? delay : Math.min(30000, delay)));
+  while (monotonic(options) < until) await (options.sleep ?? sleep)(Math.min(30000, until - monotonic(options)));
+}
+function completedJob(job) {
   if (job.status !== 'completed') throw new Error(`Rebuild ${job.id} failed or is blocked (${job.blocked?.reason ?? job.status}). ${blockedAdvice(job)}`);
   return job;
+}
+function waitTimeout(job, cause) {
+  return new Error(`Rebuild ${job.id} exceeded the wait deadline; completion remains unconfirmed (last status: ${job.blocked?.reason ?? job.status}). Inspect its status; no resume was issued.`, cause ? { cause } : undefined);
+}
+async function finalStatus(job, environment, deadline, options) {
+  const remaining = Math.ceil(deadline + 30000 - monotonic(options));
+  if (remaining <= 0) throw waitTimeout(job);
+  // One read-only check, never retried, with a fixed grace deadline.
+  try {
+    job = await maintenance('status', environment, job.id, { ...options, requestTimeoutMs: remaining });
+    if (monotonic(options) > deadline + 30000) throw waitTimeout(job);
+    options.onProgress?.(job);
+  } catch (error) { throw waitTimeout(job, error); }
+  if (terminal(job)) return completedJob(job);
+  throw waitTimeout(job);
+}
+async function followJob(job, environment, deadline, options) {
+  let attempts = 0; let retry;
+  while (!terminal(job)) {
+    if (monotonic(options) >= deadline) return finalStatus(job, environment, deadline, options);
+    await pauseUntilRetry(retry ?? job, attempts, deadline, options);
+    if (monotonic(options) >= deadline) return finalStatus(job, environment, deadline, options);
+    try {
+      job = await maintenance('status', environment, job.id, { ...options, requestTimeoutMs: Math.max(1, Math.ceil(deadline - monotonic(options))) });
+      attempts = 0; retry = undefined; options.onProgress?.(job);
+    } catch (error) {
+      if (!error.transport && !error.retryable) throw error;
+      attempts++; retry = error; options.onRetry?.(error, job);
+    }
+  }
+  return completedJob(job);
+}
+export async function waitForRebuild(job, environment, options = {}) {
+  return followJob(job, environment, waitDeadline(options), options);
 }
 
 export async function repairAndFollow(environment, file, options = {}) {
   const payload = options.payload ?? JSON.parse(await readFile(file, 'utf8'));
-  const timeoutMs = options.timeoutMs ?? 1800000;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('timeout-ms must be a positive integer');
-  const now = options.now ?? (() => performance.now());
-  const deadline = now() + timeoutMs;
-  const wait = options.sleep ?? sleep;
-  let result; let jobId; let attempts = 0; let statusRetry;
+  const deadline = waitDeadline(options);
+  let result; let jobId; let attempts = 0;
   const context = () => jobId ? `Repair committed; rebuild ${jobId} is ${result?.job?.status ?? 'awaiting activation'}.` : 'Repair outcome may be unknown; retry the identical repair file to reconcile it.';
-  const remaining = () => {
-    const left = Math.ceil(deadline - now());
-    if (left <= 0) throw new Error(`${context()} Overall repair timeout exceeded. Inspect the snapshot and rebuild status.`);
-    return left;
-  };
-  const pause = async value => {
-    await wait(Math.min(retryDelay(value, attempts++, options), remaining()));
-    remaining();
-  };
-  const call = (operation, id) => maintenance(operation, environment, id, { ...options, payload, requestTimeoutMs: remaining() });
-  const retryable = error => error.transport === true || error.retryable === true;
   while (!result) {
-    try { result = await call('repair'); }
-    catch (error) {
+    if (monotonic(options) >= deadline) {
+      let final;
+      if (jobId) {
+        try { final = await finalStatus({ id: jobId, status: 'queued' }, environment, deadline, { ...options, onProgress: job => options.onProgress?.({ job, publication_status: 'committed' }) }); }
+        catch (error) { throw new Error(`${context()} Overall repair timeout exceeded. ${error.message}`, { cause: error }); }
+      }
+      throw new Error(`${context()} Overall repair timeout exceeded; repair result remains unconfirmed.${final ? ` Final rebuild status: ${final.status}.` : ''} Inspect the snapshot and rebuild status.`);
+    }
+    try {
+      result = await maintenance('repair', environment, undefined, { ...options, payload, requestTimeoutMs: Math.max(1, Math.ceil(deadline - monotonic(options))) });
+    } catch (error) {
       if (error.publicationStatus === 'committed' && typeof error.details?.job_id === 'string') {
         jobId = error.details.job_id;
         options.onProgress?.({ publication_status: 'committed', repair_id: error.details.repair_id, job_id: jobId });
       }
-      if (!retryable(error)) throw new Error(`${jobId ? context() + ' ' : ''}${error.message}`, { cause: error });
-      await pause(error);
+      if (!error.transport && !error.retryable) throw new Error(`${jobId ? context() + ' ' : ''}${error.message}`, { cause: error });
+      await pauseUntilRetry(error, attempts++, deadline, options, true);
     }
   }
-  attempts = 0;
   jobId = result.job?.id;
   options.onProgress?.(result);
-  while (result.job && !['completed', 'failed'].includes(result.job.status) && !blocked(result.job)) {
-    await pause(statusRetry ?? result.job);
-    try { result.job = await call('status', jobId); attempts = 0; statusRetry = undefined; }
-    catch (error) {
-      if (!retryable(error)) throw new Error(`${context()} ${error.message}`, { cause: error });
-      statusRetry = error;
-      options.onProgress?.({ job_id: jobId, publication_status: 'committed', warning: error.message });
-      continue;
-    }
-    options.onProgress?.(result);
+  if (result.job) {
+    try {
+      result.job = await followJob(result.job, environment, deadline, { ...options,
+        onProgress: job => { result.job = job; options.onProgress?.(result); },
+        onRetry: error => options.onProgress?.({ job_id: jobId, publication_status: 'committed', warning: error.message }),
+      });
+    } catch (error) { throw new Error(`${context()} ${error.message}`, { cause: error }); }
   }
-  if (result.job && (result.job.status === 'failed' || blocked(result.job))) throw new Error(`Repair committed; rebuild ${jobId} failed or is blocked (${result.job.blocked?.reason ?? result.job.status}). ${blockedAdvice(result.job)}`);
   return result;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

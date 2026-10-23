@@ -1,4 +1,4 @@
-import type { AppendReply, BatchReply, PublicationStatus, PublishFailure, PublishReply, RetractReply } from './types';
+import type { AppendReply, BatchReply, PublicationStatus, PublishFailure, PublishReply, RebuildResumeReply, RetractReply } from './types';
 import { isTimestamp } from './validation';
 import { publicationOperation, alertMutation } from './operations';
 
@@ -94,16 +94,18 @@ export function committedFailureAdvice(retryable: boolean, operation?: string): 
 export function publicationFailure(error: unknown, stage: string, publication_status: PublicationStatus, operation?: string): PublishFailure {
   const failure = asHttpError(error);
   const retryable = publication_status === 'unknown' || failure.retryable;
+  const details = { details: detailsWithStage(failure.details, stage), details_truncated: failure.details_truncated,
+    ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) };
   if (alertMutation(operation) && retryable && ['unknown', 'not_committed'].includes(publication_status)) {
     const advice = operation === 'alert_confirm' ? 'Look up each confirmation client_ref or retry the unchanged batch within the original 30 Los Angeles receipt-date reference window.' : operation === 'alert_retract'
       ? 'Reconcile the alert history or retry the same retraction with its original publishing token; a first retraction must commit within 24 hours of the entry receipt.'
       : 'Look up GET /api/alerts?client_ref=YOUR_REFERENCE or retry the unchanged submission within its original 30 Los Angeles receipt-date reference window.';
-    return { status: failure.status, code: failure.code, error: `${publication_status === 'unknown' ? 'Unable to confirm the alert operation; it may have completed.' : 'The alert operation did not commit.'} ${advice}`, stage, publication_status, retryable };
+    return { status: failure.status, code: failure.code, error: `${publication_status === 'unknown' ? 'Unable to confirm the alert operation; it may have completed.' : 'The alert operation did not commit.'} ${advice}`, stage, publication_status, retryable, ...details };
   }
   if (operation === 'event' && retryable && ['unknown', 'not_committed'].includes(publication_status)) {
     return { status: failure.status, code: failure.code, error: publication_status === 'unknown'
       ? 'Unable to confirm event publication; it may have completed. Retry the unchanged payload; retained occurrences are deduplicated by source URL and start time.'
-      : 'Event publication did not commit. Retry the unchanged payload.', stage, publication_status, retryable };
+      : 'Event publication did not commit. Retry the unchanged payload.', stage, publication_status, retryable, ...details };
   }
   operation = publicationOperation(operation);
   const message = failure.code === 'publication_conflict' ? failure.message : publication_status === 'unknown' ? operation === 'retract'
@@ -113,7 +115,7 @@ export function publicationFailure(error: unknown, stage: string, publication_st
       ? 'Retraction did not commit. Retry promptly with the original token within 24 hours of the original batch receipt; after that deadline contact the operator.'
       : 'Publication did not commit. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.'
     : failure.message;
-  return { status: failure.status, code: failure.code, error: message, stage, publication_status, retryable, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) };
+  return { status: failure.status, code: failure.code, error: message, stage, publication_status, retryable, ...details };
 }
 
 export function declaredBodyBytes(request: Request): number | undefined {
@@ -182,4 +184,13 @@ export function failureError(f: PublishFailure): HttpError {
   return new HttpError(f.status, f.error, retryHeaders(f.retry_at), { stage: f.stage, code: f.code,
     retryable: f.retryable, retry_at: f.retry_at, publication_status: f.publication_status,
     details: detailsWithStage(f.details, f.stage), details_truncated: f.details_truncated });
+}
+
+export function isRebuildResumeReply(value: unknown): value is RebuildResumeReply {
+  if (!value || typeof value !== 'object') return false;
+  const reply = value as Record<string, any>;
+  if (reply.ok === false) return isPublishReply(value);
+  const job = reply.result;
+  return reply.ok === true && (job === null || job === 'conflict' || !!job && typeof job.id === 'string'
+    && /^[a-f0-9-]{36}$/.test(job.id) && ['queued', 'running', 'completed', 'failed'].includes(job.status));
 }

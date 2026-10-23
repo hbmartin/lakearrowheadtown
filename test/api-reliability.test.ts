@@ -356,7 +356,7 @@ describe('actionable diagnostics', () => {
     const id = '00000000-0000-0000-0000-000000000000';
     const path = stage === 'enqueue_rebuild' ? '/api/rebuild' : `/api/rebuild/${id}${stage === 'resume_rebuild' ? '/resume' : ''}`;
     const failed = () => { throw new Error('private RPC failure'); };
-    const response = await request(path, { method: stage === 'rebuild_status' ? 'GET' : 'POST', headers }, { PUBLISHER: { getByName: () => ({ enqueueRebuild: failed, jobStatus: failed, resumeRebuild: failed }) } as unknown as Env['PUBLISHER'] });
+    const response = await request(path, { method: stage === 'rebuild_status' ? 'GET' : 'POST', headers }, { PUBLISHER: { getByName: () => ({ enqueueRebuild: failed, jobStatus: failed, resumeRebuild: failed, resumeRebuildV1: failed }) } as unknown as Env['PUBLISHER'] });
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ code: 'service_unavailable', retryable: true, diagnostics: { stage } });
   });

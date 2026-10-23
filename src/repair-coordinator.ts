@@ -236,11 +236,12 @@ export class RepairCoordinator {
         return { publication: publicationHead(index), unchanged: true, ...(job ? { job } : {}) };
       }
       if (index.version !== input.expected_version) throw publicationChanged();
+      const id = crypto.randomUUID();
+      repairMetadata(index, { id, input });
       const job = await this.reserve(origin, trace, context);
       const migration = await boundary('storage', () => this.storage.get<{ complete: boolean }>('migration'));
       await trace.run('repair_validation', () => validateRepairTargets(this.bucket, input, migration?.complete ?? false));
-      record = { id: crypto.randomUUID(), key, input, etag: index.etag, job, state: 'pending', phase: 'prepared', attempts: 0 };
-      repairMetadata(index, record);
+      record = { id, key, input, etag: index.etag, job, state: 'pending', phase: 'prepared', attempts: 0 };
       const saved = record;
       try {
         await trace.run('repair_preparation', () => boundary('storage', () => this.storage.transaction(async storage => {
