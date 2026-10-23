@@ -312,3 +312,19 @@ it.each([429, 503, 200])('logs upstream status and cancels unused weather bodies
   expect(errors.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({ event: 'weather_pull_failed', upstream_status: status,
     error_code: status === 200 ? 'body_too_large' : 'weather_upstream_failed', stage: status === 200 ? 'weather_body_read' : 'weather_fetch' }));
 });
+
+it.each(['pending', 'etag_put', 'etag_delete'] as const)('classifies weather %s persistence failures as storage errors', async fault => {
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify(sample()), { headers: fault === 'etag_delete' ? {} : { ETag: '"new"' } }));
+  await runInDurableObject(publisher(), async (instance, state) => {
+    const method = fault === 'etag_delete' ? 'delete' : 'put'; const original = state.storage[method].bind(state.storage) as any;
+    const injection = vi.spyOn(state.storage, method).mockImplementation(((key: string, ...args: any[]) => {
+      if (key === (fault === 'pending' ? 'conditions:pending' : 'weather:etag')) throw new Error('Private durable storage outage');
+      return original(key, ...args);
+    }) as any);
+    try { await instance.pullWeatherV1(base); } finally { injection.mockRestore(); }
+  });
+  expect(errors.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({ event: 'weather_pull_failed', error_code: 'storage_error',
+    stage: fault === 'pending' ? 'weather_storage_write' : 'weather_etag_write', failure_kind: 'storage' }));
+  expect(JSON.stringify(errors.mock.calls)).not.toContain('Private durable storage outage');
+});

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { maintenance, repairAndFollow, waitForRebuild } from '../scripts/maintenance.mjs';
+import { fakeClock } from './helpers/clock.mjs';
 const id = '00000000-0000-0000-0000-000000000001';
 const secret = 'a'.repeat(64);
 const publication = { version: 'version-one', manifest: `publications/${id}.json`, rss: `publications/${id}.rss.xml`, archives: null };
@@ -176,15 +177,59 @@ test('invalid Retry-After falls back to the JSON deadline against server time', 
 });
 
 test('repair POST honors a trusted two-minute deadline across four bounded sleeps', async () => {
-  let clock = 0; const waits = []; const calls = []; const server = Date.parse('2026-10-23T12:00:00Z');
-  await repairAndFollow('preview', undefined, { ...options, payload, now: () => clock,
-    sleep: async ms => { waits.push(ms); clock += ms; }, request: async (_url, init) => {
-      calls.push({ at: clock, body: init.body, method: init.method });
+  const timing = fakeClock(); const calls = []; const server = Date.parse('2026-10-23T12:00:00Z');
+  await repairAndFollow('preview', undefined, { ...options, payload, ...timing, request: async (_url, init) => {
+      calls.push({ at: timing.now(), body: init.body, method: init.method });
       return calls.length === 1 ? Response.json({ code: 'repair_pending', retryable: true, retry_at: new Date(server + 120000).toISOString() },
         { status: 503, headers: { Date: new Date(server).toUTCString(), 'Retry-After': '120' } }) : Response.json({ publication, unchanged: true });
     } });
-  assert.deepEqual(waits, [30000, 30000, 30000, 30000]); assert.deepEqual(calls.map(call => call.at), [0, 120000]);
+  assert.deepEqual(timing.waits, [30000, 30000, 30000, 30000]); assert.deepEqual(calls.map(call => call.at), [0, 120000]);
   assert.equal(calls[0].body, calls[1].body);
+});
+
+for (const tool of ['wait', 'repair', 'pending-repair']) for (const [status, code] of [[401, 'unauthorized'], [404, 'job_not_found'], [503, 'repair_damaged']]) {
+  test(`${tool} preserves permanent ${status} ${code} from the final check`, async () => {
+    const timing = fakeClock(); const methods = [];
+    const config = { ...options, ...timing, payload, timeoutMs: 1000, request: async (_url, init) => {
+      methods.push(init.method);
+      if (init.method === 'POST') return tool === 'pending-repair'
+        ? Response.json({ code: 'repair_pending', retryable: true, publication_status: 'committed', details: { job_id: id } }, { status: 503 })
+        : Response.json({ publication, job: { id, status: 'running' } });
+      assert.equal(timing.now(), 1000);
+      return Response.json({ error: 'Correct the credential or job identity', code, retryable: false }, { status });
+    } };
+    await assert.rejects(tool === 'wait' ? waitForRebuild({ id, status: 'running' }, 'preview', config) : repairAndFollow('preview', undefined, config),
+      error => error.status === status && error.code === code && error.retryable === false && error.message.includes(`${status} ${code}`)
+        && !error.message.includes('completion remains unconfirmed') && (tool === 'wait' || error.message.includes(`Repair committed; rebuild ${id}`)));
+    assert.deepEqual(methods, tool === 'wait' ? ['GET'] : ['POST', 'GET']);
+  });
+}
+
+for (const kind of ['retryable', 'malformed', 'late-permanent']) test(`final check retains uncertainty for a ${kind} response`, async () => {
+  const timing = fakeClock(); let calls = 0;
+  await assert.rejects(waitForRebuild({ id, status: 'running' }, 'preview', { ...options, ...timing, timeoutMs: 1000,
+    request: async () => {
+      calls++; if (kind === 'late-permanent') { timing.advance(30001); return Response.json({ code: 'job_not_found', retryable: false }, { status: 404 }); }
+      return kind === 'retryable' ? Response.json({ code: 'storage_error', error: 'Storage unavailable', retryable: true }, { status: 503 }) : Response.json({ job: {} });
+    } }), /completion remains unconfirmed/);
+  assert.equal(calls, 1);
+});
+
+test('fails clearly for a nonadvancing injected clock instead of spinning or making another request', async () => {
+  let calls = 0; let sleeps = 0;
+  await assert.rejects(waitForRebuild({ id, status: 'running' }, 'preview', { ...options, now: () => 0, sleep: async () => { sleeps++; }, request: async () => { calls++; } }), /sleep must advance.*monotonic clock/);
+  assert.equal(calls, 0); assert.equal(sleeps, 1);
+});
+
+test('partially advancing sleeps still wait until request eligibility without consuming retry attempts', async () => {
+  const timing = fakeClock(); const calls = []; const waits = [];
+  await repairAndFollow('preview', undefined, { ...options, ...timing, payload, sleep: async ms => { waits.push(ms); timing.advance(Math.min(ms, 250)); },
+    request: async (_url, init) => {
+      calls.push({ at: timing.now(), body: init.body }); return calls.length === 1
+        ? Response.json({ code: 'repair_pending', retryable: true }, { status: 503, headers: { 'Retry-After': '1.2' } }) : Response.json({ publication, unchanged: true });
+    } });
+  assert.deepEqual(calls.map(call => call.at), [0, 1200]); assert.equal(calls[0].body, calls[1].body);
+  assert.deepEqual(waits, [1200, 950, 700, 450, 200]);
 });
 
 for (const tool of ['wait', 'repair']) test(`${tool} observes completion in exactly one final read-only grace check`, async () => {
