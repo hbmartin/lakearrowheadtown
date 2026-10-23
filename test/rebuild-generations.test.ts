@@ -177,3 +177,20 @@ it.each([false, true])('retains a lost-acknowledgement generation while repairin
     expect(await state.storage.get(generationKey(job.id, generation!))).toMatchObject({ prior_checkpoint: { phase: 'dispatching' }, prior_committed: landsFirst });
   });
 });
+
+it.each(['checkpoint', 'job'])('fails closed when retained generation %s evidence is damaged', async field => {
+  const job = await pausedJob(); const reply = await publisher().publicationRepairV1(await repairInput(), origin);
+  if (!reply.ok) throw new Error('Expected repaired job');
+  const generation = reply.result.job!.generation_id!;
+  const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
+  await inside(publisher(), async (instance, state) => {
+    const key = generationKey(job.id, generation); const handoff = (await state.storage.get<any>(key))!;
+    if (field === 'checkpoint') delete handoff.prior_checkpoint; else handoff.prior_job = { id: job.id };
+    await state.storage.put(key, handoff);
+    expect(await instance.publicationRepairV1(await repairInput(), origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_checkpoint_damaged' } });
+    await instance.resumeRebuild(job.id); await instance.alarm();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ blocked: { reason: 'rebuild_checkpoint_damaged' } });
+    expect(await state.storage.get('jobs')).toEqual([job.id]);
+  });
+  expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(before);
+});

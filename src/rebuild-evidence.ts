@@ -50,6 +50,10 @@ export function readHandoff(value: unknown, job: RebuildJob): GenerationHandoff 
   if (!record(value) || value.version !== 1 || value.job_id !== job.id || value.generation_id !== job.generation_id
     || !validGeneration(value.generation_id)
     || !validGeneration(value.repair_id) || !record(value.prior_job) || value.prior_job.id !== job.id
+    || !['queued', 'running', 'failed'].includes(String(value.prior_job.status)) || typeof value.prior_job.origin !== 'string'
+    || !['migration', 'render'].includes(String(value.prior_job.phase)) || !Number.isSafeInteger(value.prior_job.processed)
+    || Number(value.prior_job.processed) < 0 || value.prior_job.generation_id !== undefined && !validGeneration(value.prior_job.generation_id)
+    || value.prior_checkpoint === undefined
     || typeof value.prior_committed !== 'boolean' || typeof value.repairable_code !== 'string'
     || value.prior_archive_checkpoint !== null && typeof value.prior_archive_checkpoint !== 'string') throw checkpointDamaged('Rebuild generation evidence is damaged. Restore its exact generation record from a verified backup before resuming.');
   if (value.prior_checkpoint !== null) readCheckpoint(value.prior_checkpoint, value.prior_job as unknown as RebuildJob);
