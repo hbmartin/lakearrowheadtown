@@ -263,7 +263,7 @@ describe('request failure context', () => {
   it('reserves the publication uncertainty warning for an attempted publisher call', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const failed = () => { throw new Error('private storage detail'); };
-    const PUBLISHER = { getByName: () => ({ publishV2: failed, enqueueRebuild: failed, jobStatus: failed, resumeRebuild: failed }) } as unknown as Env['PUBLISHER'];
+    const PUBLISHER = { getByName: () => ({ publishV2: failed, enqueueRebuild: failed, jobStatus: failed, resumeRebuild: failed, resumeRebuildV1: failed }) } as unknown as Env['PUBLISHER'];
     const SITE_BUCKET = { get: failed, head: failed, put: failed } as unknown as R2Bucket;
     const id = '00000000-0000-0000-0000-000000000000';
     const responses = [

@@ -178,6 +178,8 @@ export interface RebuildBlocker {
   retry_at?: string;
 }
 
+export type RebuildResumeReply = { ok: true; result: RebuildJob | 'conflict' | null } | { ok: false; failure: PublishFailure };
+
 export interface RebuildJob {
   recovery?: { code: string; stage: string; retryable: boolean; publication_status: PublicationStatus; failed_at: string };
   manual_resume?: boolean;

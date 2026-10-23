@@ -256,3 +256,59 @@ it('does not replace a legacy page when its preserved news anchor is invalid or 
     expect((await bucket.head('pages/index.html'))!.version).toBe(before.version);
   }
 });
+
+it.each([[false, false], [false, true], [true, false], [true, true]])('avoids clock-only writes with alert failure=%s and weather failure=%s', async (badAlerts, badWeather) => {
+  const now = new Date('2026-10-23T18:00:00Z'); vi.setSystemTime(now);
+  try {
+    await submitAlert(bucket, validateAlertInput({ client_ref: 'stable-alert', phase: 'open', category: 'traffic', kind: 'closure', routes: ['SR-18'], headline: 'Stable closure', source: 'caltrans', source_url: 'https://roads.dot.ca.gov/', observed_at: now.toISOString() }), 'a'.repeat(64), now);
+    await bucket.put(WEATHER_KEY, JSON.stringify(sample()));
+    if (badAlerts) await bucket.put(ALERTS_KEY, '{broken'); if (badWeather) await bucket.put(WEATHER_KEY, '{broken');
+    await composeHomepageConditions(bucket, base);
+    const before = (await bucket.get('pages/index.html'))!; const html = await before.text();
+    vi.setSystemTime(new Date(+now + 300000));
+    const put = vi.fn((key: string, value: any, options: any) => bucket.put(key, value, options));
+    const store = new Proxy(bucket, { get(target, property) { if (property === 'put') return put; const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value; } });
+    expect(await composeHomepageConditions(store, base)).toBe(!badAlerts && !badWeather);
+    expect(put).not.toHaveBeenCalled(); expect(await (await bucket.get('pages/index.html'))!.text()).toBe(html);
+    if (badAlerts && badWeather) expect(html).not.toContain('<div class="conditions-row">');
+    if (!badWeather) {
+      const fresh = sample(); fresh.observation.temp_f += 1;
+      await bucket.put(WEATHER_KEY, JSON.stringify(fresh)); await composeHomepageConditions(store, base);
+      expect(put).toHaveBeenCalledTimes(1); expect(await (await bucket.get('pages/index.html'))!.text()).not.toBe(html);
+    }
+  } finally { vi.useRealTimers(); }
+});
+
+it('clears recovery markers without refreshing unchanged snapshot text after time advances', async () => {
+  const now = new Date('2026-10-23T18:00:00Z'); vi.setSystemTime(now);
+  try {
+    await bucket.put(WEATHER_KEY, JSON.stringify(sample())); await composeHomepageConditions(bucket, base);
+    const before = (await bucket.get('pages/index.html'))!; const html = await before.text();
+    await bucket.put('pages/index.html', html, { customMetadata: { ...before.customMetadata, conditions_status: 'unavailable' } });
+    vi.setSystemTime(new Date(+now + 300000));
+    await runInDurableObject(publisher(), async (instance, state) => { await state.storage.put('conditions:pending', true); await (instance as any).finishConditions(base); expect(await state.storage.get('conditions:pending')).toBeUndefined(); });
+    const healed = (await bucket.get('pages/index.html'))!; expect(await healed.text()).toBe(html); expect(healed.customMetadata?.conditions_status).toBeUndefined();
+  } finally { vi.useRealTimers(); }
+});
+
+it('logs the neutral conditions metadata code and retains pending intent without replacing the page', async () => {
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+  await bucket.put('pages/index.html', renderPage([], { origin: base }), { customMetadata: { padding: 'x'.repeat(8185) } });
+  await bucket.put(WEATHER_KEY, '{broken'); const version = (await bucket.head('pages/index.html'))!.version;
+  await runInDurableObject(publisher(), async (instance, state) => {
+    await state.storage.put('conditions:pending', true);
+    await (instance as any).finishConditions(base, { request_id: 'conditions-error', operation: 'alert', worker_version: 'test', environment: 'preview' });
+    expect(await state.storage.get('conditions:pending')).toBe(true);
+  });
+  expect((await bucket.head('pages/index.html'))!.version).toBe(version);
+  expect(errors.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({ event: 'conditions_composition_failed', error_code: 'index_metadata_too_large', stage: 'conditions_composition' }));
+});
+
+it.each([429, 503, 200])('logs upstream status and cancels unused weather bodies (%s)', async status => {
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {}); const cancel = vi.fn();
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(new ReadableStream({ cancel }), { status, headers: status === 200 ? { 'Content-Length': String(128 * 1024 + 1) } : {} }));
+  await publisher().pullWeatherV1(base);
+  expect(cancel).toHaveBeenCalledTimes(1);
+  expect(errors.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({ event: 'weather_pull_failed', upstream_status: status,
+    error_code: status === 200 ? 'body_too_large' : 'weather_upstream_failed', stage: status === 200 ? 'weather_body_read' : 'weather_fetch' }));
+});

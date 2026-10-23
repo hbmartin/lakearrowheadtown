@@ -668,7 +668,7 @@ export function isAlertsReply(value: unknown): value is AlertsReply {
 export function alertRpcFailure(error: unknown, context?: OperationContext): Extract<AlertsReply, { ok: false }> {
   const failure = asHttpError(error);
   const stage = (error as { alert_stage?: string })?.alert_stage ?? 'alerts';
-  emit('alert_operation_failed', context, { error_code: failure.code, stage, ...safeError(error) }, failure.status >= 500 ? 'error' : 'warn');
+  emit('alert_operation_failed', context, { error_code: failure.code, stage, ...safeError(error) }, failure.status >= 500 && failure.code !== 'confirmations_not_enabled' ? 'error' : 'warn');
   return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, stage,
     publication_status: failure.publication_status ?? 'not_attempted', retryable: failure.retryable,
     details: detailsWithStage(failure.details, stage), details_truncated: failure.details_truncated } };

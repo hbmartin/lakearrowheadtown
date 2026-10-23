@@ -19,7 +19,7 @@ import { isIndexable, metadataResource } from './public-metadata';
 import type { AppendReply, Digest, Env, OperationContext, PublicationStatus, PublishReply, PublishResult, RebuildJob, StoryUpdate } from './types';
 import { emit, fingerprint, OperationTrace, safeError } from './diagnostics';
 import { HttpError, isTimestamp, parseDigestJson, readLimited, validateClientRef, validateDigest, validateUpdate } from './validation';
-import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isBatchReply, isPublishReply, isRetractReply, OperationFailure, publicationFailure, failureError } from './errors';
+import { asHttpError, boundary, declaredBodyBytes, isAppendReply, isBatchReply, isPublishReply, isRetractReply, isRebuildResumeReply, OperationFailure, publicationFailure, failureError } from './errors';
 import notFoundPage from './not-found';
 import { noStoreHeaders } from './responses';
 import { thumbnailResponse } from './thumbnails';
@@ -317,9 +317,12 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
         if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
         return reply({ ok: true, job });
       }
-      const job = await trace.run<RebuildJob | 'conflict' | null>('resume_rebuild', () => boundary('rpc', async () => await publisher.resumeRebuild(maintenance[1], context)));
+      const received: unknown = await trace.run('resume_rebuild', () => boundary('rpc', () => publisher.resumeRebuildV1(maintenance[1], context)));
+      if (!isRebuildResumeReply(received)) throw new OperationFailure('rpc', new Error('Invalid rebuild resume reply'));
+      if (!received.ok) throw failureError(received.failure);
+      const job = received.result;
       if (!job) throw new HttpError(404, 'Job not found', {}, { code: 'job_not_found' });
-      if (job === 'conflict') throw new HttpError(409, 'Only a failed queue head or a stalled queued/running head without an alarm can resume', {}, { code: 'job_not_resumable' });
+      if (job === 'conflict') throw new HttpError(409, 'Only a failed queue head, an explicitly paused head, or an unscheduled queued/running head can resume; active scheduled heads cannot resume', {}, { code: 'job_not_resumable' });
       return reply({ ok: true, job }, 202);
     }
     if (path === '/api/digests' || path === '/api/events' || path === '/api/images' || append) {
@@ -437,7 +440,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     const diagnostics = { stage, ...(state.bytes_received !== undefined ? { bytes_received: state.bytes_received, body_complete: state.body_complete ?? false } : {}), ...(state.declared_body_bytes !== undefined ? { declared_body_bytes: state.declared_body_bytes } : {}), ...(state.body_sha256 ? { body_sha256: state.body_sha256 } : {}) };
     emit('request_error', context, { error_code: failure.code, status: failure.status, ...diagnostics, publication_status: state.publication_status, publication_outcome: state.publication_outcome,
       ...(Array.isArray(failure.details) ? { issues: failure.details.map(({ path, code }) => ({ path, code })), details_truncated: failure.details_truncated } : {}),
-      ...(!expected || failure.status >= 500 ? safeError(error) : {}) }, failure.status >= 500 ? 'error' : 'warn');
+      ...(!expected || failure.status >= 500 ? safeError(error) : {}) }, failure.status >= 500 && failure.code !== 'confirmations_not_enabled' ? 'error' : 'warn');
     if (!isApi && failure.status === 404) {
       const headers = noStoreHeaders('text/html; charset=utf-8', failure.headers);
       headers.set('X-Robots-Tag', 'noindex');
@@ -464,7 +467,7 @@ function routeFor(path: string, method: string): { route: string; operation: str
   if (/^\/api\/posts\/[^/]+\/retract$/.test(path)) return { route: '/api/posts/:id/retract', operation: 'retract' };
   if (/^\/api\/rebuild(?:\/[a-f0-9-]{36}(?:\/resume)?)?$/.test(path)) return { route: path === '/api/rebuild' ? path : path.endsWith('/resume') ? '/api/rebuild/:id/resume' : '/api/rebuild/:id', operation: 'rebuild' };
   if (path.startsWith('/api/') || path === '/api') return { route: '/api/*', operation: 'read' };
-  if (path.startsWith('/thumbnails/')) return { route: '/thumbnails/v1/:file/:edge', operation: 'read' };
+  if (path.startsWith('/thumbnails/')) return { route: path.startsWith('/thumbnails/v2/') ? '/thumbnails/v2/:file/:edge.:format' : '/thumbnails/v1/:file/:edge', operation: 'read' };
   return { route: path === '/' || path === '/index.html' ? '/' : path.startsWith('/images/') ? '/images/:file' : '/public/*', operation: 'read' };
 }
 

@@ -16,7 +16,8 @@ export function errorSuggestion(code: string, retryable: boolean, dryRun = false
     if (['retract_forbidden', 'retract_window_expired'].includes(code)) return { action: 'contact_operator', message: 'Retraction requires the original publishing token and an entry received less than 24 hours ago.' };
     if (code === 'invalid_dry_run') return { action: 'correct_dry_run', message: 'Use one dry_run=true or dry_run=false query parameter.' };
     if (code === 'confirmation_not_retractable') return { action: 'correct_alert', message: 'Confirmations cannot be undone. Submit a corrective observation or contact the operator if the latest observation prevents correction.' };
-    if (code === 'confirmations_not_enabled') return { action: 'complete_reader_rollout', message: 'Continue ordinary phase: "update" checks, or test batches with dry_run=true. Switch to batch writes after the operator deploys compatible readers and enables ALERT_CONFIRMATIONS_ENABLED for this environment.' };
+    if (code === 'confirmations_not_enabled') return { action: 'use_ordinary_alert_update', method: 'POST', path: '/api/alerts',
+      message: 'No batch checks committed. Confirm through ordinary phase: "update" requests with separately persisted references, including after rollback. Stop retrying this batch after fallback succeeds; switch back to batching only after the operator confirms enablement.' };
     if (retryable) return { action: operation === 'alert_retract' ? 'reconcile_or_retry_retraction' : 'look_up_or_retry_alert', message: operation === 'alert_retract'
       ? 'Read alert history or retry the same retraction promptly with its original token.'
       : 'Look up the exact client_ref or retry the unchanged submission within its original 30 Los Angeles receipt-date reference window.', method: 'GET', path: '/api/alerts' };

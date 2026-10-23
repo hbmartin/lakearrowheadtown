@@ -21,7 +21,8 @@ export const isPaused = (job: RebuildJob | null | undefined): boolean => !!job &
 
 export function restartRebuild(job: RebuildJob): RebuildJob {
   const next = { ...job, status: 'queued' as const, scheduling: 'automatic' as const };
-  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume', 'blocked', 'blocked_by', 'recovery'] as const) delete next[key];
+  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume', 'blocked', 'blocked_by'] as const) delete next[key];
+  if (next.recovery && !['unknown', 'committed'].includes(next.recovery.publication_status)) delete next.recovery;
   return next;
 }
 export function newRebuild(id: string, origin: string, migration: { complete: boolean; processed: number }, context?: OperationContext): RebuildJob {
@@ -236,11 +237,12 @@ export class RepairCoordinator {
         return { publication: publicationHead(index), unchanged: true, ...(job ? { job } : {}) };
       }
       if (index.version !== input.expected_version) throw publicationChanged();
+      const id = crypto.randomUUID();
+      repairMetadata(index, { id, input });
       const job = await this.reserve(origin, trace, context);
       const migration = await boundary('storage', () => this.storage.get<{ complete: boolean }>('migration'));
       await trace.run('repair_validation', () => validateRepairTargets(this.bucket, input, migration?.complete ?? false));
-      record = { id: crypto.randomUUID(), key, input, etag: index.etag, job, state: 'pending', phase: 'prepared', attempts: 0 };
-      repairMetadata(index, record);
+      record = { id, key, input, etag: index.etag, job, state: 'pending', phase: 'prepared', attempts: 0 };
       const saved = record;
       try {
         await trace.run('repair_preparation', () => boundary('storage', () => this.storage.transaction(async storage => {

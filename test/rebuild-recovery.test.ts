@@ -581,3 +581,10 @@ describe('maintenance methods, manifest damage, and upload admission', () => {
     } finally { release(); await Promise.all(pending); }
   });
 });
+
+it.each(['missing', 'malformed', 'transport'])('fails closed for an unavailable typed resume RPC (%s) without legacy fallback', async failure => {
+  const legacy = vi.fn(() => { throw new Error('Must not resume through fallback'); });
+  const methods = { resumeRebuild: legacy, ...(failure === 'missing' ? {} : { resumeRebuildV1: () => { if (failure === 'transport') throw new Error('private transport failure'); return { ok: true }; } }) };
+  const response = await request(`/api/rebuild/${id}/resume`, { method: 'POST', headers }, { PUBLISHER: { getByName: () => methods } as unknown as Env['PUBLISHER'] });
+  expect(response.status).toBe(503); expect(await response.json()).toMatchObject({ code: 'service_unavailable', retryable: true }); expect(legacy).not.toHaveBeenCalled();
+});

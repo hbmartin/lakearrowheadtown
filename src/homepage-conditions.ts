@@ -20,7 +20,7 @@ async function loadWeather(bucket: ContentBucket): Promise<ReturnType<typeof ren
 function conditionsHtml(banner: string, weather: ReturnType<typeof renderWeather> | null, now: Date, notice = ''): string {
   if (!banner && !weather && !notice) return '';
   return `<section class="homepage-conditions${banner ? ' has-alerts' : ''}${weather ? ' has-weather' : ''}" aria-label="Mountain conditions snapshot">
-    <p class="conditions-as-of">Conditions snapshot: ${weatherTime(now.toISOString())}</p>${notice}<div class="conditions-row">${banner}${weather?.summary ?? ''}</div>${weather?.details ?? ''}
+    <p class="conditions-as-of">Conditions snapshot: ${weatherTime(now.toISOString())}</p>${notice}${banner || weather ? `<div class="conditions-row">${banner}${weather?.summary ?? ''}</div>` : ''}${weather?.details ?? ''}
     </section>${weather ? `<script id="weather-interaction">
     (() => {
       const root = document.querySelector('.homepage-conditions');
@@ -68,7 +68,12 @@ export async function composeHomepageConditions(bucket: R2Bucket, origin: string
   const index = await boundary('storage', () => bucket.get('pages/index.html'));
   const base = index ? await boundary('storage', () => index.text()) : renderPage([], { origin });
   const snapshot = await conditionsSnapshot(bucket, context);
-  const body = replaceConditions(base, snapshot.html);
+  const rendered = replaceConditions(base, snapshot.html);
+  const previous = marker.exec(base)?.[0];
+  const proposed = marker.exec(rendered)![0];
+  // Ignore only our generated snapshot clock, never observation/expiry times.
+  const content = (block: string) => block.replace(/<p class="conditions-as-of">[\s\S]*?<\/p>/, '');
+  const body = previous && content(previous) === content(proposed) ? base : rendered;
   const metadata: Record<string, string> = { ...index?.customMetadata, ...(!index ? { conditions_only: 'true' } : {}) };
   if (index && !metadata.manifest && metadata.conditions_only !== 'true') {
     metadata[NEWS_ANCHOR] ??= index.uploaded.toISOString();
