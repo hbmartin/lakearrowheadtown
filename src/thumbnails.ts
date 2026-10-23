@@ -1,6 +1,6 @@
 import { matchesEtag, parseIfNoneMatch } from './conditions';
 import { emit, safeError, type OperationTrace } from './diagnostics';
-import { boundary, OperationFailure } from './errors';
+import { asHttpError, boundary, OperationFailure } from './errors';
 import { dimensions, readImageMetadata, validImageMetadata, type ImageMetadata } from './image-metadata';
 import { IMAGE_CACHE, IMAGE_LIMIT } from './images';
 import { noStoreHeaders } from './responses';
@@ -66,6 +66,7 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
   let body: R2ObjectBody | null = null;
   let input: ReadableStream<Uint8Array> | undefined;
   let size: ImageMetadata | undefined;
+  let resolvedFormat: string | undefined;
   let originalVerified = false; let malformed = false;
   const fallback = async (reason: string, error?: unknown): Promise<Response> => {
     const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : undefined;
@@ -74,7 +75,7 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
   };
   const format = () => {
     const sourceType = size?.type ?? (extension === 'jpg' ? 'image/jpeg' : `image/${extension}`);
-    return v2 ? outputExtension === 'jpg' ? 'image/jpeg' : `image/${outputExtension}` : acceptsWebp(request.headers.get('Accept'), sourceType) ? 'image/webp' : sourceType;
+    return resolvedFormat ?? (v2 ? outputExtension === 'jpg' ? 'image/jpeg' : `image/${outputExtension}` : acceptsWebp(request.headers.get('Accept'), sourceType) ? 'image/webp' : sourceType);
   };
   const headersFor = (length: number) => new Headers({ 'Cache-Control': IMAGE_CACHE, 'Cloudflare-CDN-Cache-Control': IMAGE_CACHE,
     ...(!v2 ? { Vary: 'Accept' } : {}), 'X-Content-Type-Options': 'nosniff', 'Content-Type': format(), 'Content-Length': String(length),
@@ -85,11 +86,17 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
   };
   const readCache = (variant: ReturnType<typeof derivative>) => boundary('storage', () => request.method === 'HEAD' || condition ? env.SITE_BUCKET.head(variant.key) : env.SITE_BUCKET.get(variant.key));
   const cachedResponse = async (cached: R2Object | null, variant: ReturnType<typeof derivative>): Promise<Response | null> => {
-    if (variant.oversized(cached)) { await discard(cached); return fallback('derivative_oversized'); }
+    if (variant.oversized(cached)) {
+      await discard(cached); emit('thumbnail_cache_outcome_hit', trace.context, { edge, format: format(), outcome: 'oversized' });
+      return fallback('derivative_oversized');
+    }
     if (!variant.valid(cached)) { await discard(cached); return null; }
-    if (matchesEtag(condition, headersFor(cached.size).get('ETag')!) || request.method === 'HEAD') { await discard(cached); return response(cached.size, null); }
+    if (matchesEtag(condition, headersFor(cached.size).get('ETag')!) || request.method === 'HEAD') {
+      await discard(cached); emit('thumbnail_cache_hit', trace.context, { edge, format: format() }); return response(cached.size, null);
+    }
     const full = 'body' in cached ? cached as R2ObjectBody : await boundary('storage', () => env.SITE_BUCKET.get(variant.key));
     if (!variant.valid(full)) { await discard(full); return null; }
+    emit('thumbnail_cache_hit', trace.context, { edge, format: format() });
     return response(full!.size, full!.body);
   };
   const loadInput = async () => {
@@ -117,19 +124,36 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
     originalVerified = true;
     if (initial.status === 'rejected') throw initial.reason;
     size = initial.value.legacy?.size;
+    let cached = initial.value.cached;
+    let detected = false;
     if (!v2 && !size) {
+      const formats = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'].map(type =>
+        acceptsWebp(request.headers.get('Accept'), type) ? 'image/webp' : type));
+      if (formats.size === 1) {
+        resolvedFormat = formats.values().next().value;
+        phase = 'cache_read';
+        const variant = derivative(key, edge, format()); cached = await readCache(variant);
+        const hit = await cachedResponse(cached, variant); if (hit) return hit;
+      }
       if (request.method === 'HEAD') return fallback('derivative_missing');
+      if (!env.IMAGES || typeof env.IMAGES.input !== 'function') return fallback('binding_unavailable');
       phase = 'source'; await loadInput();
-      const legacy = initial.value.legacy!;
-      phase = 'cache_write';
-      await boundary('storage', () => env.SITE_BUCKET.put(legacy.key, '', { onlyIf: legacy.saved ? { etagMatches: legacy.saved.etag } : { etagDoesNotMatch: '*' },
-        customMetadata: { version: '1', source: key, width: String(size!.width), height: String(size!.height), type: size!.type } }));
+      detected = true;
     }
     phase = 'cache_read';
     const variant = derivative(key, edge, format());
-    const cached = v2 ? initial.value.cached! : await readCache(variant);
+    if (cached === undefined) cached = await readCache(variant);
     const hit = await cachedResponse(cached, variant);
-    if (hit) { emit('thumbnail_cache_hit', trace.context, { edge, format: format() }); return hit; }
+    if (detected) {
+      const legacy = initial.value.legacy!;
+      try {
+        await boundary('storage', () => env.SITE_BUCKET.put(legacy.key, '', { onlyIf: legacy.saved ? { etagMatches: legacy.saved.etag } : { etagDoesNotMatch: '*' },
+          customMetadata: { version: '1', source: key, width: String(size!.width), height: String(size!.height), type: size!.type } }));
+      } catch (error) {
+        emit('thumbnail_source_metadata_write_failed', trace.context, { edge, error_code: asHttpError(error).code, ...safeError(error) }, 'warn');
+      }
+    }
+    if (hit) return hit;
     if (cached) emit('thumbnail_cache_invalid', trace.context, { edge, format: format() }, 'warn');
     if (request.method === 'HEAD') return fallback('derivative_missing');
     if (!env.IMAGES || typeof env.IMAGES.input !== 'function') return fallback('binding_unavailable');

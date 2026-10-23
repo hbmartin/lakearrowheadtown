@@ -379,3 +379,58 @@ it.each([false, true])('settles parallel cache reads and cancels unused bodies w
   try { await reading; } finally { release(); }
   expect((await pending).status).toBe(storageError ? 500 : 404); expect(cancel).toHaveBeenCalledTimes(1);
 });
+
+it.each([false, true])('serves a legacy derivative when optional detection metadata cannot be written (cached=%s)', async cached => {
+  const warnings = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  await source(); await bindings.SITE_BUCKET.delete(metadataKey(hash));
+  const mock = encoder(); if (cached) await (await fetch(path, {}, mock)).arrayBuffer();
+  await bindings.SITE_BUCKET.delete(`thumbnail-cache/v1/source-metadata/${hash}.jpg`);
+  const operations: string[] = [];
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) {
+    if (property === 'get') return (key: string) => { operations.push(`get:${key}`); return target.get(key); };
+    if (property === 'put') return (key: string, value: any, options: any) => { operations.push(`put:${key}`); if (key.includes('/source-metadata/')) throw new Error('Private metadata outage'); return target.put(key, value, options); };
+    const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const response = await fetch(path, {}, { ...mock, SITE_BUCKET: store });
+  expect(response.status).toBe(200); expect(new Uint8Array(await response.arrayBuffer())).toEqual(png);
+  expect(mock.output).toHaveBeenCalledTimes(1);
+  const derivativeRead = operations.findIndex(value => value.startsWith('get:thumbnail-cache/v1/scale-down'));
+  const metadataWrite = operations.findIndex(value => value.startsWith('put:thumbnail-cache/v1/source-metadata/'));
+  expect(derivativeRead).toBeGreaterThan(-1); expect(metadataWrite).toBeGreaterThan(derivativeRead);
+  expect(warnings.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({ event: 'thumbnail_source_metadata_write_failed', error_code: 'storage_error' }));
+  expect(JSON.stringify(warnings.mock.calls)).not.toContain('Private metadata outage');
+});
+
+it.each(['GET', 'HEAD', 'conditional'])('serves a verified legacy WebP cache hit without source metadata or binding: %s', async method => {
+  await source(); const mock = encoder();
+  const filled = await fetch(path, { headers: { Accept: 'image/webp' } }, mock); await filled.arrayBuffer();
+  await bindings.SITE_BUCKET.delete(metadataKey(hash));
+  const get = vi.fn((key: string) => { if (key.startsWith('images/')) throw new Error('No original body reads'); return bindings.SITE_BUCKET.get(key); });
+  const put = vi.fn(() => { throw new Error('No writes on a verified hit'); });
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) {
+    if (property === 'get') return get; if (property === 'put') return put;
+    const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const response = await fetch(path, { method: method === 'HEAD' ? 'HEAD' : 'GET', headers: { Accept: 'image/webp', ...(method === 'conditional' ? { 'If-None-Match': filled.headers.get('ETag')! } : {}) } }, { SITE_BUCKET: store, IMAGES: undefined });
+  expect(response.status).toBe(method === 'conditional' ? 304 : 200); expect(response.headers.get('ETag')).toBe(filled.headers.get('ETag'));
+  await response.arrayBuffer(); expect(put).not.toHaveBeenCalled();
+});
+
+it.each([undefined, 'image/webp'])('does not download an unknown legacy original without a binding (Accept=%s)', async accept => {
+  await source(); await bindings.SITE_BUCKET.delete(metadataKey(hash));
+  const get = vi.fn((key: string) => { if (key.startsWith('images/')) throw new Error('No source read without an encoder'); return bindings.SITE_BUCKET.get(key); });
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) { if (property === 'get') return get; const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value; } });
+  const response = await fetch(path, { headers: accept ? { Accept: accept } : {} }, { SITE_BUCKET: store, IMAGES: undefined });
+  expect(response.status).toBe(302); expect(response.headers.get('Cache-Control')).toBe('no-store');
+});
+
+it('distinguishes cached oversized outcomes from successful image cache hits and labels v2 requests', async () => {
+  const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+  await source(); const url = `/thumbnails/v2/${hash}.jpg/160.webp`;
+  await fetch(url, {}, oversizedEncoder()); info.mockClear();
+  const response = await fetch(url, {}, { IMAGES: undefined }); expect(response.status).toBe(302);
+  const events = info.mock.calls.map(([event]) => event);
+  expect(events).toContainEqual(expect.objectContaining({ event: 'thumbnail_cache_outcome_hit', outcome: 'oversized' }));
+  expect(events.some(event => event.event === 'thumbnail_cache_hit')).toBe(false);
+  expect(events).toContainEqual(expect.objectContaining({ event: 'request_completed', route: '/thumbnails/v2/:file/:edge.:format' }));
+});

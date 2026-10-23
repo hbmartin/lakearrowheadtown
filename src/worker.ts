@@ -467,7 +467,7 @@ function routeFor(path: string, method: string): { route: string; operation: str
   if (/^\/api\/posts\/[^/]+\/retract$/.test(path)) return { route: '/api/posts/:id/retract', operation: 'retract' };
   if (/^\/api\/rebuild(?:\/[a-f0-9-]{36}(?:\/resume)?)?$/.test(path)) return { route: path === '/api/rebuild' ? path : path.endsWith('/resume') ? '/api/rebuild/:id/resume' : '/api/rebuild/:id', operation: 'rebuild' };
   if (path.startsWith('/api/') || path === '/api') return { route: '/api/*', operation: 'read' };
-  if (path.startsWith('/thumbnails/')) return { route: '/thumbnails/v1/:file/:edge', operation: 'read' };
+  if (path.startsWith('/thumbnails/')) return { route: path.startsWith('/thumbnails/v2/') ? '/thumbnails/v2/:file/:edge.:format' : '/thumbnails/v1/:file/:edge', operation: 'read' };
   return { route: path === '/' || path === '/index.html' ? '/' : path.startsWith('/images/') ? '/images/:file' : '/public/*', operation: 'read' };
 }
 
