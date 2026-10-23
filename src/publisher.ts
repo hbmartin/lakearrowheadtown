@@ -406,7 +406,7 @@ export class DigestPublisher extends DurableObject<Env> {
       const repair = await this.repairCoordinator().blocker();
       if (repair) result.blocked = repair;
       else if (head.job) {
-        const reason = head.job.status === 'failed' ? 'failed_rebuild' : head.job.recovery?.code === 'rebuild_checkpoint_damaged' ? 'rebuild_checkpoint_damaged' : isPaused(head.job) ? 'manual_resume'
+        const reason = head.job.status === 'failed' ? 'failed_rebuild' : isPaused(head.job) ? head.job.recovery?.code === 'rebuild_checkpoint_damaged' ? 'rebuild_checkpoint_damaged' : 'manual_resume'
           : !this.alarmDeliveries && await boundary('storage', () => this.ctx.storage.getAlarm()) === null ? 'unscheduled' : undefined;
         if (reason) {
           result.blocked = { reason, job_id: head.job.id };

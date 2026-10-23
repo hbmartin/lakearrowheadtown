@@ -21,7 +21,8 @@ export const isPaused = (job: RebuildJob | null | undefined): boolean => !!job &
 
 export function restartRebuild(job: RebuildJob): RebuildJob {
   const next = { ...job, status: 'queued' as const, scheduling: 'automatic' as const };
-  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume', 'blocked', 'blocked_by', 'recovery'] as const) delete next[key];
+  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume', 'blocked', 'blocked_by'] as const) delete next[key];
+  if (next.recovery && !['unknown', 'committed'].includes(next.recovery.publication_status)) delete next.recovery;
   return next;
 }
 export function newRebuild(id: string, origin: string, migration: { complete: boolean; processed: number }, context?: OperationContext): RebuildJob {

@@ -557,7 +557,9 @@ it('restores a damaged checkpoint, resumes explicitly and clears recovery diagno
   await inside(publisher(), async (instance, state) => {
     await state.storage.put(`rebuild-finalization:${job.id}`, 'bad'); await instance.alarm();
     await state.storage.put(`rebuild-finalization:${job.id}`, { version: 1 });
-    expect(await instance.resumeRebuild(job.id)).toMatchObject({ status: 'queued' }); await instance.alarm();
+    expect(await instance.resumeRebuild(job.id)).toMatchObject({ status: 'queued' });
+    expect(await instance.jobStatus(job.id)).not.toHaveProperty('blocked');
+    await instance.alarm();
     const completed = await instance.jobStatus(job.id); expect(completed.status).toBe('completed');
     expect(completed.recovery).toBeUndefined(); expect(completed.manual_resume).toBeUndefined();
   });
@@ -698,5 +700,19 @@ it('recovery routing survives renamed diagnostic stages and logs transient failu
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_finalization_pending', stage: 'renamed_checkpoint_inspection', error_code: 'storage_error', publication_status: 'unknown' }));
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_recovery_record_failed' }));
     expect(events.some(event => event.event === 'rebuild_failed')).toBe(false);
+  });
+});
+
+it.each(['unknown', 'committed'] as const)('preserves %s evidence across explicit resume and another receipt outage', async certainty => {
+  await seed(); const queued = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`job:${queued.id}`, { ...queued, status: 'running', recovery: { code: 'storage_error', stage: 'rebuild_finalize', retryable: true, publication_status: certainty, failed_at: new Date().toISOString() } });
+    await state.storage.put(`rebuild-finalization:${queued.id}`, { version: 1 }); await state.storage.deleteAlarm();
+    const resumed = await instance.resumeRebuild(queued.id);
+    expect(resumed).toMatchObject({ status: 'queued', recovery: { publication_status: certainty } });
+    const head = instance.env.SITE_BUCKET.head.bind(instance.env.SITE_BUCKET);
+    const fault = vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => { if (key === 'pages/index.html') throw new Error('Receipt outage after resume'); return head(key); });
+    try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { fault.mockRestore(); }
+    expect(await instance.jobStatus(queued.id)).toMatchObject({ recovery: { publication_status: certainty } });
   });
 });
