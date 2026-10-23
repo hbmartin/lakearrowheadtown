@@ -1,7 +1,7 @@
 import { matchesEtag, parseIfNoneMatch } from './conditions';
 import { emit, safeError, type OperationTrace } from './diagnostics';
 import { boundary, OperationFailure } from './errors';
-import { dimensions, readImageMetadata, type ImageMetadata } from './image-metadata';
+import { dimensions, readImageMetadata, validImageMetadata, type ImageMetadata } from './image-metadata';
 import { IMAGE_CACHE, IMAGE_LIMIT } from './images';
 import { noStoreHeaders } from './responses';
 import { THUMBNAIL_PATH, THUMBNAIL_V2_PATH, thumbnailWidth } from './thumbnail-sizes';
@@ -29,16 +29,29 @@ const recipe = 'scale-down-q80-anim-1';
 function derivative(source: string, edge: number, type: string) {
   const extension = type === 'image/jpeg' ? 'jpg' : type.slice(6);
   const metadata = { recipe, source, edge: String(edge), format: type };
+  const matches = (object: R2Object | null) => !!object && Object.entries(metadata).every(([key, value]) => object.customMetadata?.[key] === value);
   return { key: `thumbnail-cache/v1/${recipe}/${source.slice('images/'.length)}/${edge}.${extension}`, metadata,
-    valid: (object: R2Object | null): object is R2Object => !!object && Number.isSafeInteger(object.size) && object.size > 0
-      && object.httpMetadata?.contentType === type && Object.entries(metadata).every(([key, value]) => object.customMetadata?.[key] === value) };
+    valid: (object: R2Object | null): object is R2Object => matches(object) && Number.isSafeInteger(object!.size) && object!.size > 0 && object!.httpMetadata?.contentType === type,
+    oversized: (object: R2Object | null): boolean => matches(object) && object!.size === 0 && object!.customMetadata?.outcome === 'oversized-v1'
+      && object!.customMetadata?.limit === String(IMAGE_LIMIT) && object!.httpMetadata?.contentType === 'application/octet-stream' };
 }
 
-async function discard(object: R2Object | null) {
-  if (object && 'body' in object) {
-    const body = object as R2ObjectBody;
-    if (!body.bodyUsed) await body.body.cancel().catch(() => {});
+// Every request owns its streams. Never let cleanup replace the original error.
+async function discard(object: R2Object | Response | { body: ReadableStream | null; bodyUsed?: boolean } | null | undefined) {
+  if (object && 'body' in object && object.body && !object.bodyUsed) await object.body.cancel().catch(() => {});
+}
+
+async function legacyMetadata(env: Env, hash: string, source: string) {
+  const key = `thumbnail-cache/v1/source-metadata/${source.slice('images/'.length)}`;
+  let size = await readImageMetadata(env.SITE_BUCKET, hash);
+  let saved: R2Object | null = null;
+  if (!size) {
+    saved = await boundary('storage', () => env.SITE_BUCKET.head(key));
+    const metadata = saved?.customMetadata;
+    const detected = { width: Number(metadata?.width), height: Number(metadata?.height), type: metadata?.type ?? '' };
+    if (saved?.size === 0 && metadata?.version === '1' && metadata.source === source && validImageMetadata(detected)) size = detected;
   }
+  return { key, size, saved };
 }
 
 export async function thumbnailResponse(request: Request, env: Env, trace: OperationTrace): Promise<Response> {
@@ -50,39 +63,71 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
   if (v2 && outputExtension !== extension && outputExtension !== 'webp') throw new HttpError(404, 'Not found');
   const edge = Number(preset); const key = `images/${hash}.${extension}`;
   const condition = parseIfNoneMatch(request.headers.get('If-None-Match'));
-  const original = await boundary('storage', () => env.SITE_BUCKET.head(key));
-  if (!original) throw new HttpError(404, 'Not found');
   let body: R2ObjectBody | null = null;
+  let input: ReadableStream<Uint8Array> | undefined;
+  let size: ImageMetadata | undefined;
+  let originalVerified = false; let malformed = false;
   const fallback = async (reason: string, error?: unknown): Promise<Response> => {
-    try { if (body && !body.bodyUsed) await body.body.cancel(); } catch { /* Preserve fallback after encoder failure. */ }
     const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : undefined;
     emit('thumbnail_fallback', trace.context, { reason, edge, ...(code !== undefined ? { images_code: code } : {}), ...(error ? safeError(error) : {}) }, 'warn');
     return new Response(null, { status: 302, headers: noStoreHeaders('text/plain; charset=utf-8', { Location: `/${key}`, ...(!v2 ? { Vary: 'Accept' } : {}) }) });
   };
+  const format = () => {
+    const sourceType = size?.type ?? (extension === 'jpg' ? 'image/jpeg' : `image/${extension}`);
+    return v2 ? outputExtension === 'jpg' ? 'image/jpeg' : `image/${outputExtension}` : acceptsWebp(request.headers.get('Accept'), sourceType) ? 'image/webp' : sourceType;
+  };
+  const headersFor = (length: number) => new Headers({ 'Cache-Control': IMAGE_CACHE, 'Cloudflare-CDN-Cache-Control': IMAGE_CACHE,
+    ...(!v2 ? { Vary: 'Accept' } : {}), 'X-Content-Type-Options': 'nosniff', 'Content-Type': format(), 'Content-Length': String(length),
+    ETag: `W/"thumbnail-${v2 ? 'v2' : 'v1'}-${hash}-${edge}-${format().slice(6)}-q80"` });
+  const response = (length: number, bytes: BodyInit | null) => {
+    const headers = headersFor(length); const unchanged = matchesEtag(condition, headers.get('ETag')!);
+    return new Response(unchanged || request.method === 'HEAD' ? null : bytes, { status: unchanged ? 304 : 200, headers });
+  };
+  const readCache = (variant: ReturnType<typeof derivative>) => boundary('storage', () => request.method === 'HEAD' || condition ? env.SITE_BUCKET.head(variant.key) : env.SITE_BUCKET.get(variant.key));
+  const cachedResponse = async (cached: R2Object | null, variant: ReturnType<typeof derivative>): Promise<Response | null> => {
+    if (variant.oversized(cached)) { await discard(cached); return fallback('derivative_oversized'); }
+    if (!variant.valid(cached)) { await discard(cached); return null; }
+    if (matchesEtag(condition, headersFor(cached.size).get('ETag')!) || request.method === 'HEAD') { await discard(cached); return response(cached.size, null); }
+    const full = 'body' in cached ? cached as R2ObjectBody : await boundary('storage', () => env.SITE_BUCKET.get(variant.key));
+    if (!variant.valid(full)) { await discard(full); return null; }
+    return response(full!.size, full!.body);
+  };
+  const loadInput = async () => {
+    body = await boundary('storage', () => env.SITE_BUCKET.get(key));
+    if (!body) throw new HttpError(404, 'Not found');
+    input = body.body;
+    if (!size) {
+      const bytes = new Uint8Array(await boundary('storage', () => body!.arrayBuffer()));
+      try { size = dimensions(bytes); } catch (error) { malformed = true; throw error; }
+      input = new Blob([bytes]).stream();
+    }
+  };
   let phase: 'metadata' | 'source' | 'encoder' | 'cache_read' | 'cache_write' = 'metadata';
   try {
-    let size = v2 ? undefined : await readImageMetadata(env.SITE_BUCKET, hash);
-    const sourceType = () => size?.type ?? (extension === 'jpg' ? 'image/jpeg' : `image/${extension}`);
-    const format = () => v2 ? outputExtension === 'jpg' ? 'image/jpeg' : `image/${outputExtension}` : acceptsWebp(request.headers.get('Accept'), sourceType()) ? 'image/webp' : sourceType();
-    const headersFor = () => new Headers({ 'Cache-Control': IMAGE_CACHE, 'Cloudflare-CDN-Cache-Control': IMAGE_CACHE,
-      ...(!v2 ? { Vary: 'Accept' } : {}), 'X-Content-Type-Options': 'nosniff', 'Content-Type': format(),
-      ETag: `W/"thumbnail-${v2 ? 'v2' : 'v1'}-${hash}-${edge}-${format().slice(6)}-q80"` });
-    const cachedResponse = async (cached: R2Object | null, variant: ReturnType<typeof derivative>): Promise<Response | null> => {
-      if (!variant.valid(cached)) { await discard(cached); return null; }
-      const headers = headersFor(); headers.set('Content-Length', String(cached.size));
-      if (matchesEtag(condition, headers.get('ETag')!) || request.method === 'HEAD') {
-        await discard(cached);
-        return new Response(null, { status: matchesEtag(condition, headers.get('ETag')!) ? 304 : 200, headers });
-      }
-      const full = 'body' in cached ? cached as R2ObjectBody : await boundary('storage', () => env.SITE_BUCKET.get(variant.key));
-      if (!variant.valid(full)) { await discard(full); return null; }
-      headers.set('Content-Length', String(full.size));
-      return new Response(full!.body, { headers });
-    };
+    // Settle both reads even on failure so an unused R2 body cannot escape.
+    const [original, initial] = await Promise.allSettled([
+      boundary('storage', () => env.SITE_BUCKET.head(key)),
+      v2 ? readCache(derivative(key, edge, format())).then(cached => ({ cached, legacy: undefined }))
+        : legacyMetadata(env, hash, key).then(legacy => ({ cached: undefined, legacy })),
+    ]);
+    if (original.status === 'rejected' || !original.value) {
+      if (initial.status === 'fulfilled') await discard(initial.value.cached);
+      throw original.status === 'rejected' ? original.reason : new HttpError(404, 'Not found');
+    }
+    originalVerified = true;
+    if (initial.status === 'rejected') throw initial.reason;
+    size = initial.value.legacy?.size;
+    if (!v2 && !size) {
+      if (request.method === 'HEAD') return fallback('derivative_missing');
+      phase = 'source'; await loadInput();
+      const legacy = initial.value.legacy!;
+      phase = 'cache_write';
+      await boundary('storage', () => env.SITE_BUCKET.put(legacy.key, '', { onlyIf: legacy.saved ? { etagMatches: legacy.saved.etag } : { etagDoesNotMatch: '*' },
+        customMetadata: { version: '1', source: key, width: String(size!.width), height: String(size!.height), type: size!.type } }));
+    }
     phase = 'cache_read';
-    let variant = derivative(key, edge, format());
-    const readKey = variant.key;
-    const cached = await boundary('storage', () => request.method === 'HEAD' || condition ? env.SITE_BUCKET.head(variant.key) : env.SITE_BUCKET.get(variant.key));
+    const variant = derivative(key, edge, format());
+    const cached = v2 ? initial.value.cached! : await readCache(variant);
     const hit = await cachedResponse(cached, variant);
     if (hit) { emit('thumbnail_cache_hit', trace.context, { edge, format: format() }); return hit; }
     if (cached) emit('thumbnail_cache_invalid', trace.context, { edge, format: format() }, 'warn');
@@ -90,49 +135,39 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
     if (!env.IMAGES || typeof env.IMAGES.input !== 'function') return fallback('binding_unavailable');
     phase = 'metadata';
     size ??= await readImageMetadata(env.SITE_BUCKET, hash);
-    phase = 'source';
-    body = await boundary('storage', () => env.SITE_BUCKET.get(key));
-    if (!body) throw new HttpError(404, 'Not found');
-    let input: ReadableStream<Uint8Array> = body.body;
-    if (!size) {
-      const bytes = new Uint8Array(await boundary('storage', () => body!.arrayBuffer()));
-      try { size = dimensions(bytes); } catch (error) { return fallback('malformed_image', error); }
-      input = new Blob([bytes]).stream();
-    }
+    if (!input) { phase = 'source'; await loadInput(); }
     phase = 'encoder';
     const type = format() as ImageOutputOptions['format'];
-    const output = await trace.run('thumbnail_transform', () => env.IMAGES!.input(input)
+    const output = await trace.run('thumbnail_transform', () => env.IMAGES!.input(input!)
       .transform({ width: thumbnailWidth(size!, edge), fit: 'scale-down' })
       .output({ format: type, ...(type !== 'image/gif' ? { quality: 80 } : {}), ...(['image/webp', 'image/gif'].includes(type) ? { anim: true } : {}) }));
     const rendered = output.response();
-    if (rendered.status !== 200 || !rendered.body || rendered.headers.get('Content-Type') !== type) {
-      await rendered.body?.cancel(); return fallback('unexpected_error');
-    }
-    phase = 'cache_write';
-    variant = derivative(key, edge, type);
-    // Conditional writes settle through full output consumption before success
-    // is advertised. No request-owned streams/promises are shared with callers.
-    const prior = variant.key === readKey ? cached : null;
-    let saved: R2Object | null;
     try {
-      // The Images binding returns a stream without a known R2 upload length.
-      // Bound buffering by the existing image budget; oversized derivatives
-      // retain the original-image fallback rather than exhausting the isolate.
-      const bytes = await readLimited(new Request(url, { method: 'POST', body: rendered.body,
-        ...(rendered.headers.has('Content-Length') ? { headers: { 'Content-Length': rendered.headers.get('Content-Length')! } } : {}) }), IMAGE_LIMIT);
-      saved = await trace.run('thumbnail_cache_write', () => boundary('storage', () => env.SITE_BUCKET.put(variant.key, bytes, {
-        onlyIf: prior ? { etagMatches: prior.etag } : { etagDoesNotMatch: '*' },
-        customMetadata: variant.metadata, httpMetadata: { contentType: type, cacheControl: IMAGE_CACHE },
+      if (rendered.status !== 200 || !rendered.body || rendered.headers.get('Content-Type') !== type) return fallback('unexpected_error');
+      phase = 'cache_write';
+      let bytes: ArrayBuffer | undefined;
+      try {
+        // Complete output must fit the memory budget before it becomes a derivative.
+        bytes = await readLimited(new Request(url, { method: 'POST', body: rendered.body,
+          ...(rendered.headers.has('Content-Length') ? { headers: { 'Content-Length': rendered.headers.get('Content-Length')! } } : {}) }), IMAGE_LIMIT);
+      } catch (error) { if (!(error instanceof HttpError) || error.status !== 413) throw error; }
+      if (bytes?.byteLength === 0) return fallback('unexpected_error');
+      const oversized = bytes === undefined;
+      const saved = await trace.run('thumbnail_cache_write', () => boundary('storage', () => env.SITE_BUCKET.put(variant.key, bytes ?? new Uint8Array(0), {
+        onlyIf: cached ? { etagMatches: cached.etag } : { etagDoesNotMatch: '*' },
+        customMetadata: { ...variant.metadata, ...(oversized ? { outcome: 'oversized-v1', limit: String(IMAGE_LIMIT) } : {}) },
+        httpMetadata: { contentType: oversized ? 'application/octet-stream' : type, cacheControl: IMAGE_CACHE },
       })));
-    } finally { if (!rendered.bodyUsed) await rendered.body.cancel().catch(() => {}); }
-    emit('thumbnail_cache_fill', trace.context, { edge, format: type, bytes_written: saved?.size ?? 0, outcome: saved ? 'stored' : 'race' });
-    phase = 'cache_read';
-    const winner = await boundary('storage', () => condition ? env.SITE_BUCKET.head(variant.key) : env.SITE_BUCKET.get(variant.key));
-    const result = await cachedResponse(winner, variant);
-    return result ?? fallback('cache_read_failed');
+      emit('thumbnail_cache_fill', trace.context, { edge, format: type, bytes_written: saved?.size ?? 0, outcome: saved ? oversized ? 'oversized' : 'stored' : 'race' });
+      if (saved && oversized && variant.oversized(saved)) return fallback('derivative_oversized');
+      if (saved && bytes !== undefined && variant.valid(saved)) return response(bytes.byteLength, bytes);
+      // Only a lost race needs a winner read. Never return the losing encoder's bytes.
+      phase = 'cache_read';
+      return await cachedResponse(await readCache(variant), variant) ?? fallback('cache_read_failed');
+    } finally { await discard(rendered); }
   } catch (error) {
-    if (error instanceof HttpError && error.status === 404) throw error;
+    if (!originalVerified || error instanceof HttpError && error.status === 404) throw error;
     const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-    return fallback(phase === 'cache_write' ? 'cache_write_failed' : error instanceof OperationFailure && error.kind === 'storage' ? 'storage_error' : code === 9422 ? 'quota_exhausted' : phase === 'encoder' && !(error instanceof TypeError) ? 'transformation_failed' : 'unexpected_error', error);
-  }
+    return fallback(malformed ? 'malformed_image' : phase === 'cache_write' ? 'cache_write_failed' : error instanceof OperationFailure && error.kind === 'storage' ? 'storage_error' : code === 9422 ? 'quota_exhausted' : phase === 'encoder' && !(error instanceof TypeError) ? 'transformation_failed' : 'unexpected_error', error);
+  } finally { await discard(body); if (input) await discard({ body: input }); }
 }
