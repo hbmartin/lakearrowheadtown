@@ -39,17 +39,21 @@ export class DigestPublisher extends DurableObject<Env> {
   }
 
   private async finishConditions(origin = this.conditionsOrigin(), context?: OperationContext): Promise<void> {
+    let stage = 'conditions_intent_read';
     try {
-      if (!await this.ctx.storage.get('conditions:pending') && (await boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')))?.customMetadata?.conditions_status !== 'unavailable') return;
+      if (!await boundary('storage', () => this.ctx.storage.get('conditions:pending')) && (await boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')))?.customMetadata?.conditions_status !== 'unavailable') return;
+      stage = 'repair_recovery';
       await this.repairCoordinator().gate(context);
+      stage = 'conditions_composition';
       const available = await composeHomepageConditions(this.env.SITE_BUCKET, origin, context);
-      if (!available) { await this.ctx.storage.put('conditions:pending', true); emit('conditions_unavailable', context, {}, 'error'); return; }
-      await this.ctx.storage.delete('conditions:pending');
+      stage = 'conditions_intent_write';
+      if (!available) { await boundary('storage', () => this.ctx.storage.put('conditions:pending', true)); emit('conditions_unavailable', context, {}, 'error'); return; }
+      await boundary('storage', () => this.ctx.storage.delete('conditions:pending'));
       emit('conditions_composed', context, {});
     } catch (error) {
       // Sources may already be committed. Retain the complete previous page and
       // durable intent; retry on another source event/manual rebuild, never a timer.
-      emit('conditions_composition_failed', context, { ...safeError(error) }, 'error');
+      emit('conditions_composition_failed', context, { error_code: asHttpError(error).code, stage: asHttpError(error).stage ?? stage, ...safeError(error) }, 'error');
     }
   }
 
@@ -58,38 +62,50 @@ export class DigestPublisher extends DurableObject<Env> {
     const parse = (body: string | null) => { try { return body ? validateWeather(JSON.parse(body)) : null; } catch { return null; } };
     const read = async () => { const object = await boundary('storage', () => this.env.SITE_BUCKET.get(WEATHER_KEY)); return object ? boundary('storage', () => object.text()) : null; };
     let candidate: { body: string; weather: ReturnType<typeof validateWeather>; etag: string | null } | undefined;
+    let response: Response | undefined;
+    let stage = 'weather_storage_read';
     const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 8000);
     try {
       const prior = parse(await read());
+      stage = 'weather_etag_read';
       const etag = prior ? await boundary('storage', () => this.ctx.storage.get<string>('weather:etag')) : undefined;
-      const response = await fetch(WEATHER_URL, { headers: etag ? { 'If-None-Match': etag } : {}, signal: controller.signal });
+      stage = 'weather_fetch';
+      response = await fetch(WEATHER_URL, { headers: etag ? { 'If-None-Match': etag } : {}, signal: controller.signal });
       if (response.status !== 304) {
-        if (!response.ok) throw new Error('Upstream weather request failed');
+        if (!response.ok) throw new HttpError(503, 'Upstream weather request failed', {}, { code: 'weather_upstream_failed', retryable: true });
         const length = response.headers.get('Content-Length');
         const headers = length ? { 'Content-Length': length } : undefined;
+        stage = 'weather_body_read';
         const bytes = await readLimited(new Request(WEATHER_URL, { method: 'POST', body: response.body, headers }), 128 * 1024);
+        stage = 'weather_validation';
         const weather = validateWeather(JSON.parse(new TextDecoder().decode(bytes)));
         if (Date.parse(weather.published_at) > Date.now() + 300_000) throw new Error('Weather publication is ahead of the clock');
         candidate = { body: JSON.stringify(weather), weather, etag: response.headers.get('etag') };
       }
-    } catch (error) { emit('weather_pull_failed', context, { ...safeError(error) }, 'error'); }
-    finally { clearTimeout(timer); }
+    } catch (error) { emit('weather_pull_failed', context, { error_code: asHttpError(error).code, stage, ...(response ? { upstream_status: response.status } : {}), ...safeError(error) }, 'error'); }
+    finally {
+      try { if (response?.body && !response.bodyUsed) await response.body.cancel().catch(() => {}); }
+      finally { clearTimeout(timer); }
+    }
     await this.serialize(async () => {
       try {
         if (candidate) {
+          stage = 'weather_storage_read';
           const priorBody = await read(); const prior = parse(priorBody);
           if (prior && Date.parse(prior.published_at) > Date.parse(candidate.weather.published_at)) {
             emit('weather_pull', context, { changed: false, discarded_stale: true });
           } else {
             if (priorBody !== candidate.body) {
+              stage = 'weather_storage_write';
               await this.ctx.storage.put('conditions:pending', true);
               await boundary('storage', () => this.env.SITE_BUCKET.put(WEATHER_KEY, candidate!.body, { httpMetadata: { contentType: 'application/json' } }));
             }
+            stage = 'weather_etag_write';
             if (candidate.etag) await this.ctx.storage.put('weather:etag', candidate.etag); else await this.ctx.storage.delete('weather:etag');
             emit('weather_pull', context, { changed: priorBody !== candidate.body, published_at: candidate.weather.published_at });
           }
         }
-      } catch (error) { emit('weather_pull_failed', context, { ...safeError(error) }, 'error'); }
+      } catch (error) { emit('weather_pull_failed', context, { error_code: asHttpError(error).code, stage, ...safeError(error) }, 'error'); }
       await this.finishConditions(origin, context);
     }, context);
   }
