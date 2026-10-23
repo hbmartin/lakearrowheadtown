@@ -6,6 +6,7 @@ import { checkEnvironment, readPublishingCredential, validateCredential } from '
 
 const defaults = { preview: 'https://lakearrowheadtown-preview.harold-martin.workers.dev', production: 'https://lakearrowhead.town' };
 const retryDeadline = Symbol('monotonic retry deadline');
+const permanentApplicationError = Symbol('validated permanent application error');
 const monotonic = options => (options.now ?? (() => performance.now()))();
 function withTiming(value, response, retryAt, options) {
   const server = Date.parse(response.headers.get('Date'));
@@ -64,6 +65,9 @@ export async function maintenance(operation, environment, id, options = {}) {
     failure.code = result?.code;
     failure.retryAt = result?.retry_at;
     failure.retryable = result?.retryable === true;
+    failure[permanentApplicationError] = result !== null && typeof result === 'object' && !Array.isArray(result)
+      && typeof result.code === 'string' && result.code.length > 0 && typeof result.error === 'string' && result.error.length > 0
+      && result.retryable === false;
     failure.publicationStatus = result?.publication_status;
     failure.details = result?.details;
     failure.status = response.status;
@@ -111,7 +115,7 @@ function completedJob(job) {
 function waitTimeout(job, cause) {
   return new Error(`Rebuild ${job.id} exceeded the wait deadline; completion remains unconfirmed (last status: ${job.blocked?.reason ?? job.status}). Inspect its status; no resume was issued.`, cause ? { cause } : undefined);
 }
-async function finalStatus(job, environment, deadline, options) {
+async function finalStatus(job, environment, deadline, options, awaitingActivation = false) {
   const remaining = Math.ceil(deadline + 30000 - monotonic(options));
   if (remaining <= 0) throw waitTimeout(job);
   // One read-only check, never retried, with a fixed grace deadline.
@@ -120,7 +124,10 @@ async function finalStatus(job, environment, deadline, options) {
     if (monotonic(options) > deadline + 30000) throw waitTimeout(job);
     options.onProgress?.(job);
   } catch (error) {
-    if (monotonic(options) <= deadline + 30000 && !error.transport && error.retryable === false && Number.isInteger(error.status)) throw error;
+    if (monotonic(options) <= deadline + 30000 && error[permanentApplicationError]
+      && !(awaitingActivation && error.status === 404 && error.code === 'job_not_found')) {
+      throw repairFollowFailure(`Rebuild ${job.id} status check failed (last status: ${awaitingActivation ? 'awaiting activation' : job.blocked?.reason ?? job.status}). ${error.message}`, error);
+    }
     throw waitTimeout(job, error);
   }
   if (terminal(job)) return completedJob(job);
@@ -159,7 +166,7 @@ export async function repairAndFollow(environment, file, options = {}) {
     if (monotonic(options) >= deadline) {
       let final;
       if (jobId) {
-        try { final = await finalStatus({ id: jobId, status: 'queued' }, environment, deadline, { ...options, onProgress: job => options.onProgress?.({ job, publication_status: 'committed' }) }); }
+        try { final = await finalStatus({ id: jobId, status: 'awaiting activation' }, environment, deadline, { ...options, onProgress: job => options.onProgress?.({ job, publication_status: 'committed' }) }, true); }
         catch (error) { throw repairFollowFailure(`${context()} Overall repair timeout exceeded. ${error.message}`, error); }
       }
       throw new Error(`${context()} Overall repair timeout exceeded; repair result remains unconfirmed.${final ? ` Final rebuild status: ${final.status}.` : ''} Inspect the snapshot and rebuild status.`);
