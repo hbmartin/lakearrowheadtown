@@ -11,8 +11,7 @@ import { publishEvents, readEvents, type EventDigest, type EventsReply } from '.
 import { validateRepair, type RepairReply } from './publication-repair';
 import { RepairCoordinator, restartRebuild, newRebuild, isPaused, pauseReason } from './repair-coordinator';
 import { composeHomepageConditions } from './homepage-conditions';
-import { REBUILD_MARKER } from './index-metadata';
-import { record } from './primitives';
+import { checkpointKey, readCheckpoint, receiptMatches } from './rebuild-evidence';
 import { validateWeather, WEATHER_KEY, WEATHER_URL } from './weather';
 import { readLimited } from './validation';
 import type { AppendReply, BatchReply, Digest, Env, Migration, OperationContext, PublicationStatus, PublishFailure, PublishReply, RebuildJob, RebuildResumeReply, RetractReply, StoryUpdate } from './types';
@@ -546,18 +545,16 @@ export class DigestPublisher extends DurableObject<Env> {
         // Receipt reads/finalization fail through platform redelivery, never the
         // pre-commit failure path. The marker survives later index replacements.
         try {
-          const finalization = await trace.run('rebuild_finalization_read', () => boundary('storage', () => this.ctx.storage.get<{ version: 1; migration?: Migration }>(`rebuild-finalization:${job!.id}`)));
+          const finalization = await trace.run('rebuild_finalization_read', async () => readCheckpoint(
+            await boundary('storage', () => this.ctx.storage.get(checkpointKey(job!.id))), job!));
           if (finalization !== undefined) {
-            if (!record(finalization) || finalization.version !== 1 || finalization.migration !== undefined && (!record(finalization.migration)
-              || finalization.migration.complete !== true || !Number.isSafeInteger(finalization.migration.processed) || finalization.migration.processed < 0)) {
-              throw new HttpError(503, 'Rebuild finalization checkpoint is damaged. Restore the checkpoint from a verified backup before resuming.', {}, { code: 'rebuild_checkpoint_damaged', stage: 'rebuild_finalization_validation' });
-            }
             const index = await trace.run('rebuild_receipt_read', () => boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')));
-            if (index?.customMetadata?.[REBUILD_MARKER] === job.id) {
+            if (receiptMatches(index, job)) {
               trace.publication_status = 'committed';
               phase = 'finalizing';
               await this.finalizeRebuild(job, ids, finalization.migration, undefined, trace); return;
             }
+            if (finalization.version === 2 && finalization.phase === 'prepared' && inherited !== 'committed') inherited = 'not_committed';
           } else {
             if (inherited === 'committed') throw new HttpError(503,
               'A committed rebuild has no finalization checkpoint. Restore the checkpoint from a verified backup before resuming.', {},
