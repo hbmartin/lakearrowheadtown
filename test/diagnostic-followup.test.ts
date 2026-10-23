@@ -64,7 +64,7 @@ describe('rebuild storage diagnostics', () => {
   it.each([
     ['enqueue_state', 'enqueueRebuild', 'rebuild_enqueue_state'], ['enqueue_write', 'enqueueRebuild', 'rebuild_enqueue'],
     ['status_job', 'jobStatus', 'rebuild_status_read'], ['status_queue', 'jobStatus', 'rebuild_status_read'], ['status_head', 'jobStatus', 'rebuild_status_read'],
-    ['resume_read', 'resumeRebuild', 'rebuild_resume_read'], ['resume_write', 'resumeRebuild', 'rebuild_resume_write'],
+    ['resume_gate', 'resumeRebuild', 'repair_recovery'], ['resume_read', 'resumeRebuild', 'rebuild_resume_read'], ['resume_write', 'resumeRebuild', 'rebuild_resume_write'],
   ])('classifies and correlates %s failures', async (fault, operation, stage) => {
     const publisher = bindings.PUBLISHER.getByName('site');
     await inPublisher(publisher, async (instance, state) => {
@@ -76,7 +76,7 @@ describe('rebuild storage diagnostics', () => {
       const getSpy = vi.spyOn(state.storage, 'get').mockImplementation(async (key: any) => {
         if ((fault === 'enqueue_state' && key === 'migration') || (fault === 'status_job' && key === `job:${id}`)
           || (fault === 'status_queue' && key === 'jobs') || (fault === 'status_head' && key === `job:${headId}`)
-          || (fault === 'resume_read' && key === `job:${id}`)) throw new Error('private storage detail');
+          || (fault === 'resume_read' && key === `job:${id}`) || (fault === 'resume_gate' && key === 'publication_repair_pending')) throw new Error('private storage detail');
         return get(key);
       });
       const transactionSpy = fault.endsWith('write') ? vi.spyOn(state.storage, 'transaction').mockRejectedValue(new Error('private transaction detail')) : undefined;
@@ -90,7 +90,7 @@ describe('rebuild storage diagnostics', () => {
     const failure = events.find(event => event.event === 'rebuild_request_failed');
     expect(failure).toMatchObject({ request_id: context.request_id, stage, error_code: 'storage_error', failure_kind: 'storage' });
     expect(operation === 'enqueueRebuild' ? failure.candidate_job_id : failure.job_id).toBeTruthy();
-    expect(failure.publication_status).toBeUndefined();
+    expect(failure.publication_status).toBe(operation === 'jobStatus' ? undefined : 'not_committed');
     if (operation === 'enqueueRebuild') expect(failure.job_id).toBeUndefined();
     expect(events).toContainEqual(expect.objectContaining({ event: 'operation_stage', stage, outcome: 'error' }));
     expect(JSON.stringify(events)).not.toMatch(/private storage detail|private transaction detail/);

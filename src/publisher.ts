@@ -425,7 +425,7 @@ export class DigestPublisher extends DurableObject<Env> {
 
   async resumeRebuild(id: string, context?: OperationContext): Promise<RebuildJob | 'conflict' | null> {
     return this.rebuildRequest(context, { job_id: id }, async (trace, context) => {
-      await this.repairCoordinator().gate(context);
+      await trace.run('repair_recovery', () => this.repairCoordinator().gate(context));
       const saved = await trace.run('rebuild_resume_read', () => boundary('storage', () => this.ctx.storage.get<RebuildJob>(`job:${id}`)));
       if (!saved) return null;
       const job = restartRebuild(saved);
