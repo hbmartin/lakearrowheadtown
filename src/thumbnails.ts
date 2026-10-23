@@ -87,7 +87,7 @@ export async function thumbnailResponse(request: Request, env: Env, trace: Opera
   const readCache = (variant: ReturnType<typeof derivative>) => boundary('storage', () => request.method === 'HEAD' || condition ? env.SITE_BUCKET.head(variant.key) : env.SITE_BUCKET.get(variant.key));
   const cachedResponse = async (cached: R2Object | null, variant: ReturnType<typeof derivative>, initial = true): Promise<Response | null> => {
     if (variant.oversized(cached)) {
-      await discard(cached); emit('thumbnail_cache_outcome_hit', trace.context, { edge, format: format(), outcome: 'oversized' });
+      await discard(cached); if (initial) emit('thumbnail_cache_outcome_hit', trace.context, { edge, format: format(), outcome: 'oversized' });
       return fallback('derivative_oversized');
     }
     if (!variant.valid(cached)) { await discard(cached); return null; }

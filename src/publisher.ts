@@ -136,15 +136,16 @@ export class DigestPublisher extends DurableObject<Env> {
     action: (complete: boolean | undefined, context: OperationContext | undefined, snapshot?: CommittedSnapshot) => Promise<T>): Promise<{ ok: true; result: T } | { ok: false; failure: PublishFailure }> {
     context = this.executingContext(context);
     return this.serialize(async () => {
+      const trace = new OperationTrace(context);
       try {
-        if (operation !== 'preview') await this.repairCoordinator().gate(context);
-        const migration = await new OperationTrace(context).run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
+        if (operation !== 'preview') await trace.run('repair_recovery', () => this.repairCoordinator().gate(context));
+        const migration = await trace.run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
         let snapshot: CommittedSnapshot | undefined;
         // Internal publishing helpers may bootstrap a new bucket; only persisted
         // completion establishes that losing its manifest requires operator repair.
         if (migration?.complete) {
           try {
-            await new OperationTrace(context).run('committed_snapshot_loading', async () => {
+            await trace.run('committed_snapshot_loading', async () => {
               snapshot = await committedSnapshot(this.env.SITE_BUCKET);
               requireCommittedManifest(snapshot);
             });
@@ -152,7 +153,8 @@ export class DigestPublisher extends DurableObject<Env> {
         }
         return { ok: true, result: await action(migration?.complete, context, snapshot) };
       } catch (error) {
-        const stage = error instanceof PublicationError ? error.stage : asHttpError(error).stage ?? (asHttpError(error).code === 'repair_blocked' ? 'repair_recovery' : 'migration_state');
+        const classified = asHttpError(error);
+        const stage = error instanceof PublicationError ? error.stage : classified.stage ?? trace.failed_stage ?? 'migration_state';
         const publication_status = operation === 'preview' ? 'not_attempted' : error instanceof PublicationError ? error.publication_status : 'not_committed';
         const cause = error instanceof PublicationError ? error.cause : error;
         const failure = operation === 'preview' ? { ...publicationFailure(cause, stage, publication_status), error: asHttpError(cause).message } : publicationFailure(cause, stage, publication_status, operation);
@@ -310,10 +312,10 @@ export class DigestPublisher extends DurableObject<Env> {
       } catch (error) {
         const failure = asHttpError(error);
         const publication_status = input === undefined ? 'not_attempted' : failure.publication_status ?? trace.publication_status;
-        emit('repair_failed', context, { stage: trace.failed_stage ?? 'repair_validation', error_code: failure.code,
+        emit('repair_failed', context, { stage: failure.stage ?? trace.failed_stage ?? 'repair_validation', error_code: failure.code,
           publication_status, ...safeError(error) }, failure.status >= 500 ? 'error' : 'warn');
         return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message,
-          retryable: failure.retryable, publication_status, stage: trace.failed_stage ?? 'repair_validation',
+          retryable: failure.retryable, publication_status, stage: failure.stage ?? trace.failed_stage ?? 'repair_validation',
           details: failure.details, details_truncated: failure.details_truncated, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) } };
       }
     };
@@ -385,7 +387,7 @@ export class DigestPublisher extends DurableObject<Env> {
       catch (error) {
         const failure = asHttpError(error);
         emit('rebuild_request_failed', context, { stage: failure.stage ?? trace.failed_stage ?? 'rebuild_request', error_code: failure.code,
-          publication_status: failure.publication_status ?? trace.publication_status, ...safeError(error) }, 'error');
+          publication_status: 'not_attempted', ...safeError(error) }, 'error');
         throw error;
       }
     }, context);
@@ -409,7 +411,7 @@ export class DigestPublisher extends DurableObject<Env> {
       await storage.put('jobs', [...ids, job.id]);
       if (head.job?.status !== 'failed' && !isPaused(head.job)) await storage.setAlarm(Date.now() + 1000);
     })));
-    emit('rebuild_queued', jobContext, { job_id: job.id });
+    emit('rebuild_queued', jobContext, { job_id: job.id, generation_id: job.generation_id });
     return job;
   }
 
@@ -470,7 +472,7 @@ export class DigestPublisher extends DurableObject<Env> {
     catch (error) {
       const failure = asHttpError(error);
       if (failure.code !== 'repair_blocked') throw error;
-      return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, stage: failure.stage ?? 'repair_recovery',
+      return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, stage: failure.stage!,
         retryable: failure.retryable, publication_status: 'not_committed', details: failure.details,
         details_truncated: failure.details_truncated, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) } };
     }
@@ -502,18 +504,18 @@ export class DigestPublisher extends DurableObject<Env> {
       if (next.job && next.job.status !== 'failed' && !isPaused(next.job)) await storage.setAlarm(Date.now() + 1000);
       else await storage.deleteAlarm();
     })));
-    emit('rebuild_completed', trace.context, { processed: job.processed, publication_status: 'committed' });
+    emit('rebuild_completed', trace.context, { generation_id: job.generation_id, processed: job.processed, publication_status: 'committed' });
   }
 
   private async recordRebuildRecovery(job: RebuildJob, error: unknown, trace: OperationTrace, damaged: boolean, publication_status: PublicationStatus) {
     const failure = asHttpError(error);
     const paused = damaged || !failure.retryable;
-    const saved: RebuildJob = { ...job, recovery: { code: failure.code, stage: trace.failed_stage ?? failure.stage ?? 'rebuild_finalization', retryable: !paused && failure.retryable,
+    const saved: RebuildJob = { ...job, recovery: { code: failure.code, stage: trace.failed_stage ?? failure.stage ?? 'rebuild_finalization', retryable: !paused,
       publication_status, failed_at: new Date().toISOString() },
       ...(paused ? { manual_resume: true, scheduling: 'manual' as const, pause_reason: damaged ? 'rebuild_checkpoint_damaged' as const : 'manual_resume' as const } : {}) };
     const { code, ...recovery } = saved.recovery!;
-    emit(damaged ? 'rebuild_checkpoint_damaged' : 'rebuild_finalization_pending', trace.context,
-      { error_code: code, ...recovery, ...(paused ? { pause_reason: saved.pause_reason } : {}), ...safeError(error) }, 'error');
+    emit(damaged ? 'rebuild_checkpoint_damaged' : paused ? 'rebuild_paused' : 'rebuild_finalization_pending', trace.context,
+      { error_code: code, generation_id: job.generation_id, ...recovery, ...(paused ? { pause_reason: saved.pause_reason } : {}), ...safeError(error) }, 'error');
     try {
       await boundary('storage', () => this.ctx.storage.transaction(async storage => {
         await storage.put(`job:${job.id}`, saved);

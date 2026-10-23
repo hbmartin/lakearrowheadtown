@@ -1,3 +1,4 @@
+import { withoutIndexFence } from '../src/index-fence';
 import { env } from 'cloudflare:workers';
 import { reset } from 'cloudflare:test';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -63,7 +64,7 @@ describe('homepage metadata', () => {
     expect(listOf(pages[0]).numberOfItems).toBe(0);
     expect(listOf(pages[0]).itemListElement).toEqual([]);
     expect(pageOf(pages[1]).dateModified).toBe(now.toISOString());
-    expect(pages[2]).toBe(pages[1]);
+    expect(withoutIndexFence(pages[2])).toBe(withoutIndexFence(pages[1]));
     const graph = graphOf(pages[1]);
     expect(graph[0]).toMatchObject({ '@type': 'WebSite', name: SITE.name, url: SITE.origin + '/', inLanguage: 'en-US' });
     expect(graph[1].isPartOf['@id']).toBe(graph[0]['@id']);

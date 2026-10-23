@@ -1,5 +1,5 @@
 import { settledInOrder } from './batches';
-import { asHttpError, boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply, publicationFailure, type ValidationIssue } from './errors';
+import { boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply, publicationFailure, type ValidationIssue } from './errors';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { localDate, recentDates } from './feed';
 import { canonicalJson, fingerprint, record } from './primitives';

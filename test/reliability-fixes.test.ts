@@ -1,3 +1,4 @@
+import { withoutIndexFence } from '../src/index-fence';
 import { env } from 'cloudflare:workers';
 import { evictDurableObject, reset, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
@@ -232,15 +233,16 @@ describe('bounded resumable archive rebuilds', () => {
     const job = await publisher().enqueueRebuild(origin, context);
     let restore!: () => void;
     await inPublisher(publisher(), async instance => {
-      const bucket = instance.env.SITE_BUCKET; const head = bucket.head.bind(bucket);
-      let changed = false;
-      const spy = vi.spyOn(bucket, 'head').mockImplementation(async (key: any) => {
-        const result = await head(key);
-        if (key === 'pages/index.html' && !changed) {
-          changed = true;
-          await bucket.put(key, newerHtml, { customMetadata: newer.customMetadata });
-        }
-        return result;
+      let changed = false; const run = OperationTrace.prototype.run;
+      const spy = vi.spyOn(OperationTrace.prototype, 'run').mockImplementation(function (this: OperationTrace, stage: string, action: any, fields?: any) {
+        return run.call(this, stage, async () => {
+          const result = await action();
+          if (stage === 'publication_loading' && !changed) {
+            changed = true;
+            await instance.env.SITE_BUCKET.put('pages/index.html', newerHtml, { customMetadata: newer.customMetadata });
+          }
+          return result;
+        }, fields);
       });
       restore = () => spy.mockRestore();
     });
@@ -604,7 +606,7 @@ describe('publication I/O', () => {
     const gate = new Promise<void>(resolve => { release = resolve; });
     const trace = new OperationTrace(context);
     const prepared = prepareWrites(store({ put: async (key, body) => {
-      active++; peak = Math.max(peak, active); calls.push(`start:${key}:${new TextDecoder().decode(body as Uint8Array)}`);
+      active++; peak = Math.max(peak, active); calls.push(`start:${key}:${withoutIndexFence(new TextDecoder().decode(body as Uint8Array))}`);
       await gate;
       calls.push(`end:${key}`); active--; return { key } as R2Object;
     } }), trace);

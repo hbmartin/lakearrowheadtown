@@ -270,7 +270,7 @@ it.each([[false, false], [false, true], [true, false], [true, true]])('avoids cl
     const put = vi.fn((key: string, value: any, options: any) => bucket.put(key, value, options));
     const store = new Proxy(bucket, { get(target, property) { if (property === 'put') return put; const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value; } });
     expect(await composeHomepageConditions(store, base)).toBe(!badAlerts && !badWeather);
-    expect(put).not.toHaveBeenCalled(); expect(withoutIndexFence(await (await bucket.get('pages/index.html'))!.text())).toBe(withoutIndexFence(html));
+    expect(put).not.toHaveBeenCalled(); expect(await (await bucket.get('pages/index.html'))!.text()).toBe(html);
     if (badAlerts && badWeather) expect(html).not.toContain('<div class="conditions-row">');
     if (!badWeather) {
       const fresh = sample(); fresh.observation.temp_f += 1;

@@ -766,6 +766,8 @@ it.each(['source', 'manifest', 'render'] as const)('pauses permanent %s failures
     try { await instance.alarm(); } finally { rendering?.mockRestore(); }
     expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'running', manual_resume: true, scheduling: 'manual', pause_reason: 'manual_resume',
       blocked: { reason: 'manual_resume' }, recovery: { code: fault === 'source' ? 'source_damaged' : fault === 'manifest' ? 'manifest_damaged' : 'render_failed', retryable: false, publication_status: 'unknown' } });
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_paused', job_id: job.id, publication_status: 'unknown', retryable: false }));
+    expect(events.some(event => event.job_id === job.id && event.event === 'rebuild_finalization_pending')).toBe(false);
     expect(await state.storage.get(`rebuild-finalization:${job.id}`)).toEqual({ version: 1 });
     expect(await state.storage.getAlarm()).toBeNull();
     await instance.alarm();
@@ -833,8 +835,27 @@ it('reports the actual repair stage and this resume request certainty without co
       const pending = await state.storage.get<any>(key); vi.setSystemTime(new Date(pending.next_retry_at));
       const context = { request_id: 'resume-stage', operation: 'rebuild', environment: 'preview', worker_version: 'test' };
       expect(await instance.resumeRebuildV1(job.id, context)).toMatchObject({ ok: false, failure: { code: 'repair_blocked', stage: 'index_write', publication_status: 'not_committed', retryable: true } });
-      expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_request_failed', request_id: context.request_id, stage: 'index_write', publication_status: 'not_committed' }));
+      expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_request_failed', request_id: context.request_id, stage: 'index_write', publication_status: 'not_attempted' }));
       expect(events).toContainEqual(expect.objectContaining({ event: 'repair_recovery_failed', request_id: context.request_id, stage: 'index_write', error_code: 'storage_error' }));
+    } finally { fault.mockRestore(); }
+  });
+});
+
+it('preserves the failed gate stage when a different repair submission is blocked', async () => {
+  const { input } = await seed();
+  await inside(publisher(), async (instance, state) => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const fault = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => {
+      if (key === 'pages/index.html') throw new Error('Private index outage'); return put(key, ...args);
+    });
+    try {
+      await instance.publicationRepairV1(input, origin);
+      const key = (await state.storage.get<string>('publication_repair_pending'))!;
+      const pending = await state.storage.get<any>(key); vi.setSystemTime(new Date(pending.next_retry_at));
+      const context = { request_id: 'different-repair-stage', operation: 'publication_repair', environment: 'preview', worker_version: 'test' };
+      expect(await instance.publicationRepairV1({ ...input, expected_version: 'different-request' }, origin, context)).toMatchObject({ ok: false,
+        failure: { code: 'repair_blocked', stage: 'index_write', publication_status: 'not_committed', retryable: true } });
+      expect(events).toContainEqual(expect.objectContaining({ event: 'repair_failed', request_id: context.request_id, stage: 'index_write' }));
     } finally { fault.mockRestore(); }
   });
 });

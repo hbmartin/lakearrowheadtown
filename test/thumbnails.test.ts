@@ -363,7 +363,7 @@ it.each([false, true])('reconciles a competing oversized/derivative winner (over
   if (!oversizedWinner) expect(new Uint8Array(await response.arrayBuffer())).toEqual(png);
   expect((await bindings.SITE_BUCKET.list({ prefix: 'thumbnail-cache/' })).objects).toHaveLength(1);
   expect(info.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({ event: 'thumbnail_cache_fill', outcome: 'race' }));
-  expect(info.mock.calls.some(([event]: any) => event.event === 'thumbnail_cache_hit')).toBe(false);
+  expect(info.mock.calls.some(([event]: any) => ['thumbnail_cache_hit', 'thumbnail_cache_outcome_hit'].includes(event.event))).toBe(false);
 });
 
 it.each([false, true])('settles parallel cache reads and cancels unused bodies when original existence fails (%s)', async storageError => {

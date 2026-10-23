@@ -140,3 +140,40 @@ it('fences a delayed old generation across repair, conditions and subsequent ide
   expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'completed' });
   expect(await lateWrite()).toBeNull();
 });
+
+it.each([false, true])('retains a lost-acknowledgement generation while repairing its paused job (old write lands first=%s)', async landsFirst => {
+  const job = await seed(); const publication = await currentPublication(bindings.SITE_BUCKET);
+  const source = publication.posts[0].key; const body = await (await bindings.SITE_BUCKET.get(source))!.text();
+  let delayed!: () => Promise<R2Object | null>;
+  await inside(publisher(), async (instance, state) => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET); let intercepted = false;
+    const fault = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, value: any, options: any) => {
+      if (key === 'pages/index.html' && !intercepted) {
+        intercepted = true; delayed = () => put(key, value, options); throw new Error('Lost acknowledgement while write remains in flight');
+      }
+      return put(key, value, options);
+    });
+    try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { fault.mockRestore(); }
+    await bindings.SITE_BUCKET.delete(source); await instance.alarm();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ blocked: { reason: 'manual_resume' }, recovery: { code: 'source_damaged', publication_status: 'unknown' } });
+    expect(await state.storage.get(checkpointKey(job.id))).toMatchObject({ generation_id: job.generation_id, phase: 'dispatching' });
+  });
+  await bindings.SITE_BUCKET.put(source, body);
+  if (landsFirst) expect(await delayed()).not.toBeNull();
+  const input = await repairInput(); const reply = await publisher().publicationRepairV1(input, origin);
+  if (!reply.ok) throw new Error('Expected repaired paused job');
+  expect(reply.result.job).toMatchObject({ id: job.id, manual_resume: true });
+  const generation = reply.result.job!.generation_id; expect(generation).not.toBe(job.generation_id);
+  expect(await delayed()).toBeNull();
+  const repaired = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
+  await evictDurableObject(publisher()); await publisher().resumeRebuild(job.id); await runDurableObjectAlarm(publisher());
+  expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'completed', generation_id: generation });
+  const completed = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
+  expect(completed.version).not.toBe(repaired.version);
+  expect(completed.customMetadata).toMatchObject({ [REBUILD_GENERATION]: generation });
+  expect(await delayed()).toBeNull();
+  await inside(publisher(), async (_instance, state) => {
+    expect(await state.storage.get('jobs')).toEqual([]);
+    expect(await state.storage.get(generationKey(job.id, generation!))).toMatchObject({ prior_checkpoint: { phase: 'dispatching' }, prior_committed: landsFirst });
+  });
+});
