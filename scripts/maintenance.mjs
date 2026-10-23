@@ -60,7 +60,7 @@ export async function maintenance(operation, environment, id, options = {}) {
     throw withTiming(failure, response, undefined, options);
   }
   if (!response.ok) {
-    const failure = new Error(`Maintenance request failed (${response.status}): ${typeof result?.error === 'string' ? result.error : 'Unknown error'}`);
+    const failure = new Error(`Maintenance request failed (${response.status}${typeof result?.code === 'string' ? ` ${result.code}` : ''}): ${typeof result?.error === 'string' ? result.error : 'Unknown error'}`);
     failure.code = result?.code;
     failure.retryAt = result?.retry_at;
     failure.retryable = result?.retryable === true;
@@ -98,7 +98,11 @@ function waitDeadline(options) {
 async function pauseUntilRetry(value, attempts, deadline, options, submission = false) {
   const delay = retryDelay(value, attempts, options);
   const until = Math.min(deadline, monotonic(options) + (submission ? delay : Math.min(30000, delay)));
-  while (monotonic(options) < until) await (options.sleep ?? sleep)(Math.min(30000, until - monotonic(options)));
+  while (monotonic(options) < until) {
+    const before = monotonic(options);
+    await (options.sleep ?? sleep)(Math.min(30000, until - before));
+    if (options.now && options.sleep && !(monotonic(options) > before)) throw new Error('Injected maintenance sleep must advance the injected monotonic clock');
+  }
 }
 function completedJob(job) {
   if (job.status !== 'completed') throw new Error(`Rebuild ${job.id} failed or is blocked (${job.blocked?.reason ?? job.status}). ${blockedAdvice(job)}`);
@@ -115,7 +119,10 @@ async function finalStatus(job, environment, deadline, options) {
     job = await maintenance('status', environment, job.id, { ...options, requestTimeoutMs: remaining });
     if (monotonic(options) > deadline + 30000) throw waitTimeout(job);
     options.onProgress?.(job);
-  } catch (error) { throw waitTimeout(job, error); }
+  } catch (error) {
+    if (monotonic(options) <= deadline + 30000 && !error.transport && error.retryable === false && Number.isInteger(error.status)) throw error;
+    throw waitTimeout(job, error);
+  }
   if (terminal(job)) return completedJob(job);
   throw waitTimeout(job);
 }
@@ -139,6 +146,10 @@ export async function waitForRebuild(job, environment, options = {}) {
   return followJob(job, environment, waitDeadline(options), options);
 }
 
+function repairFollowFailure(message, cause) {
+  return Object.assign(new Error(message, { cause }), { status: cause.status, code: cause.code, retryable: cause.retryable });
+}
+
 export async function repairAndFollow(environment, file, options = {}) {
   const payload = options.payload ?? JSON.parse(await readFile(file, 'utf8'));
   const deadline = waitDeadline(options);
@@ -149,7 +160,7 @@ export async function repairAndFollow(environment, file, options = {}) {
       let final;
       if (jobId) {
         try { final = await finalStatus({ id: jobId, status: 'queued' }, environment, deadline, { ...options, onProgress: job => options.onProgress?.({ job, publication_status: 'committed' }) }); }
-        catch (error) { throw new Error(`${context()} Overall repair timeout exceeded. ${error.message}`, { cause: error }); }
+        catch (error) { throw repairFollowFailure(`${context()} Overall repair timeout exceeded. ${error.message}`, error); }
       }
       throw new Error(`${context()} Overall repair timeout exceeded; repair result remains unconfirmed.${final ? ` Final rebuild status: ${final.status}.` : ''} Inspect the snapshot and rebuild status.`);
     }
@@ -160,7 +171,7 @@ export async function repairAndFollow(environment, file, options = {}) {
         jobId = error.details.job_id;
         options.onProgress?.({ publication_status: 'committed', repair_id: error.details.repair_id, job_id: jobId });
       }
-      if (!error.transport && !error.retryable) throw new Error(`${jobId ? context() + ' ' : ''}${error.message}`, { cause: error });
+      if (!error.transport && !error.retryable) throw repairFollowFailure(`${jobId ? context() + ' ' : ''}${error.message}`, error);
       await pauseUntilRetry(error, attempts++, deadline, options, true);
     }
   }
@@ -172,7 +183,7 @@ export async function repairAndFollow(environment, file, options = {}) {
         onProgress: job => { result.job = job; options.onProgress?.(result); },
         onRetry: error => options.onProgress?.({ job_id: jobId, publication_status: 'committed', warning: error.message }),
       });
-    } catch (error) { throw new Error(`${context()} ${error.message}`, { cause: error }); }
+    } catch (error) { throw repairFollowFailure(`${context()} ${error.message}`, error); }
   }
   return result;
 }
