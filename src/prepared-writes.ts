@@ -1,12 +1,13 @@
 import { boundary } from './errors';
 import { indexCondition, PublicationConflict } from './publication-conflict';
 import { OperationTrace } from './diagnostics';
+import { fenceIndex } from './index-fence';
 import type { ContentBucket } from './types';
 
 // All source, renderer-cache, archive, and snapshot writes first land here.
 // Reads see staged objects so archive seeding can feed the next preparation.
 // Only commit() reaches durable storage; the homepage remains the last write.
-export function prepareWrites(bucket: ContentBucket, trace: OperationTrace) {
+export function prepareWrites(bucket: ContentBucket, trace: OperationTrace, fenceToken = crypto.randomUUID()) {
   const previousPhase = trace.phase;
   trace.phase = 'preparation';
   const writes: { key: string; bytes: Uint8Array; options?: R2PutOptions; stage: string }[] = [];
@@ -16,8 +17,9 @@ export function prepareWrites(bucket: ContentBucket, trace: OperationTrace) {
     head: async key => staged.get(key) ?? bucket.head(key),
     list: options => bucket.list(options),
     async put(key, value, options) {
-      const bytes = typeof value === 'string' ? new TextEncoder().encode(value)
+      let bytes = typeof value === 'string' ? new TextEncoder().encode(value)
         : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice() : new Uint8Array(value).slice();
+      if (key === 'pages/index.html') bytes = new TextEncoder().encode(fenceIndex(new TextDecoder().decode(bytes), fenceToken));
       const object = {
         key, size: bytes.byteLength, uploaded: new Date(), customMetadata: options?.customMetadata,
         text: async () => new TextDecoder().decode(bytes), arrayBuffer: async () => bytes.slice().buffer,
@@ -30,7 +32,7 @@ export function prepareWrites(bucket: ContentBucket, trace: OperationTrace) {
   return {
     bucket: view,
     close() { trace.phase = previousPhase; },
-    async commit(index: R2Object | null) {
+    async commit(index: R2Object | null, beforeIndexDispatch?: () => Promise<void>) {
       let committedIndex: R2Object | undefined;
       // A child trace per write avoids concurrent stage-stack mutation.
       const persist = async (write: typeof writes[number]) => {
@@ -70,6 +72,7 @@ export function prepareWrites(bucket: ContentBucket, trace: OperationTrace) {
         }));
         if (failed) throw failure;
         for (const write of writes.filter(write => write.key === 'pages/index.html')) {
+          await beforeIndexDispatch?.();
           trace.publication_status = 'unknown';
           try { committedIndex = (await persist(write))!; }
           catch (error) { if (error instanceof PublicationConflict) trace.publication_status = 'not_committed'; throw error; }

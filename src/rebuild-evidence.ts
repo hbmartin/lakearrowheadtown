@@ -17,6 +17,7 @@ export function checkpointDamaged(message = 'Rebuild finalization checkpoint is 
 }
 
 export function readCheckpoint(value: unknown, job: RebuildJob): RebuildCheckpoint | undefined {
+  if (job.generation_id !== undefined && !validGeneration(job.generation_id)) throw checkpointDamaged();
   if (value === undefined) return;
   if (!record(value) || value.migration !== undefined && !completeMigration(value.migration)) throw checkpointDamaged();
   if (value.version === 1 && job.generation_id === undefined) return value as RebuildCheckpoint;
@@ -47,6 +48,7 @@ export interface GenerationHandoff {
 export function readHandoff(value: unknown, job: RebuildJob): GenerationHandoff | undefined {
   if (value === undefined) return;
   if (!record(value) || value.version !== 1 || value.job_id !== job.id || value.generation_id !== job.generation_id
+    || !validGeneration(value.generation_id)
     || !validGeneration(value.repair_id) || !record(value.prior_job) || value.prior_job.id !== job.id
     || typeof value.prior_committed !== 'boolean' || typeof value.repairable_code !== 'string'
     || value.prior_archive_checkpoint !== null && typeof value.prior_archive_checkpoint !== 'string') throw checkpointDamaged('Rebuild generation evidence is damaged. Restore its exact generation record from a verified backup before resuming.');

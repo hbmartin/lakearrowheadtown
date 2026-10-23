@@ -1,3 +1,4 @@
+import { withoutIndexFence } from '../src/index-fence';
 import { env } from 'cloudflare:workers';
 import { reset, runInDurableObject } from 'cloudflare:test';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -88,7 +89,7 @@ describe('static weather publication', () => {
     const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify(sample())));
     await publisher().pullWeatherV1(base);
     const after = await bucket.get('pages/index.html'); const html = await after!.text();
-    const without = (s: string) => s.replace(/<!-- conditions:start -->[\s\S]*?<!-- conditions:end -->/, '');
+    const without = (s: string) => withoutIndexFence(s).replace(/<!-- conditions:start -->[\s\S]*?<!-- conditions:end -->/, '');
     expect(without(html)).toBe(without(body)); expect(after!.customMetadata).toEqual(metadata);
     expect(html).toContain('A saved story'); expect(fetcher).toHaveBeenCalledOnce();
   });
@@ -220,7 +221,7 @@ it('clears an unavailable metadata marker even when fresh HTML already matches',
   await bucket.put('pages/index.html', html, { customMetadata: { ...index.customMetadata, conditions_status: 'unavailable' } });
   await composeHomepageConditions(bucket, base);
   const healed = (await bucket.get('pages/index.html'))!;
-  expect(await healed.text()).toBe(html); expect(healed.customMetadata?.conditions_status).toBeUndefined();
+  expect(withoutIndexFence(await healed.text())).toBe(withoutIndexFence(html)); expect(healed.customMetadata?.conditions_status).toBeUndefined();
   } finally { vi.useRealTimers(); }
 });
 
@@ -269,7 +270,7 @@ it.each([[false, false], [false, true], [true, false], [true, true]])('avoids cl
     const put = vi.fn((key: string, value: any, options: any) => bucket.put(key, value, options));
     const store = new Proxy(bucket, { get(target, property) { if (property === 'put') return put; const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value; } });
     expect(await composeHomepageConditions(store, base)).toBe(!badAlerts && !badWeather);
-    expect(put).not.toHaveBeenCalled(); expect(await (await bucket.get('pages/index.html'))!.text()).toBe(html);
+    expect(put).not.toHaveBeenCalled(); expect(withoutIndexFence(await (await bucket.get('pages/index.html'))!.text())).toBe(withoutIndexFence(html));
     if (badAlerts && badWeather) expect(html).not.toContain('<div class="conditions-row">');
     if (!badWeather) {
       const fresh = sample(); fresh.observation.temp_f += 1;
@@ -287,7 +288,7 @@ it('clears recovery markers without refreshing unchanged snapshot text after tim
     await bucket.put('pages/index.html', html, { customMetadata: { ...before.customMetadata, conditions_status: 'unavailable' } });
     vi.setSystemTime(new Date(+now + 300000));
     await runInDurableObject(publisher(), async (instance, state) => { await state.storage.put('conditions:pending', true); await (instance as any).finishConditions(base); expect(await state.storage.get('conditions:pending')).toBeUndefined(); });
-    const healed = (await bucket.get('pages/index.html'))!; expect(await healed.text()).toBe(html); expect(healed.customMetadata?.conditions_status).toBeUndefined();
+    const healed = (await bucket.get('pages/index.html'))!; expect(withoutIndexFence(await healed.text())).toBe(withoutIndexFence(html)); expect(healed.customMetadata?.conditions_status).toBeUndefined();
   } finally { vi.useRealTimers(); }
 });
 

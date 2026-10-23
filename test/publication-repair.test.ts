@@ -4,6 +4,7 @@ import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import worker from '../src/worker';
 import { appendUpdate, currentPublication, publishDigest } from '../src/publishing';
 import { committedFailureAdvice } from '../src/errors';
+import { withoutIndexFence } from '../src/index-fence';
 import type { ContentBucket, Digest, Env } from '../src/types';
 import type { RepairInput } from '../src/publication-repair';
 
@@ -115,7 +116,7 @@ it('authenticates snapshots and repairs, supports HEAD, and reports a missing in
   expect(await (await request('HEAD')).text()).toBe('');
 });
 
-it('preserves index bytes and metadata, durably schedules regeneration first, and makes repeated repairs a no-op', async () => {
+it('preserves visible index content and metadata, durably schedules regeneration first, and makes repeated repairs a no-op', async () => {
   await seed(); const input = await repairInput();
   const original = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
   const body = await original.text();
@@ -136,7 +137,8 @@ it('preserves index bytes and metadata, durably schedules regeneration first, an
     finally { spy.mockRestore(); }
   });
   const repaired = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
-  expect(await repaired.text()).toBe(body);
+  expect(withoutIndexFence(await repaired.text())).toBe(withoutIndexFence(body));
+  expect(repaired.etag).not.toBe(original.etag);
   expect(repaired.customMetadata).toEqual({ ...customMetadata, manifest: input.manifest, lakearrowhead_repair_id: expect.any(String) });
   expect(repaired.httpMetadata?.contentLanguage).toBe('en-US');
   const response = await request('POST', input);
