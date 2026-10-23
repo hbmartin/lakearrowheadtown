@@ -20,7 +20,7 @@ async function loadWeather(bucket: ContentBucket): Promise<ReturnType<typeof ren
 function conditionsHtml(banner: string, weather: ReturnType<typeof renderWeather> | null, now: Date, notice = ''): string {
   if (!banner && !weather && !notice) return '';
   return `<section class="homepage-conditions${banner ? ' has-alerts' : ''}${weather ? ' has-weather' : ''}" aria-label="Mountain conditions snapshot">
-    <p class="conditions-as-of">Conditions snapshot: ${weatherTime(now.toISOString())}</p><div class="conditions-row">${banner}${weather?.summary ?? ''}${notice}</div>${weather?.details ?? ''}
+    <p class="conditions-as-of">Conditions snapshot: ${weatherTime(now.toISOString())}</p>${notice}<div class="conditions-row">${banner}${weather?.summary ?? ''}</div>${weather?.details ?? ''}
     </section>${weather ? `<script id="weather-interaction">
     (() => {
       const root = document.querySelector('.homepage-conditions');

@@ -671,5 +671,5 @@ export function alertRpcFailure(error: unknown, context?: OperationContext): Ext
   emit('alert_operation_failed', context, { error_code: failure.code, stage, ...safeError(error) }, failure.status >= 500 ? 'error' : 'warn');
   return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, stage,
     publication_status: failure.publication_status ?? 'not_attempted', retryable: failure.retryable,
-    details: detailsWithStage(failure, stage), details_truncated: failure.details_truncated } };
+    details: detailsWithStage(failure.details, stage), details_truncated: failure.details_truncated } };
 }

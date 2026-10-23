@@ -17,9 +17,11 @@ interface RepairRecord {
   phase?: 'prepared' | 'writing' | 'activation'; stalled?: boolean;
   last_error?: { code: string; stage: string; retryable: boolean };
 }
+export const isPaused = (job: RebuildJob | null | undefined): boolean => !!job && (job.manual_resume === true || job.scheduling === 'manual');
+
 export function restartRebuild(job: RebuildJob): RebuildJob {
   const next = { ...job, status: 'queued' as const, scheduling: 'automatic' as const };
-  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume', 'blocked', 'blocked_by'] as const) delete next[key];
+  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume', 'blocked', 'blocked_by', 'recovery'] as const) delete next[key];
   return next;
 }
 export function newRebuild(id: string, origin: string, migration: { complete: boolean; processed: number }, context?: OperationContext): RebuildJob {
@@ -41,7 +43,7 @@ const damaged = () => new HttpError(503, 'The repair journal is damaged. Restore
 function repairMetadata(index: R2Object, record: Pick<RepairRecord, 'id' | 'input'>): Record<string, string> {
   const metadata: Record<string, string> = { ...index.customMetadata, manifest: record.input.manifest, rss: record.input.rss, [REPAIR_MARKER]: record.id };
   if (record.input.archives === null) delete (metadata as Record<string, string>).archives; else metadata.archives = record.input.archives;
-  validateIndexMetadata(metadata);
+  validateIndexMetadata(metadata, true);
   return metadata;
 }
 function valid(value: unknown): value is RepairRecord {
@@ -88,7 +90,7 @@ export class RepairCoordinator {
     for (const id of ids) {
       const job = await storage.get<RebuildJob>(`job:${id}`);
       if (!job || job.status === 'completed') continue;
-      if (job.status === 'failed' || job.manual_resume || job.scheduling === 'manual') await storage.deleteAlarm();
+      if (job.status === 'failed' || isPaused(job)) await storage.deleteAlarm();
       else await storage.setAlarm(Math.max(Date.now() + 1000, Date.parse(job.next_retry_at ?? '') || 0));
       return;
     }
