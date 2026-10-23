@@ -198,7 +198,7 @@ export class DigestPublisher extends DurableObject<Env> {
     context = this.executingContext(context);
     return this.serialize(async () => {
       try {
-        if (!dryRun && this.env.ALERT_CONFIRMATIONS_ENABLED !== 'true') throw new HttpError(503, 'Confirmation writes are not enabled. Deploy compatible readers before enabling this endpoint.', {}, { code: 'confirmations_not_enabled' });
+        if (!dryRun && this.env.ALERT_CONFIRMATIONS_ENABLED !== 'true') throw new HttpError(503, 'Batch confirmation writes are disabled in this environment; no publication was attempted. Dry-run batches and ordinary alert updates remain available.', {}, { code: 'confirmations_not_enabled' });
         const result = await confirmAlerts(this.env.SITE_BUCKET, inputs, new Date(), context, dryRun,
           () => this.ctx.storage.put('conditions:pending', true));
         if (!dryRun) await this.finishConditions(undefined, context);
