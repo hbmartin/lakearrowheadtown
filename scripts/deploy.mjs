@@ -20,7 +20,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const environment = process.argv[2];
     const queued = await deploy(environment);
     console.log(`Deployment complete; waiting for rebuild ${queued.id}.`);
-    const job = await waitForRebuild(queued, environment, { onProgress: job => console.log(`Rebuild ${job.id}: ${job.status}, ${job.phase}, ${job.processed} processed`) });
+    const job = await waitForRebuild(queued, environment, { onProgress: job => console.log(`Rebuild ${job.id}: ${job.status}, ${job.phase}, ${job.processed} processed${job.recovery ? `; recovery ${job.recovery.code} at ${job.recovery.stage}, publication ${job.recovery.publication_status}` : ""}`) });
     console.log(`Deployment complete; rebuild ${job.id} completed.`);
     console.log(`Check: npm run rebuild:status -- ${environment} ${job.id}`);
   } catch (error) { console.error(error.message); process.exitCode = 1; }

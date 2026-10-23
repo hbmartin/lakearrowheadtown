@@ -560,3 +560,55 @@ it('restores a damaged checkpoint, resumes explicitly and clears recovery diagno
     expect(completed.recovery).toBeUndefined(); expect(completed.manual_resume).toBeUndefined();
   });
 });
+
+it.each([false, true])('retains recovery diagnostics through retry exhaustion and eviction (known committed=%s)', async known => {
+  await seed(); const queued = await publisher().enqueueRebuild(origin);
+  const index = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
+  await bindings.SITE_BUCKET.put('pages/index.html', await index.text(), { customMetadata: { ...index.customMetadata, [REBUILD_MARKER]: queued.id }, httpMetadata: index.httpMetadata });
+  const version = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`rebuild-finalization:${queued.id}`, { version: 1 });
+    await state.storage.put(`job:${queued.id}`, { ...queued, status: 'running', ...(known ? { recovery: { code: 'storage_error', stage: 'rebuild_finalize', retryable: true, publication_status: 'committed', failed_at: new Date().toISOString() } } : {}) });
+    const head = instance.env.SITE_BUCKET.head.bind(instance.env.SITE_BUCKET);
+    const fault = vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => { if (key === 'pages/index.html') throw new Error('Private receipt outage'); return head(key); });
+    try { for (let attempt = 0; attempt <= 6; attempt++) { await state.storage.deleteAlarm(); await expect(instance.alarm()).rejects.toBeInstanceOf(OperationFailure); } }
+    finally { fault.mockRestore(); }
+  });
+  await evictDurableObject(publisher());
+  expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'running', blocked: { reason: 'unscheduled' }, recovery: { code: 'storage_error', stage: 'rebuild_receipt_read', retryable: true, publication_status: known ? 'committed' : 'unknown' } });
+  expect(await publisher().resumeRebuild(queued.id)).toMatchObject({ status: 'queued' }); await runDurableObjectAlarm(publisher());
+  expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'completed' });
+  expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(version);
+  expect(JSON.stringify(events)).not.toContain('Private receipt outage');
+});
+
+it('redelivers when damaged-checkpoint diagnostics cannot be persisted', async () => {
+  await seed(); const job = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`rebuild-finalization:${job.id}`, 'bad');
+    const transaction = state.storage.transaction.bind(state.storage);
+    const fault = vi.spyOn(state.storage, 'transaction').mockImplementation(callback => transaction(async storage => callback(new Proxy(storage, { get(target, prop) {
+      if (prop === 'put') return (key: any, value: any) => { if (value?.recovery) throw new Error('Private diagnostics outage'); return target.put(key, value); };
+      const value = Reflect.get(target, prop); return typeof value === 'function' ? value.bind(target) : value;
+    } }))));
+    try { await expect(instance.alarm()).rejects.toBeInstanceOf(OperationFailure); } finally { fault.mockRestore(); }
+    expect(await state.storage.get(`job:${job.id}`)).not.toHaveProperty('recovery');
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_recovery_record_failed', original_error_code: 'rebuild_checkpoint_damaged' }));
+    await instance.alarm(); expect(await instance.jobStatus(job.id)).toMatchObject({ blocked: { reason: 'rebuild_checkpoint_damaged' } });
+    expect(JSON.stringify(events)).not.toContain('Private diagnostics outage');
+  });
+});
+
+it('reconciles a lost rebuild acknowledgement without publishing it again', async () => {
+  await seed(); const job = await publisher().enqueueRebuild(origin); let writes = 0;
+  await inside(publisher(), async instance => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const fault = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation(async (...args: any[]) => {
+      const saved = await put(...args); if (args[0] === 'pages/index.html') { writes++; throw new Error('Lost commit acknowledgement'); } return saved;
+    });
+    try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { fault.mockRestore(); }
+    expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'running', recovery: { publication_status: 'unknown' } });
+    await instance.alarm(); expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'completed' });
+  });
+  expect(writes).toBe(1);
+});

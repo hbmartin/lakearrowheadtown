@@ -455,7 +455,7 @@ export class DigestPublisher extends DurableObject<Env> {
 
   private async recordRebuildRecovery(job: RebuildJob, error: unknown, trace: OperationTrace, damaged: boolean) {
     const failure = asHttpError(error);
-    const saved: RebuildJob = { ...job, recovery: { code: failure.code, stage: trace.failed_stage ?? 'rebuild_finalization', retryable: failure.retryable,
+    const saved: RebuildJob = { ...job, recovery: { code: failure.code, stage: trace.failed_stage ?? failure.stage ?? 'rebuild_finalization', retryable: failure.retryable || !damaged && trace.publication_status === 'unknown',
       publication_status: trace.publication_status === 'committed' || job.recovery?.publication_status === 'committed' ? 'committed' : 'unknown', failed_at: new Date().toISOString() },
       ...(damaged ? { manual_resume: true, scheduling: 'manual' as const } : {}) };
     try {
@@ -508,7 +508,7 @@ export class DigestPublisher extends DurableObject<Env> {
           if (finalization !== undefined) {
             if (!record(finalization) || finalization.version !== 1 || finalization.migration !== undefined && (!record(finalization.migration)
               || finalization.migration.complete !== true || !Number.isSafeInteger(finalization.migration.processed) || finalization.migration.processed < 0)) {
-              throw new HttpError(503, 'Rebuild finalization checkpoint is damaged. Restore the checkpoint from a verified backup before resuming.', {}, { code: 'rebuild_checkpoint_damaged' });
+              throw new HttpError(503, 'Rebuild finalization checkpoint is damaged. Restore the checkpoint from a verified backup before resuming.', {}, { code: 'rebuild_checkpoint_damaged', stage: 'rebuild_finalization_validation' });
             }
             const index = await trace.run('rebuild_receipt_read', () => boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')));
             if (index?.customMetadata?.[REBUILD_MARKER] === job.id) {
