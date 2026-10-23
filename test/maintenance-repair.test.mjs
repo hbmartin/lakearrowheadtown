@@ -112,6 +112,15 @@ test('transient status errors retry while permanent status errors retain committ
     error => error.message.includes(`Repair committed; rebuild ${id}`) && error.message.includes('404'));
 });
 
+test('permanent polling errors before the deadline retain the direct waiter job and last status', async () => {
+  const timing = fakeClock(); let calls = 0;
+  await assert.rejects(waitForRebuild({ id, status: 'running' }, 'preview', { ...options, ...timing, timeoutMs: 5000,
+    request: async () => { calls++; return Response.json({ error: 'Correct the credential', code: 'unauthorized', retryable: false }, { status: 401 }); } }),
+    error => error.status === 401 && error.code === 'unauthorized' && error.message.includes(id)
+      && error.message.includes('last status: running') && error.cause?.message.includes('Correct the credential'));
+  assert.equal(calls, 1); assert.equal(timing.now(), 1000);
+});
+
 test('repairAndFollow refuses invalid configuration before sleeping or retrying', async () => {
   let calls = 0; let waits = 0;
   for (const patch of [{ origin: 'https://evil.example' }, { secret: 'short' }, { payload: { ...payload, rss: 'private/anything' } }]) {

@@ -115,6 +115,9 @@ function completedJob(job) {
 function waitTimeout(job, cause) {
   return new Error(`Rebuild ${job.id} exceeded the wait deadline; completion remains unconfirmed (last status: ${job.blocked?.reason ?? job.status}). Inspect its status; no resume was issued.`, cause ? { cause } : undefined);
 }
+function statusFailure(job, cause, awaitingActivation = false) {
+  return repairFollowFailure(`Rebuild ${job.id} status check failed (last status: ${awaitingActivation ? 'awaiting activation' : job.blocked?.reason ?? job.status}). ${cause.message}`, cause);
+}
 async function finalStatus(job, environment, deadline, options, awaitingActivation = false) {
   const remaining = Math.ceil(deadline + 30000 - monotonic(options));
   if (remaining <= 0) throw waitTimeout(job);
@@ -126,7 +129,7 @@ async function finalStatus(job, environment, deadline, options, awaitingActivati
   } catch (error) {
     if (monotonic(options) <= deadline + 30000 && error[permanentApplicationError]
       && !(awaitingActivation && error.status === 404 && error.code === 'job_not_found')) {
-      throw repairFollowFailure(`Rebuild ${job.id} status check failed (last status: ${awaitingActivation ? 'awaiting activation' : job.blocked?.reason ?? job.status}). ${error.message}`, error);
+      throw statusFailure(job, error, awaitingActivation);
     }
     throw waitTimeout(job, error);
   }
@@ -143,7 +146,7 @@ async function followJob(job, environment, deadline, options) {
       job = await maintenance('status', environment, job.id, { ...options, requestTimeoutMs: Math.max(1, Math.ceil(deadline - monotonic(options))) });
       attempts = 0; retry = undefined; options.onProgress?.(job);
     } catch (error) {
-      if (!error.transport && !error.retryable) throw error;
+      if (!error.transport && !error.retryable) throw statusFailure(job, error);
       attempts++; retry = error; options.onRetry?.(error, job);
     }
   }
