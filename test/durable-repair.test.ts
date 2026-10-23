@@ -716,3 +716,114 @@ it.each(['unknown', 'committed'] as const)('preserves %s evidence across explici
     expect(await instance.jobStatus(queued.id)).toMatchObject({ recovery: { publication_status: certainty } });
   });
 });
+
+it('clears inspection-only uncertainty across eviction and lets a related repair reuse the failed head', async () => {
+  const { input, publication } = await seed(); const job = await publisher().enqueueRebuild(origin);
+  const source = publication.posts[0].key; const savedSource = await (await bindings.SITE_BUCKET.get(source))!.text();
+  await inside(publisher(), async (instance, state) => {
+    const get = state.storage.get.bind(state.storage) as any;
+    const fault = vi.spyOn(state.storage, 'get').mockImplementation((key: any) => {
+      if (key === `rebuild-finalization:${job.id}`) throw new Error('Private checkpoint outage'); return get(key);
+    });
+    await state.storage.deleteAlarm();
+    try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { fault.mockRestore(); }
+    expect(await state.storage.get(`rebuild-finalization:${job.id}`)).toBeUndefined();
+  });
+  await bindings.SITE_BUCKET.delete(source); await evictDurableObject(publisher());
+  await inside(publisher(), async (instance, state) => {
+    await instance.alarm();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'failed', error_code: 'source_damaged' });
+    expect(await state.storage.get(`rebuild-finalization:${job.id}`)).toBeUndefined();
+    expect((await state.storage.get<RebuildJob>(`job:${job.id}`))?.recovery).toBeUndefined();
+    expect(await state.storage.getAlarm()).toBeNull();
+  });
+  await bindings.SITE_BUCKET.put(source, savedSource);
+  const repaired = await (await request(input)).json<any>(); expect(repaired.job.id).toBe(job.id);
+  await runDurableObjectAlarm(publisher()); expect(await publisher().jobStatus(job.id)).toMatchObject({ status: 'completed' });
+  await inside(publisher(), async (_instance, state) => expect(await state.storage.get('jobs')).toEqual([]));
+});
+
+it.each(['source', 'manifest', 'render'] as const)('pauses permanent %s failures without discarding unresolved dispatch evidence', async fault => {
+  const { publication } = await seed(); const job = await publisher().enqueueRebuild(origin);
+  const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`rebuild-finalization:${job.id}`, { version: 1 });
+    if (fault === 'source') await bindings.SITE_BUCKET.delete(publication.posts[0].key);
+    if (fault === 'manifest') await bindings.SITE_BUCKET.put((await bindings.SITE_BUCKET.head('pages/index.html'))!.customMetadata!.manifest, 'bad');
+    const run = OperationTrace.prototype.run;
+    const rendering = fault === 'render' ? vi.spyOn(OperationTrace.prototype, 'run').mockImplementation(function (this: OperationTrace, stage: string, action: any, fields?: any) {
+      return run.call(this, stage, stage === 'rendering' ? () => { throw new OperationFailure('rendering', new Error('Private render fault')); } : action, fields);
+    }) : undefined;
+    await state.storage.deleteAlarm();
+    try { await instance.alarm(); } finally { rendering?.mockRestore(); }
+    expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'running', manual_resume: true, scheduling: 'manual', pause_reason: 'manual_resume',
+      blocked: { reason: 'manual_resume' }, recovery: { code: fault === 'source' ? 'source_damaged' : fault === 'manifest' ? 'manifest_damaged' : 'render_failed', retryable: false, publication_status: 'unknown' } });
+    expect(await state.storage.get(`rebuild-finalization:${job.id}`)).toEqual({ version: 1 });
+    expect(await state.storage.getAlarm()).toBeNull();
+    await instance.alarm();
+  });
+  expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(before);
+});
+
+it('pauses known committed evidence with a missing checkpoint without republishing', async () => {
+  await seed(); const job = await publisher().enqueueRebuild(origin);
+  const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`job:${job.id}`, { ...job, status: 'running', recovery: { code: 'storage_error', stage: 'rebuild_finalize', retryable: true, publication_status: 'committed', failed_at: new Date().toISOString() } });
+    await instance.alarm();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ pause_reason: 'rebuild_checkpoint_damaged', blocked: { reason: 'rebuild_checkpoint_damaged' }, recovery: { publication_status: 'committed', retryable: false } });
+  });
+  expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(before);
+});
+
+it('does not reuse historical checkpoint damage as the reason for an unrelated repair pause after resume', async () => {
+  const { input } = await seed(); const job = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`rebuild-finalization:${job.id}`, 'bad'); await state.storage.deleteAlarm(); await instance.alarm();
+    await state.storage.put(`rebuild-finalization:${job.id}`, { version: 1 });
+    const resumed = await instance.resumeRebuild(job.id); expect(resumed.pause_reason).toBeUndefined();
+    await state.storage.deleteAlarm();
+    expect(await instance.publicationRepairV1(input, origin)).toMatchObject({ ok: true });
+    expect(await instance.jobStatus(job.id)).toMatchObject({ pause_reason: 'manual_resume', blocked: { reason: 'manual_resume' }, recovery: { code: 'rebuild_checkpoint_damaged' } });
+  });
+});
+
+it.each([undefined, 'manual_resume'] as const)('keeps legacy damage-pause fallback but honors an explicit current reason: %s', async pause_reason => {
+  await seed(); const job = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`job:${job.id}`, { ...job, manual_resume: true, pause_reason,
+      recovery: { code: 'rebuild_checkpoint_damaged', stage: 'old', retryable: false, publication_status: 'unknown', failed_at: new Date().toISOString() } });
+    expect(await instance.jobStatus(job.id)).toMatchObject({ blocked: { reason: pause_reason ?? 'rebuild_checkpoint_damaged' } });
+  });
+});
+
+it('retains stale evidence atomically if both non-commit cleanup and failure bookkeeping cannot persist', async () => {
+  await seed(); const job = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    const saved = { ...job, recovery: { code: 'old', stage: 'old', retryable: true, publication_status: 'unknown' as const, failed_at: new Date().toISOString() } };
+    await state.storage.put(`job:${job.id}`, saved); await state.storage.deleteAlarm();
+    const transaction = state.storage.transaction.bind(state.storage);
+    const fault = vi.spyOn(state.storage, 'transaction').mockImplementation(callback => transaction(async storage => { await callback(storage); throw new Error('Private transaction rollback'); }));
+    try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { fault.mockRestore(); }
+    expect(await state.storage.get(`job:${job.id}`)).toEqual(saved);
+    expect(await state.storage.get(`rebuild-finalization:${job.id}`)).toBeUndefined();
+    await instance.alarm(); expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'completed' });
+  });
+});
+
+it('reports the actual repair stage and this resume request certainty without copying the repair outcome', async () => {
+  const { input } = await seed(); const job = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    const store = instance.env.SITE_BUCKET; const put = store.put.bind(store);
+    const fault = vi.spyOn(store, 'put').mockImplementation((key: any, ...args: any[]) => { if (key === 'pages/index.html') throw new Error('Private index outage'); return put(key, ...args); });
+    try {
+      await instance.publicationRepairV1(input, origin);
+      const key = (await state.storage.get<string>('publication_repair_pending'))!;
+      const pending = await state.storage.get<any>(key); vi.setSystemTime(new Date(pending.next_retry_at));
+      const context = { request_id: 'resume-stage', operation: 'rebuild', environment: 'preview', worker_version: 'test' };
+      expect(await instance.resumeRebuildV1(job.id, context)).toMatchObject({ ok: false, failure: { code: 'repair_blocked', stage: 'index_write', publication_status: 'not_committed', retryable: true } });
+      expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_request_failed', request_id: context.request_id, stage: 'index_write', publication_status: 'not_committed' }));
+      expect(events).toContainEqual(expect.objectContaining({ event: 'repair_recovery_failed', request_id: context.request_id, stage: 'index_write', error_code: 'storage_error' }));
+    } finally { fault.mockRestore(); }
+  });
+});

@@ -21,7 +21,7 @@ export const isPaused = (job: RebuildJob | null | undefined): boolean => !!job &
 
 export function restartRebuild(job: RebuildJob): RebuildJob {
   const next = { ...job, status: 'queued' as const, scheduling: 'automatic' as const };
-  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume', 'blocked', 'blocked_by'] as const) delete next[key];
+  for (const key of ['error', 'error_code', 'failed_stage', 'finished_at', 'conflict_count', 'next_retry_at', 'manual_resume', 'pause_reason', 'blocked', 'blocked_by'] as const) delete next[key];
   if (next.recovery && !['unknown', 'committed'].includes(next.recovery.publication_status)) delete next.recovery;
   return next;
 }
@@ -189,12 +189,14 @@ export class RepairCoordinator {
     await this.attempt(saved, trace); return true;
   }
   async gate(context?: OperationContext): Promise<void> {
-    try { await this.recover(new OperationTrace(context), true); }
+    const trace = new OperationTrace(context);
+    try { await this.recover(trace, true); }
     catch (error) {
       const failure = asHttpError(error);
       if (!['repair_pending', 'repair_stalled', 'repair_journal_damaged'].includes(failure.code)) throw error;
       throw new HttpError(503, 'A different publication repair blocks index replacement. Inspect its recovery state before retrying this operation.', {}, {
-        code: 'repair_blocked', retryable: failure.retryable, retry_at: failure.retry_at, publication_status: 'not_committed', details: { blocking_repair: failure.details } });
+        code: 'repair_blocked', stage: trace.failed_stage ?? failure.stage ?? 'repair_recovery', retryable: failure.retryable, retry_at: failure.retry_at,
+        publication_status: 'not_committed', details: { blocking_repair: failure.details } });
     }
   }
   async control(action: 'resume' | 'cancel', input: unknown, trace: OperationTrace): Promise<RepairResult> {
@@ -253,7 +255,7 @@ export class RepairCoordinator {
             // Preserve genuinely unscheduled work, including automatic jobs
             // whose platform redeliveries were exhausted. A consumed delivery
             // waiting in our queue is distinguished by alarmDelivered().
-            if (existing.status !== 'failed' && existing.scheduling !== 'manual') await storage.put(`job:${id}`, { ...existing, manual_resume: true, scheduling: 'manual' });
+            if (existing.status !== 'failed' && existing.scheduling !== 'manual') await storage.put(`job:${id}`, { ...existing, manual_resume: true, scheduling: 'manual', pause_reason: 'manual_resume' });
             break;
           }
           await storage.put(key, saved); await storage.put(ACTIVE, key);

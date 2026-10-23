@@ -182,6 +182,7 @@ export type RebuildResumeReply = { ok: true; result: RebuildJob | 'conflict' | n
 
 export interface RebuildJob {
   recovery?: { code: string; stage: string; retryable: boolean; publication_status: PublicationStatus; failed_at: string };
+  pause_reason?: 'manual_resume' | 'rebuild_checkpoint_damaged';
   manual_resume?: boolean;
   scheduling?: 'automatic' | 'manual';
   id: string;
