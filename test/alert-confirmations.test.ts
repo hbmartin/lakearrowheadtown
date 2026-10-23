@@ -116,9 +116,15 @@ it('wires HTTP batching and stages writes behind the reader rollout gate', async
   const send = (suffix = '') => request('/api/alerts/confirmations' + suffix, { method: 'POST', headers: auth, body: JSON.stringify({ confirmations: [input] }) });
   expect((await request('/api/alerts/confirmations')).status).toBe(401);
   expect((await request('/api/alerts/confirmations', { headers: auth })).status).toBe(405);
-  const preview = await send('?dry_run=true'); expect(await preview.json()).toMatchObject({ ok: true, dry_run: true, counts: { confirmed: 1 } });
   await inPublisher(bindings.PUBLISHER.getByName('site'), async (instance: any) => { instance.env = { ...instance.env, ALERT_CONFIRMATIONS_ENABLED: 'false' }; });
-  expect(await (await send()).json()).toMatchObject({ ok: false, code: 'confirmations_not_enabled', publication_status: 'not_attempted' });
+  const before = await (await bucket.get(ALERTS_KEY))!.text();
+  const preview = await send('?dry_run=true'); expect(preview.status).toBe(200);
+  expect(await preview.json()).toMatchObject({ ok: true, dry_run: true, committed: false, counts: { confirmed: 1 } });
+  const blocked = await send(); expect(blocked.status).toBe(503);
+  expect(await blocked.json()).toMatchObject({ ok: false, code: 'confirmations_not_enabled', publication_status: 'not_attempted', suggestion: { action: 'complete_reader_rollout' } });
+  expect(await (await bucket.get(ALERTS_KEY))!.text()).toBe(before);
+  const fallback = await request('/api/alerts', { method: 'POST', headers: auth, body: JSON.stringify({ ...input, client_ref: crypto.randomUUID(), phase: 'update' }) });
+  expect(fallback.status).toBe(200); expect(await fallback.json()).toMatchObject({ ok: true, status: 'published', alert_id: a.alert_id });
   await inPublisher(bindings.PUBLISHER.getByName('site'), async (instance: any) => { instance.env = { ...instance.env, ALERT_CONFIRMATIONS_ENABLED: 'true' }; });
   const confirmed = await (await send()).json<ConfirmationsResult & { ok: boolean }>(); expect(confirmed).toMatchObject({ ok: true, counts: { confirmed: 1 } });
   expect(await (await send()).json()).toMatchObject({ ok: true, counts: { duplicates: 1, confirmed: 0 } });
