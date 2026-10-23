@@ -135,5 +135,40 @@ test('a pending repair remains observable progress and its retry deadline is hon
     calls++; return Response.json(calls === 1 ? { publication, unchanged: false, job: { id, status: 'running', blocked: { reason: 'repair_pending', repair_id: id, retry_at: new Date(Date.now() + 120000).toISOString() } } }
       : { job: { id, status: 'completed' } });
   } });
-  assert.equal(result.job.status, 'completed'); assert(waits[0] > 119000 && waits[0] <= 120000);
+  assert.equal(result.job.status, 'completed'); assert.equal(waits[0], 30000);
+});
+
+for (const skew of [-600000, 600000]) for (const timing of ['date', 'relative', 'missing']) {
+  test(`bounds repair waits with ${skew}ms clock skew and ${timing} timing`, async () => {
+    const server = Date.parse('2026-10-23T12:00:00Z'); const original = Date.now;
+    let clock = 0; let calls = 0; const waits = [];
+    Date.now = () => server + skew + clock;
+    try {
+      const headers = timing === 'missing' ? {} : { Date: new Date(server).toUTCString(), ...(timing === 'relative' ? { 'Retry-After': '3' } : {}) };
+      await repairAndFollow('preview', undefined, { ...options, payload, now: () => clock, sleep: async ms => { waits.push(ms); clock += ms; }, request: async () => ++calls === 1
+        ? Response.json({ error: 'Pending', retryable: true, retry_at: new Date(server + 5000).toISOString() }, { status: 503, headers })
+        : Response.json({ publication, unchanged: true }) });
+      assert.equal(waits[0], timing === 'date' ? 5000 : timing === 'relative' ? 3000 : skew < 0 ? 30000 : 1000);
+    } finally { Date.now = original; }
+  });
+}
+
+test('job timing uses server dates and remains private to the waiting tools', async () => {
+  const server = Date.parse('2026-10-23T12:00:00Z'); let clock = 0; const waits = [];
+  const job = await maintenance('status', 'preview', id, { ...options, now: () => clock, request: async () => Response.json({ job: { id, status: 'running', next_retry_at: new Date(server + 5000).toISOString() } }, { headers: { Date: new Date(server).toUTCString() } }) });
+  assert.equal(JSON.stringify(job), JSON.stringify({ id, status: 'running', next_retry_at: new Date(server + 5000).toISOString() }));
+  await waitForRebuild(job, 'preview', { ...options, now: () => clock, sleep: async ms => { waits.push(ms); clock += ms; }, request: async () => Response.json({ job: { id, status: 'completed' } }) });
+  assert.deepEqual(waits, [5000]);
+});
+
+test('waiting tools explain durable checkpoint damage immediately', async () => {
+  await assert.rejects(waitForRebuild({ id, status: 'running', blocked: { reason: 'rebuild_checkpoint_damaged' } }, 'preview', options), /verified backup.*explicitly resume/);
+});
+
+test('invalid Retry-After falls back to the JSON deadline against server time', async () => {
+  const server = Date.parse('2026-10-23T12:00:00Z'); let clock = 0; let calls = 0; const waits = [];
+  await repairAndFollow('preview', undefined, { ...options, payload, now: () => clock, sleep: async ms => { waits.push(ms); clock += ms; }, request: async () => ++calls === 1
+    ? Response.json({ error: 'Pending', retryable: true, retry_at: new Date(server + 5000).toISOString() }, { status: 503, headers: { Date: new Date(server).toUTCString(), 'Retry-After': 'invalid' } })
+    : Response.json({ publication, unchanged: true }) });
+  assert.deepEqual(waits, [5000]);
 });

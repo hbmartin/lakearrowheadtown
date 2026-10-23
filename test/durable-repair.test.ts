@@ -498,7 +498,7 @@ it('finalizes a committed rebuild across eviction without a second index write, 
     } }))));
     try { await expect(instance.alarm()).rejects.toBeInstanceOf(OperationFailure); }
     finally { writes.mockRestore(); failure.mockRestore(); }
-    expect(await state.storage.get(`job:${queued.id}`)).toMatchObject({ status: 'running' });
+    expect(await state.storage.get(`job:${queued.id}`)).toMatchObject({ status: 'running', recovery: { code: 'storage_error', stage: 'rebuild_finalize', publication_status: 'committed' } });
   });
   expect(indexWrites).toBe(1);
   const publication = await currentPublication(bindings.SITE_BUCKET);
@@ -529,8 +529,86 @@ it.each(['damaged', {}, { version: 1, migration: { complete: true, processed: -1
   const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
   await inside(publisher(), async (instance, state) => {
     await state.storage.put(`rebuild-finalization:${job.id}`, checkpoint);
-    await expect(instance.alarm()).rejects.toMatchObject({ code: 'rebuild_checkpoint_damaged', retryable: false });
-    expect(await state.storage.get(`job:${job.id}`)).toMatchObject({ status: 'queued' });
+    await instance.alarm();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'queued', manual_resume: true, scheduling: 'manual', blocked: { reason: 'rebuild_checkpoint_damaged' }, recovery: { code: 'rebuild_checkpoint_damaged', retryable: false, publication_status: 'unknown' } });
+    expect(await state.storage.getAlarm()).toBeNull();
+    await instance.alarm();
   });
   expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(before);
+});
+
+it.each([{ manual_resume: true }, { scheduling: 'manual' }])('resumes a paused head with queued delivery %j exactly once', async pause => {
+  await seed(); const queued = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    const job = await state.storage.get<RebuildJob>(`job:${queued.id}`);
+    await state.storage.put(`job:${queued.id}`, { ...job, ...pause }); await state.storage.deleteAlarm();
+    const resuming = instance.resumeRebuild(queued.id); const delivered = instance.alarm();
+    expect(await resuming).toMatchObject({ id: queued.id, status: 'queued' }); await delivered;
+    expect(await instance.jobStatus(queued.id)).toMatchObject({ status: 'completed' });
+    await instance.alarm();
+    expect(events.filter(event => event.event === 'rebuild_completed' && event.job_id === queued.id)).toHaveLength(1);
+  });
+});
+
+it('restores a damaged checkpoint, resumes explicitly and clears recovery diagnostics', async () => {
+  await seed(); const job = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`rebuild-finalization:${job.id}`, 'bad'); await instance.alarm();
+    await state.storage.put(`rebuild-finalization:${job.id}`, { version: 1 });
+    expect(await instance.resumeRebuild(job.id)).toMatchObject({ status: 'queued' }); await instance.alarm();
+    const completed = await instance.jobStatus(job.id); expect(completed.status).toBe('completed');
+    expect(completed.recovery).toBeUndefined(); expect(completed.manual_resume).toBeUndefined();
+  });
+});
+
+it.each([false, true])('retains recovery diagnostics through retry exhaustion and eviction (known committed=%s)', async known => {
+  await seed(); const queued = await publisher().enqueueRebuild(origin);
+  const index = (await bindings.SITE_BUCKET.get('pages/index.html'))!;
+  await bindings.SITE_BUCKET.put('pages/index.html', await index.text(), { customMetadata: { ...index.customMetadata, [REBUILD_MARKER]: queued.id }, httpMetadata: index.httpMetadata });
+  const version = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`rebuild-finalization:${queued.id}`, { version: 1 });
+    await state.storage.put(`job:${queued.id}`, { ...queued, status: 'running', ...(known ? { recovery: { code: 'storage_error', stage: 'rebuild_finalize', retryable: true, publication_status: 'committed', failed_at: new Date().toISOString() } } : {}) });
+    const head = instance.env.SITE_BUCKET.head.bind(instance.env.SITE_BUCKET);
+    const fault = vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => { if (key === 'pages/index.html') throw new Error('Private receipt outage'); return head(key); });
+    try { for (let attempt = 0; attempt <= 6; attempt++) { await state.storage.deleteAlarm(); await expect(instance.alarm()).rejects.toBeInstanceOf(OperationFailure); } }
+    finally { fault.mockRestore(); }
+  });
+  await evictDurableObject(publisher());
+  expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'running', blocked: { reason: 'unscheduled' }, recovery: { code: 'storage_error', stage: 'rebuild_receipt_read', retryable: true, publication_status: known ? 'committed' : 'unknown' } });
+  expect(await publisher().resumeRebuild(queued.id)).toMatchObject({ status: 'queued' }); await runDurableObjectAlarm(publisher());
+  expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'completed' });
+  expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(version);
+  expect(JSON.stringify(events)).not.toContain('Private receipt outage');
+});
+
+it('redelivers when damaged-checkpoint diagnostics cannot be persisted', async () => {
+  await seed(); const job = await publisher().enqueueRebuild(origin);
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`rebuild-finalization:${job.id}`, 'bad');
+    const transaction = state.storage.transaction.bind(state.storage);
+    const fault = vi.spyOn(state.storage, 'transaction').mockImplementation(callback => transaction(async storage => callback(new Proxy(storage, { get(target, prop) {
+      if (prop === 'put') return (key: any, value: any) => { if (value?.recovery) throw new Error('Private diagnostics outage'); return target.put(key, value); };
+      const value = Reflect.get(target, prop); return typeof value === 'function' ? value.bind(target) : value;
+    } }))));
+    try { await expect(instance.alarm()).rejects.toBeInstanceOf(OperationFailure); } finally { fault.mockRestore(); }
+    expect(await state.storage.get(`job:${job.id}`)).not.toHaveProperty('recovery');
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_recovery_record_failed', original_error_code: 'rebuild_checkpoint_damaged' }));
+    await instance.alarm(); expect(await instance.jobStatus(job.id)).toMatchObject({ blocked: { reason: 'rebuild_checkpoint_damaged' } });
+    expect(JSON.stringify(events)).not.toContain('Private diagnostics outage');
+  });
+});
+
+it('reconciles a lost rebuild acknowledgement without publishing it again', async () => {
+  await seed(); const job = await publisher().enqueueRebuild(origin); let writes = 0;
+  await inside(publisher(), async instance => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const fault = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation(async (...args: any[]) => {
+      const saved = await put(...args); if (args[0] === 'pages/index.html') { writes++; throw new Error('Lost commit acknowledgement'); } return saved;
+    });
+    try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { fault.mockRestore(); }
+    expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'running', recovery: { publication_status: 'unknown' } });
+    await instance.alarm(); expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'completed' });
+  });
+  expect(writes).toBe(1);
 });

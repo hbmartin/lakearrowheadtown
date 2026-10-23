@@ -77,8 +77,8 @@ export function asHttpError(error: unknown): HttpError {
   return new HttpError(failure.status, failure.error, {}, failure);
 }
 
-export function detailsWithStage(failure: HttpError, stage: string): HttpError['details'] {
-  return Array.isArray(failure.details) || Object.keys(failure.details).length ? failure.details : { stage };
+export function detailsWithStage(details: HttpError['details'] | undefined, stage: string): HttpError['details'] {
+  return details && (Array.isArray(details) || Object.keys(details).length) ? details : { stage };
 }
 
 export const UNKNOWN_PUBLICATION = 'Unable to confirm publication; it may have completed. Retry the unchanged payload within the original 30 Los Angeles receipt-date deduplication window.';
@@ -181,5 +181,5 @@ export function retryHeaders(retryAt?: string): HeadersInit {
 export function failureError(f: PublishFailure): HttpError {
   return new HttpError(f.status, f.error, retryHeaders(f.retry_at), { stage: f.stage, code: f.code,
     retryable: f.retryable, retry_at: f.retry_at, publication_status: f.publication_status,
-    details: f.details ?? { stage: f.stage }, details_truncated: f.details_truncated });
+    details: detailsWithStage(f.details, f.stage), details_truncated: f.details_truncated });
 }

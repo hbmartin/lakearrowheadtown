@@ -195,7 +195,11 @@ it.each([[false, false], [false, true], [true, false], [true, true]])('isolates 
   expect(result.html.includes('Today on the mountain')).toBe(!badWeather);
   if (badAlerts || badWeather) expect(result.html).toContain('role="status"');
   if (badAlerts && badWeather) expect(result.html).toContain('Mountain conditions are temporarily unavailable.');
-  else if (badAlerts) expect(result.html).toContain('Road and power alerts are temporarily unavailable.');
+  else if (badAlerts) {
+    expect(result.html).toContain('Road and power alerts are temporarily unavailable.');
+    expect(result.html.indexOf('conditions-unavailable')).toBeLessThan(result.html.indexOf('conditions-row'));
+    expect(result.html).toMatch(/<\/div><\/div><section id="weather-details"/);
+  }
   else if (badWeather) expect(result.html).toContain('Weather is temporarily unavailable.');
 });
 
@@ -248,7 +252,7 @@ it('does not replace a legacy page when its preserved news anchor is invalid or 
     await bucket.put('pages/index.html', renderPage([], { origin: base }), { customMetadata: metadata });
     const before = (await bucket.head('pages/index.html'))!;
     await bucket.put(WEATHER_KEY, '{broken');
-    await expect(composeHomepageConditions(bucket, base)).rejects.toBeInstanceOf(Error);
+    await expect(composeHomepageConditions(bucket, base)).rejects.toMatchObject({ code: NEWS_ANCHOR in metadata ? 'legacy_recovery_required' : 'index_metadata_too_large' });
     expect((await bucket.head('pages/index.html'))!.version).toBe(before.version);
   }
 });

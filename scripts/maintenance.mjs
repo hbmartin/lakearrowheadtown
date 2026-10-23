@@ -5,6 +5,22 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { checkEnvironment, readPublishingCredential, validateCredential } from './credentials.mjs';
 
 const defaults = { preview: 'https://lakearrowheadtown-preview.harold-martin.workers.dev', production: 'https://lakearrowhead.town' };
+const retryDeadline = Symbol('monotonic retry deadline');
+const monotonic = options => (options.now ?? (() => performance.now()))();
+function withTiming(value, response, retryAt, options) {
+  const server = Date.parse(response.headers.get('Date'));
+  const header = response.headers.get('Retry-After');
+  let delay = header !== null && /^\d+(?:\.\d+)?$/.test(header) ? Number(header) * 1000
+    : Number.isFinite(server) ? Date.parse(header) - server : NaN;
+  if (!Number.isFinite(delay) && Number.isFinite(server)) delay = Date.parse(retryAt) - server;
+  if (Number.isFinite(delay)) Object.defineProperty(value, retryDeadline, { value: monotonic(options) + Math.max(0, delay) });
+  return value;
+}
+function retryDelay(value, attempts, options) {
+  const delay = value?.[retryDeadline] !== undefined ? value[retryDeadline] - monotonic(options)
+    : Date.parse(value?.retryAt ?? value?.blocked?.retry_at ?? value?.next_retry_at) - Date.now();
+  return Math.min(30000, Math.max(1000, delay > 0 ? delay : 2 ** Math.min(attempts, 5) * 1000));
+}
 export function maintenanceTarget(environment, value = process.env.SITE_URL || defaults[environment]) {
   checkEnvironment(environment);
   const url = new URL(value);
@@ -40,7 +56,7 @@ export async function maintenance(operation, environment, id, options = {}) {
     const failure = new Error(response.ok ? `Invalid maintenance response (${response.status}): expected JSON` : `Maintenance request failed (${response.status}): non-JSON response`);
     failure.status = response.status;
     failure.retryable = response.ok || response.status >= 500;
-    throw failure;
+    throw withTiming(failure, response, undefined, options);
   }
   if (!response.ok) {
     const failure = new Error(`Maintenance request failed (${response.status}): ${typeof result?.error === 'string' ? result.error : 'Unknown error'}`);
@@ -50,34 +66,37 @@ export async function maintenance(operation, environment, id, options = {}) {
     failure.publicationStatus = result?.publication_status;
     failure.details = result?.details;
     failure.status = response.status;
-    throw failure;
+    throw withTiming(failure, response, failure.retryAt, options);
   }
   if (repairing) {
     const head = result?.publication;
     if (!head || typeof head.version !== 'string' || !head.version || !['manifest', 'rss', 'archives'].every(key => head[key] === null || typeof head[key] === 'string')) throw new Error(`Invalid maintenance response (${response.status}): expected a publication snapshot`);
+    if (result.job) withTiming(result.job, response, result.job.blocked?.retry_at ?? result.job.next_retry_at, options);
     return result;
   }
   if (typeof result?.job?.id !== 'string' || !/^[a-f0-9-]{36}$/.test(result.job.id) || !['queued', 'running', 'completed', 'failed'].includes(result.job.status)) throw new Error(`Invalid maintenance response (${response.status}): expected a rebuild job`);
-  return result.job;
+  return withTiming(result.job, response, result.job.blocked?.retry_at ?? result.job.next_retry_at, options);
 }
 const blocked = job => job.blocked?.reason ? job.blocked.reason !== 'repair_pending' : Boolean(job.manual_resume || job.blocked_by);
 const blockedAdvice = job => {
   const reason = job.blocked?.reason ?? (job.manual_resume ? 'manual_resume' : 'failed_rebuild');
   const target = job.blocked?.job_id ?? job.blocked_by ?? job.id;
+  if (reason === 'rebuild_checkpoint_damaged') return `Restore rebuild ${target}'s finalization checkpoint from a verified backup, then explicitly resume it.`;
+  const recovery = job.recovery ? ` Last recovery failure: ${job.recovery.code} at ${job.recovery.stage}; publication ${job.recovery.publication_status}.` : '';
   return reason.startsWith('repair_')
     ? `Inspect publication repair${job.blocked?.repair_id ? ` ${job.blocked.repair_id}` : ''}; restore damaged records or explicitly resume stalled recovery.`
-    : `Inspect rebuild ${target} and explicitly resume it after correcting the cause.`;
+    : `Inspect rebuild ${target} and explicitly resume it after correcting the cause.${recovery}`;
 };
 
 export async function waitForRebuild(job, environment, options = {}) {
-  const deadline = performance.now() + (options.timeoutMs ?? 1800000);
-  let attempts = 0;
+  const deadline = monotonic(options) + (options.timeoutMs ?? 1800000);
+  let attempts = 0; let retry;
   while (!['completed', 'failed'].includes(job.status) && !blocked(job)) {
-    if (performance.now() >= deadline) throw new Error(`Rebuild ${job.id} exceeded the wait deadline. Inspect its status; no resume was issued.`);
-    const next = Date.parse(job.blocked?.retry_at ?? job.next_retry_at) - Date.now();
-    await (options.sleep ?? sleep)(Math.min(Math.max(1000, next > 0 ? next : 2 ** Math.min(attempts, 5) * 1000), 30000, Math.max(1, deadline - performance.now())));
-    try { job = await maintenance('status', environment, job.id, options); attempts = 0; options.onProgress?.(job); }
-    catch (error) { if (!error.transport && !error.retryable) throw error; attempts++; }
+    if (monotonic(options) >= deadline) throw new Error(`Rebuild ${job.id} exceeded the wait deadline. Inspect its status; no resume was issued.`);
+    await (options.sleep ?? sleep)(Math.min(retryDelay(retry ?? job, attempts, options), Math.max(1, deadline - monotonic(options))));
+    if (monotonic(options) >= deadline) throw new Error(`Rebuild ${job.id} exceeded the wait deadline. Inspect its status; no resume was issued.`);
+    try { job = await maintenance('status', environment, job.id, { ...options, requestTimeoutMs: Math.max(1, deadline - monotonic(options)) }); attempts = 0; retry = undefined; options.onProgress?.(job); }
+    catch (error) { if (!error.transport && !error.retryable) throw error; attempts++; retry = error; }
   }
   if (job.status !== 'completed') throw new Error(`Rebuild ${job.id} failed or is blocked (${job.blocked?.reason ?? job.status}). ${blockedAdvice(job)}`);
   return job;
@@ -90,16 +109,15 @@ export async function repairAndFollow(environment, file, options = {}) {
   const now = options.now ?? (() => performance.now());
   const deadline = now() + timeoutMs;
   const wait = options.sleep ?? sleep;
-  let result; let jobId; let attempts = 0; let statusRetryAt;
+  let result; let jobId; let attempts = 0; let statusRetry;
   const context = () => jobId ? `Repair committed; rebuild ${jobId} is ${result?.job?.status ?? 'awaiting activation'}.` : 'Repair outcome may be unknown; retry the identical repair file to reconcile it.';
   const remaining = () => {
     const left = Math.ceil(deadline - now());
     if (left <= 0) throw new Error(`${context()} Overall repair timeout exceeded. Inspect the snapshot and rebuild status.`);
     return left;
   };
-  const pause = async retryAt => {
-    const delay = Math.max(1000, (Date.parse(retryAt) > Date.now() ? Date.parse(retryAt) - Date.now() : Math.min(30000, 2 ** Math.min(attempts++, 5) * 1000)));
-    await wait(Math.min(delay, remaining()));
+  const pause = async value => {
+    await wait(Math.min(retryDelay(value, attempts++, options), remaining()));
     remaining();
   };
   const call = (operation, id) => maintenance(operation, environment, id, { ...options, payload, requestTimeoutMs: remaining() });
@@ -112,18 +130,18 @@ export async function repairAndFollow(environment, file, options = {}) {
         options.onProgress?.({ publication_status: 'committed', repair_id: error.details.repair_id, job_id: jobId });
       }
       if (!retryable(error)) throw new Error(`${jobId ? context() + ' ' : ''}${error.message}`, { cause: error });
-      await pause(error.retryAt);
+      await pause(error);
     }
   }
   attempts = 0;
   jobId = result.job?.id;
   options.onProgress?.(result);
   while (result.job && !['completed', 'failed'].includes(result.job.status) && !blocked(result.job)) {
-    await pause(statusRetryAt ?? result.job.blocked?.retry_at ?? result.job.next_retry_at);
-    try { result.job = await call('status', jobId); attempts = 0; statusRetryAt = undefined; }
+    await pause(statusRetry ?? result.job);
+    try { result.job = await call('status', jobId); attempts = 0; statusRetry = undefined; }
     catch (error) {
       if (!retryable(error)) throw new Error(`${context()} ${error.message}`, { cause: error });
-      statusRetryAt = error.retryAt;
+      statusRetry = error;
       options.onProgress?.({ job_id: jobId, publication_status: 'committed', warning: error.message });
       continue;
     }
