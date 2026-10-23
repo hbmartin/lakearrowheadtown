@@ -112,6 +112,15 @@ test('transient status errors retry while permanent status errors retain committ
     error => error.message.includes(`Repair committed; rebuild ${id}`) && error.message.includes('404'));
 });
 
+test('permanent polling errors before the deadline retain the direct waiter job and last status', async () => {
+  const timing = fakeClock(); let calls = 0;
+  await assert.rejects(waitForRebuild({ id, status: 'running' }, 'preview', { ...options, ...timing, timeoutMs: 5000,
+    request: async () => { calls++; return Response.json({ error: 'Correct the credential', code: 'unauthorized', retryable: false }, { status: 401 }); } }),
+    error => error.status === 401 && error.code === 'unauthorized' && error.message.includes(id)
+      && error.message.includes('last status: running') && error.cause?.message.includes('Correct the credential'));
+  assert.equal(calls, 1); assert.equal(timing.now(), 1000);
+});
+
 test('repairAndFollow refuses invalid configuration before sleeping or retrying', async () => {
   let calls = 0; let waits = 0;
   for (const patch of [{ origin: 'https://evil.example' }, { secret: 'short' }, { payload: { ...payload, rss: 'private/anything' } }]) {
@@ -199,8 +208,10 @@ for (const tool of ['wait', 'repair', 'pending-repair']) for (const [status, cod
       return Response.json({ error: 'Correct the credential or job identity', code, retryable: false }, { status });
     } };
     await assert.rejects(tool === 'wait' ? waitForRebuild({ id, status: 'running' }, 'preview', config) : repairAndFollow('preview', undefined, config),
-      error => error.status === status && error.code === code && error.retryable === false && error.message.includes(`${status} ${code}`)
-        && !error.message.includes('completion remains unconfirmed') && (tool === 'wait' || error.message.includes(`Repair committed; rebuild ${id}`)));
+      error => tool === 'pending-repair' && status === 404 ? error.message.includes('completion remains unconfirmed') && error.message.includes(id)
+        : error.status === status && error.code === code && error.retryable === false && error.message.includes(`${status} ${code}`)
+          && error.message.includes(id) && error.message.includes('last status:') && !error.message.includes('completion remains unconfirmed')
+          && (tool === 'wait' || error.message.includes(`Repair committed; rebuild ${id}`)));
     assert.deepEqual(methods, tool === 'wait' ? ['GET'] : ['POST', 'GET']);
   });
 }
@@ -214,6 +225,23 @@ for (const kind of ['retryable', 'malformed', 'late-permanent']) test(`final che
     } }), /completion remains unconfirmed/);
   assert.equal(calls, 1);
 });
+
+for (const kind of ['html-403', 'html-429', 'missing-retryable', 'missing-code', 'missing-error', 'nonboolean-retryable', 'array']) {
+  test(`a final ${kind} reply cannot establish a permanent application failure`, async () => {
+    const timing = fakeClock(); let calls = 0;
+    await assert.rejects(waitForRebuild({ id, status: 'running' }, 'preview', { ...options, ...timing, timeoutMs: 1000, request: async () => {
+      calls++;
+      if (kind.startsWith('html')) return new Response('<html>Edge rejection</html>', { status: Number(kind.slice(-3)) });
+      const body = { code: 'unauthorized', error: 'Correct the credential', retryable: false };
+      if (kind === 'missing-retryable') delete body.retryable;
+      if (kind === 'missing-code') delete body.code;
+      if (kind === 'missing-error') delete body.error;
+      if (kind === 'nonboolean-retryable') body.retryable = 'false';
+      return Response.json(kind === 'array' ? [body] : body, { status: 401 });
+    } }), error => error.message.includes('completion remains unconfirmed') && error.message.includes(id) && error.cause?.status >= 400);
+    assert.equal(calls, 1);
+  });
+}
 
 test('fails clearly for a nonadvancing injected clock instead of spinning or making another request', async () => {
   let calls = 0; let sleeps = 0;

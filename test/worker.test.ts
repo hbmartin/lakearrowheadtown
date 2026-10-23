@@ -1,3 +1,4 @@
+import { withoutIndexFence } from '../src/index-fence';
 import { env } from 'cloudflare:workers';
 import { evictDurableObject, reset, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -186,11 +187,11 @@ describe('damaged source omission and recovery', () => {
     } });
     await rebuildHomepage(noOmittedReads, base);
     expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
-    expect(await (await fetch('/')).text()).toBe(html);
+    expect(withoutIndexFence(await (await fetch('/')).text())).toBe(withoutIndexFence(html));
     await bindings.SITE_BUCKET.put(key, original);
     await rebuildHomepage(bindings.SITE_BUCKET, base);
     expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
-    expect(await (await fetch('/')).text()).toBe(html);
+    expect(withoutIndexFence(await (await fetch('/')).text())).toBe(withoutIndexFence(html));
     await publishDigest(bindings.SITE_BUCKET, digest('Publication after repair', now.toISOString()), base, now, true);
     const recovered = await currentPublication(bindings.SITE_BUCKET);
     expect(recovered.posts).toHaveLength(4); expect(recovered.omitted_posts).toBeUndefined();
@@ -255,7 +256,7 @@ describe('damaged source omission and recovery', () => {
     await runDurableObjectAlarm(publisher());
     expect((await jobStatus(job.id)).status).toBe('completed');
     expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
-    expect(await (await fetch('/')).text()).toBe(html);
+    expect(withoutIndexFence(await (await fetch('/')).text())).toBe(withoutIndexFence(html));
   });
 });
 
@@ -342,7 +343,7 @@ describe('server dates, snapshots and rendering', () => {
     expect(html).not.toContain('Day 09'); expect(html).toContain('Day 10'); expect(html).toContain('Day 16');
     await rebuildHomepage(bindings.SITE_BUCKET, base);
     expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
-    expect(await (await fetch('/')).text()).toBe(html);
+    expect(withoutIndexFence(await (await fetch('/')).text())).toBe(withoutIndexFence(html));
     await publishDigest(bindings.SITE_BUCKET, digest('Next week', '2026-10-24T20:00:00Z'), base, new Date('2026-10-24T20:00:00Z'));
     expect(await (await fetch('/')).text()).not.toContain('Day 16');
   });
@@ -643,7 +644,7 @@ describe('linked article thumbnails', () => {
     await rebuildHomepage(bindings.SITE_BUCKET, base);
     expect(await currentPublication(bindings.SITE_BUCKET)).toEqual(snapshot);
     expect(await (await bindings.SITE_BUCKET.get(snapshot.posts[0].key))!.text()).toBe(stored);
-    expect(await (await fetch('/')).text()).toBe(html);
+    expect(withoutIndexFence(await (await fetch('/')).text())).toBe(withoutIndexFence(html));
   });
 });
 

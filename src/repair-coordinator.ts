@@ -4,6 +4,7 @@ import { fingerprint, record as object } from './primitives';
 import { prepareWrites } from './prepared-writes';
 import { PublicationConflict } from './publication-conflict';
 import { validateIndexMetadata } from './index-metadata';
+import { checkpointKey, completeMigration, generationKey, readHandoff, receiptMatches, type GenerationHandoff } from './rebuild-evidence';
 import { indexNotFound, publicationHead, validateRepair, validateRepairTargets, type PublicationHead, type RepairInput, type RepairResult, type RecoverySummary } from './publication-repair';
 import type { ContentBucket, OperationContext, PublicationStatus, RebuildJob, RebuildBlocker } from './types';
 
@@ -16,6 +17,7 @@ interface RepairRecord {
   conflict_status?: PublicationStatus; attempts: number; next_retry_at?: string;
   phase?: 'prepared' | 'writing' | 'activation'; stalled?: boolean;
   last_error?: { code: string; stage: string; retryable: boolean };
+  handoff?: GenerationHandoff;
 }
 export const isPaused = (job: RebuildJob | null | undefined): boolean => !!job && (job.manual_resume === true || job.scheduling === 'manual');
 export const pauseReason = (job: RebuildJob): NonNullable<RebuildJob['pause_reason']> => job.pause_reason
@@ -30,7 +32,7 @@ export function restartRebuild(job: RebuildJob): RebuildJob {
 export function newRebuild(id: string, origin: string, migration: { complete: boolean; processed: number }, context?: OperationContext): RebuildJob {
   const jobContext = context ? { ...context, job_id: id } : undefined;
   if (jobContext) delete jobContext.candidate_job_id;
-  return { id, origin, status: 'queued', scheduling: 'automatic', phase: migration.complete ? 'render' : 'migration', processed: migration.processed,
+  return { id, generation_id: crypto.randomUUID(), origin, status: 'queued', scheduling: 'automatic', phase: migration.complete ? 'render' : 'migration', processed: migration.processed,
     created_at: new Date().toISOString(), ...(jobContext ? { context: jobContext } : {}) };
 }
 export const publicationChanged = (status: PublicationStatus = 'not_committed') => new HttpError(409,
@@ -53,11 +55,11 @@ function valid(value: unknown): value is RepairRecord {
   if (!object(value) || typeof value.id !== 'string' || typeof value.key !== 'string' || !/^repair-request:[a-f0-9]{64}$/.test(value.key)
     || !object(value.job) || typeof value.job.id !== 'string' || !/^[a-f0-9-]{36}$/.test(value.job.id) || value.job.status !== 'queued' || !['migration', 'render'].includes(String(value.job.phase)) || !Number.isSafeInteger(value.job.processed) || typeof value.etag !== 'string' || !['pending', 'committed', 'conflict'].includes(String(value.state))
     || !Number.isSafeInteger(value.attempts) || Number(value.attempts) < 0) return false;
-  try { const input = validateRepair(value.input); return value.key === `repair-request:${fingerprint(JSON.stringify([input.expected_version, input.manifest, input.rss, input.archives]))}` && (value.phase === undefined || ['prepared', 'writing', 'activation'].includes(String(value.phase))); } catch { return false; }
+  try { if (value.handoff !== undefined) readHandoff(value.handoff, value.job as unknown as RebuildJob); const input = validateRepair(value.input); return value.key === `repair-request:${fingerprint(JSON.stringify([input.expected_version, input.manifest, input.rss, input.archives]))}` && (value.phase === undefined || ['prepared', 'writing', 'activation'].includes(String(value.phase))); } catch { return false; }
 }
 export class RepairCoordinator {
   constructor(private bucket: ContentBucket, private storage: DurableObjectStorage,
-    private reserve: (origin: string, trace: OperationTrace, context?: OperationContext) => Promise<RebuildJob>,
+    private reserve: (origin: string, trace: OperationTrace, context: OperationContext | undefined, index: R2Object, repairId: string) => Promise<{ job: RebuildJob; handoff?: GenerationHandoff }>,
     private alarmDelivered: () => boolean = () => false) {}
 
   private async active() {
@@ -109,13 +111,24 @@ export class RepairCoordinator {
     record.publication = publicationHead(index);
     await boundary('storage', () => this.storage.transaction(async storage => {
       const ids = await storage.get<string[]>('jobs') ?? [];
+      if (record.handoff) {
+        const handoff = { ...record.handoff, prior_committed: record.handoff.prior_committed || receiptMatches(index, record.handoff.prior_job) };
+        // The committed repair changed the bytes, fencing all older conditional
+        // writes. Keep their evidence, but start the repaired generation prepared.
+        await storage.put(generationKey(record.job.id, record.job.generation_id!), handoff);
+        if (handoff.prior_committed && !completeMigration(await storage.get('migration'))) {
+          if (!handoff.prior_checkpoint?.migration) throw damaged();
+          await storage.put('migration', handoff.prior_checkpoint.migration);
+        }
+        await storage.put(checkpointKey(record.job.id), { version: 2, generation_id: record.job.generation_id!, phase: 'prepared' });
+      }
       await storage.put(`job:${record.job.id}`, record.job);
       if (!ids.includes(record.job.id)) await storage.put('jobs', [...ids, record.job.id]);
       await storage.put(record.key, { ...record, state: 'committed' });
       await storage.put(`repair:${index.version}`, record.job.id);
       await storage.delete(ACTIVE); await this.schedule(storage);
     }));
-    emit('rebuild_queued', record.job.context ?? context, { job_id: record.job.id });
+    emit('rebuild_queued', record.job.context ?? context, { job_id: record.job.id, generation_id: record.job.generation_id });
   }
   private async reconcile(record: RepairRecord, index: R2Object | null, trace: OperationTrace, uncertain: boolean): Promise<boolean> {
     if (index?.customMetadata?.[REPAIR_MARKER] === record.id && matches(index, record.input)) {
@@ -141,7 +154,7 @@ export class RepairCoordinator {
       if (await this.reconcile(record, index, trace, uncertain)) return;
       if (!index) return;
       const metadata = repairMetadata(index, record);
-      const prepared = prepareWrites(this.bucket, trace);
+      const prepared = prepareWrites(this.bucket, trace, record.id);
       let committed: R2Object;
       try {
         const body = await trace.run('repair_body_loading', () => boundary('storage', () => index.arrayBuffer()));
@@ -243,10 +256,10 @@ export class RepairCoordinator {
       if (index.version !== input.expected_version) throw publicationChanged();
       const id = crypto.randomUUID();
       repairMetadata(index, { id, input });
-      const job = await this.reserve(origin, trace, context);
+      const { job, handoff } = await this.reserve(origin, trace, context, index, id);
       const migration = await boundary('storage', () => this.storage.get<{ complete: boolean }>('migration'));
       await trace.run('repair_validation', () => validateRepairTargets(this.bucket, input, migration?.complete ?? false));
-      record = { id, key, input, etag: index.etag, job, state: 'pending', phase: 'prepared', attempts: 0 };
+      record = { id, key, input, etag: index.etag, job, ...(handoff ? { handoff } : {}), state: 'pending', phase: 'prepared', attempts: 0 };
       const saved = record;
       try {
         await trace.run('repair_preparation', () => boundary('storage', () => this.storage.transaction(async storage => {

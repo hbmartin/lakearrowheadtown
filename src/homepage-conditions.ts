@@ -6,6 +6,7 @@ import { renderPage } from './render';
 import { indexCondition, PublicationConflict } from './publication-conflict';
 import { validateWeather, WEATHER_KEY, weatherTime, renderWeather } from './weather';
 import { NEWS_ANCHOR, validateIndexMetadata } from './index-metadata';
+import { fenceIndex } from './index-fence';
 import type { ContentBucket, OperationContext } from './types';
 
 const marker = /<!-- conditions:start -->[\s\S]*?<!-- conditions:end -->/;
@@ -82,10 +83,10 @@ export async function composeHomepageConditions(bucket: R2Bucket, origin: string
   if (snapshot.available) delete metadata.conditions_status; else metadata.conditions_status = 'unavailable';
   if (body === base && JSON.stringify(metadata) === JSON.stringify(index?.customMetadata ?? {})) return snapshot.available;
   validateIndexMetadata(metadata);
-  const result = await bucket.put('pages/index.html', body, {
+  const result = await boundary('storage', () => bucket.put('pages/index.html', fenceIndex(body), {
     onlyIf: indexCondition(index), customMetadata: metadata,
     httpMetadata: { ...index?.httpMetadata, contentType: 'text/html; charset=utf-8', cacheControl: 'public, max-age=0, must-revalidate' },
-  });
+  }));
   if (!result) throw new PublicationConflict();
   return snapshot.available;
 }

@@ -1,3 +1,4 @@
+import { withoutIndexFence } from '../src/index-fence';
 import { env } from 'cloudflare:workers';
 import { Buffer } from 'node:buffer';
 import { createHmac } from 'node:crypto';
@@ -88,7 +89,9 @@ describe('authenticated story reads and updates', () => {
     expect(current.rss).toContain('reopened'); expect(current.rss).toContain('link-only');
     expect(current.rss).toContain('View source post');
     await rebuildHomepage(bindings.SITE_BUCKET, origin);
-    expect(await snapshot()).toMatchObject({ publication: current.publication, html: current.html, rss: current.rss });
+    const rebuilt = await snapshot();
+    expect(rebuilt).toMatchObject({ publication: current.publication, rss: current.rss });
+    expect(withoutIndexFence(rebuilt.html!)).toBe(withoutIndexFence(current.html!));
   });
   it('deduplicates sources globally through either API without writes or changed content', async () => {
     const a = await submit(digest('A'));
@@ -213,7 +216,9 @@ describe('snapshot reads and publication failure recovery', () => {
     const current = await snapshot();
     const publisher = bindings.PUBLISHER.getByName('site'); await publisher.enqueueRebuild(origin);
     await runDurableObjectAlarm(publisher);
-    expect(await snapshot()).toMatchObject({ publication: current.publication, html: current.html, rss: current.rss });
+    const rebuilt = await snapshot();
+    expect(rebuilt).toMatchObject({ publication: current.publication, rss: current.rss });
+    expect(withoutIndexFence(rebuilt.html!)).toBe(withoutIndexFence(current.html!));
     const ref = (await currentPublication(bindings.SITE_BUCKET)).posts[0];
     const post = await loadPost(bindings.SITE_BUCKET, ref);
     post.items[0].updates![0].received_at = 'invalid';

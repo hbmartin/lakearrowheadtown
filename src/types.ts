@@ -181,6 +181,7 @@ export interface RebuildBlocker {
 export type RebuildResumeReply = { ok: true; result: RebuildJob | 'conflict' | null } | { ok: false; failure: PublishFailure };
 
 export interface RebuildJob {
+  generation_id?: string;
   recovery?: { code: string; stage: string; retryable: boolean; publication_status: PublicationStatus; failed_at: string };
   pause_reason?: 'manual_resume' | 'rebuild_checkpoint_damaged';
   manual_resume?: boolean;

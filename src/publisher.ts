@@ -11,8 +11,7 @@ import { publishEvents, readEvents, type EventDigest, type EventsReply } from '.
 import { validateRepair, type RepairReply } from './publication-repair';
 import { RepairCoordinator, restartRebuild, newRebuild, isPaused, pauseReason } from './repair-coordinator';
 import { composeHomepageConditions } from './homepage-conditions';
-import { REBUILD_MARKER } from './index-metadata';
-import { record } from './primitives';
+import { checkpointKey, checkpointDamaged, completeMigration, generationKey, readCheckpoint, readHandoff, receiptMatches, type GenerationHandoff } from './rebuild-evidence';
 import { validateWeather, WEATHER_KEY, WEATHER_URL } from './weather';
 import { readLimited } from './validation';
 import type { AppendReply, BatchReply, Digest, Env, Migration, OperationContext, PublicationStatus, PublishFailure, PublishReply, RebuildJob, RebuildResumeReply, RetractReply, StoryUpdate } from './types';
@@ -137,15 +136,16 @@ export class DigestPublisher extends DurableObject<Env> {
     action: (complete: boolean | undefined, context: OperationContext | undefined, snapshot?: CommittedSnapshot) => Promise<T>): Promise<{ ok: true; result: T } | { ok: false; failure: PublishFailure }> {
     context = this.executingContext(context);
     return this.serialize(async () => {
+      const trace = new OperationTrace(context);
       try {
-        if (operation !== 'preview') await this.repairCoordinator().gate(context);
-        const migration = await new OperationTrace(context).run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
+        if (operation !== 'preview') await trace.run('repair_recovery', () => this.repairCoordinator().gate(context));
+        const migration = await trace.run('migration_state', () => boundary('storage', () => this.ctx.storage.get<Migration>('migration')));
         let snapshot: CommittedSnapshot | undefined;
         // Internal publishing helpers may bootstrap a new bucket; only persisted
         // completion establishes that losing its manifest requires operator repair.
         if (migration?.complete) {
           try {
-            await new OperationTrace(context).run('committed_snapshot_loading', async () => {
+            await trace.run('committed_snapshot_loading', async () => {
               snapshot = await committedSnapshot(this.env.SITE_BUCKET);
               requireCommittedManifest(snapshot);
             });
@@ -153,7 +153,8 @@ export class DigestPublisher extends DurableObject<Env> {
         }
         return { ok: true, result: await action(migration?.complete, context, snapshot) };
       } catch (error) {
-        const stage = error instanceof PublicationError ? error.stage : asHttpError(error).stage ?? (asHttpError(error).code === 'repair_blocked' ? 'repair_recovery' : 'migration_state');
+        const classified = asHttpError(error);
+        const stage = error instanceof PublicationError ? error.stage : classified.stage ?? trace.failed_stage ?? 'migration_state';
         const publication_status = operation === 'preview' ? 'not_attempted' : error instanceof PublicationError ? error.publication_status : 'not_committed';
         const cause = error instanceof PublicationError ? error.cause : error;
         const failure = operation === 'preview' ? { ...publicationFailure(cause, stage, publication_status), error: asHttpError(cause).message } : publicationFailure(cause, stage, publication_status, operation);
@@ -265,17 +266,36 @@ export class DigestPublisher extends DurableObject<Env> {
   }
 
   private repairCoordinator(): RepairCoordinator {
-    return new RepairCoordinator(this.env.SITE_BUCKET, this.ctx.storage, async (origin, trace, context) => {
+    return new RepairCoordinator(this.env.SITE_BUCKET, this.ctx.storage, async (origin, trace, context, index, repairId) => {
       const head = await this.rebuildHead(trace, context, 'repair');
-      if (head.job?.status === 'failed') {
-        if (!['manifest_damaged', 'legacy_recovery_required', 'source_damaged', 'archive_damaged'].includes(head.job.error_code ?? '')) {
-          throw new HttpError(409, 'An unrelated failed rebuild blocks regeneration.', {}, { code: 'rebuild_blocked' });
+      const prior = head.job;
+      const repairable = ['manifest_damaged', 'legacy_recovery_required', 'source_damaged', 'archive_damaged'];
+      if (prior && (prior.status === 'failed' || isPaused(prior))) {
+        const existing = prior.generation_id ? await trace.run('repair_generation_read', async () => readHandoff(
+          await boundary('storage', () => this.ctx.storage.get(generationKey(prior.id, prior.generation_id!))), prior)) : undefined;
+        const code = prior.status === 'failed' ? prior.error_code : prior.recovery?.code ?? existing?.repairable_code;
+        if (!repairable.includes(code ?? '') || isPaused(prior) && pauseReason(prior) === 'rebuild_checkpoint_damaged') {
+          throw new HttpError(409, 'An unrelated or damaged rebuild blocks regeneration. Inspect its recovery evidence before resuming.', {}, { code: 'rebuild_blocked', details: { job_id: prior.id } });
         }
-        return restartRebuild(head.job);
+        const checkpoint = await trace.run('repair_rebuild_evidence', async () => readCheckpoint(
+          await boundary('storage', () => this.ctx.storage.get(checkpointKey(prior.id))), prior));
+        const committed = receiptMatches(index, prior) || prior.recovery?.publication_status === 'committed';
+        const migration = await boundary('storage', () => this.ctx.storage.get<Migration>('migration'));
+        if (committed && !checkpoint?.migration && !completeMigration(migration)) throw checkpointDamaged(
+          'Committed migration bookkeeping is missing. Restore the finalization checkpoint before repairing this job.');
+        const job = { ...restartRebuild(prior), generation_id: crypto.randomUUID() };
+        // Repairing content never revokes an operator pause. The new generation
+        // has not dispatched; the old summary is retained in the handoff below.
+        if (isPaused(prior)) { job.manual_resume = true; job.scheduling = 'manual'; job.pause_reason = pauseReason(prior); }
+        delete job.recovery;
+        const handoff: GenerationHandoff = { version: 1, job_id: job.id, generation_id: job.generation_id, repair_id: repairId,
+          prior_job: prior, prior_checkpoint: checkpoint ?? null,
+          prior_archive_checkpoint: await boundary('storage', () => this.ctx.storage.get<string>(`rebuild:${prior.id}`)) ?? null,
+          prior_committed: committed, repairable_code: code! };
+        return { job, handoff };
       }
       const migration = await boundary('storage', () => this.ctx.storage.get<Migration>('migration')) ?? initialMigration();
-      const id = crypto.randomUUID();
-      return newRebuild(id, origin, migration, context);
+      return { job: newRebuild(crypto.randomUUID(), origin, migration, context) };
     }, () => this.alarmDeliveries > 0);
   }
 
@@ -292,10 +312,10 @@ export class DigestPublisher extends DurableObject<Env> {
       } catch (error) {
         const failure = asHttpError(error);
         const publication_status = input === undefined ? 'not_attempted' : failure.publication_status ?? trace.publication_status;
-        emit('repair_failed', context, { stage: trace.failed_stage ?? 'repair_validation', error_code: failure.code,
+        emit('repair_failed', context, { stage: failure.stage ?? trace.failed_stage ?? 'repair_validation', error_code: failure.code,
           publication_status, ...safeError(error) }, failure.status >= 500 ? 'error' : 'warn');
         return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message,
-          retryable: failure.retryable, publication_status, stage: trace.failed_stage ?? 'repair_validation',
+          retryable: failure.retryable, publication_status, stage: failure.stage ?? trace.failed_stage ?? 'repair_validation',
           details: failure.details, details_truncated: failure.details_truncated, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) } };
       }
     };
@@ -367,7 +387,7 @@ export class DigestPublisher extends DurableObject<Env> {
       catch (error) {
         const failure = asHttpError(error);
         emit('rebuild_request_failed', context, { stage: failure.stage ?? trace.failed_stage ?? 'rebuild_request', error_code: failure.code,
-          publication_status: failure.publication_status ?? trace.publication_status, ...safeError(error) }, 'error');
+          publication_status: 'not_attempted', ...safeError(error) }, 'error');
         throw error;
       }
     }, context);
@@ -391,7 +411,7 @@ export class DigestPublisher extends DurableObject<Env> {
       await storage.put('jobs', [...ids, job.id]);
       if (head.job?.status !== 'failed' && !isPaused(head.job)) await storage.setAlarm(Date.now() + 1000);
     })));
-    emit('rebuild_queued', jobContext, { job_id: job.id });
+    emit('rebuild_queued', jobContext, { job_id: job.id, generation_id: job.generation_id });
     return job;
   }
 
@@ -452,7 +472,7 @@ export class DigestPublisher extends DurableObject<Env> {
     catch (error) {
       const failure = asHttpError(error);
       if (failure.code !== 'repair_blocked') throw error;
-      return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, stage: failure.stage ?? 'repair_recovery',
+      return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, stage: failure.stage!,
         retryable: failure.retryable, publication_status: 'not_committed', details: failure.details,
         details_truncated: failure.details_truncated, ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) } };
     }
@@ -484,18 +504,18 @@ export class DigestPublisher extends DurableObject<Env> {
       if (next.job && next.job.status !== 'failed' && !isPaused(next.job)) await storage.setAlarm(Date.now() + 1000);
       else await storage.deleteAlarm();
     })));
-    emit('rebuild_completed', trace.context, { processed: job.processed, publication_status: 'committed' });
+    emit('rebuild_completed', trace.context, { generation_id: job.generation_id, processed: job.processed, publication_status: 'committed' });
   }
 
   private async recordRebuildRecovery(job: RebuildJob, error: unknown, trace: OperationTrace, damaged: boolean, publication_status: PublicationStatus) {
     const failure = asHttpError(error);
     const paused = damaged || !failure.retryable;
-    const saved: RebuildJob = { ...job, recovery: { code: failure.code, stage: trace.failed_stage ?? failure.stage ?? 'rebuild_finalization', retryable: !paused && failure.retryable,
+    const saved: RebuildJob = { ...job, recovery: { code: failure.code, stage: trace.failed_stage ?? failure.stage ?? 'rebuild_finalization', retryable: !paused,
       publication_status, failed_at: new Date().toISOString() },
       ...(paused ? { manual_resume: true, scheduling: 'manual' as const, pause_reason: damaged ? 'rebuild_checkpoint_damaged' as const : 'manual_resume' as const } : {}) };
     const { code, ...recovery } = saved.recovery!;
-    emit(damaged ? 'rebuild_checkpoint_damaged' : 'rebuild_finalization_pending', trace.context,
-      { error_code: code, ...recovery, ...(paused ? { pause_reason: saved.pause_reason } : {}), ...safeError(error) }, 'error');
+    emit(damaged ? 'rebuild_checkpoint_damaged' : paused ? 'rebuild_paused' : 'rebuild_finalization_pending', trace.context,
+      { error_code: code, generation_id: job.generation_id, ...recovery, ...(paused ? { pause_reason: saved.pause_reason } : {}), ...safeError(error) }, 'error');
     try {
       await boundary('storage', () => this.ctx.storage.transaction(async storage => {
         await storage.put(`job:${job.id}`, saved);
@@ -546,36 +566,36 @@ export class DigestPublisher extends DurableObject<Env> {
         // Receipt reads/finalization fail through platform redelivery, never the
         // pre-commit failure path. The marker survives later index replacements.
         try {
-          const finalization = await trace.run('rebuild_finalization_read', () => boundary('storage', () => this.ctx.storage.get<{ version: 1; migration?: Migration }>(`rebuild-finalization:${job!.id}`)));
+          if (job.generation_id) await trace.run('rebuild_generation_read', async () => readHandoff(
+            await boundary('storage', () => this.ctx.storage.get(generationKey(job!.id, job!.generation_id!))), job!));
+          const finalization = await trace.run('rebuild_finalization_read', async () => readCheckpoint(
+            await boundary('storage', () => this.ctx.storage.get(checkpointKey(job!.id))), job!));
           if (finalization !== undefined) {
-            if (!record(finalization) || finalization.version !== 1 || finalization.migration !== undefined && (!record(finalization.migration)
-              || finalization.migration.complete !== true || !Number.isSafeInteger(finalization.migration.processed) || finalization.migration.processed < 0)) {
-              throw new HttpError(503, 'Rebuild finalization checkpoint is damaged. Restore the checkpoint from a verified backup before resuming.', {}, { code: 'rebuild_checkpoint_damaged', stage: 'rebuild_finalization_validation' });
-            }
             const index = await trace.run('rebuild_receipt_read', () => boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')));
-            if (index?.customMetadata?.[REBUILD_MARKER] === job.id) {
+            if (receiptMatches(index, job)) {
               trace.publication_status = 'committed';
               phase = 'finalizing';
               await this.finalizeRebuild(job, ids, finalization.migration, undefined, trace); return;
             }
+            if (finalization.version === 2 && finalization.phase === 'prepared' && inherited !== 'committed') inherited = 'not_committed';
           } else {
-            if (inherited === 'committed') throw new HttpError(503,
-              'A committed rebuild has no finalization checkpoint. Restore the checkpoint from a verified backup before resuming.', {},
-              { code: 'rebuild_checkpoint_damaged', stage: 'rebuild_finalization_validation' });
-            // Every supported dispatch first persists this checkpoint. A prior
-            // inspection outage is not evidence that a write was dispatched.
+            const index = await trace.run('rebuild_receipt_read', () => boundary('storage', () => this.env.SITE_BUCKET.head('pages/index.html')));
+            if (receiptMatches(index, job)) {
+              trace.publication_status = 'committed';
+              const migration = await trace.run('rebuild_migration_receipt', () => boundary('storage', () => this.ctx.storage.get('migration')));
+              if (!completeMigration(migration)) throw checkpointDamaged('Committed migration bookkeeping is missing. Restore the finalization checkpoint from a verified backup before resuming.');
+              phase = 'finalizing';
+              await this.finalizeRebuild(job, ids, undefined, undefined, trace); return;
+            }
+            if (inherited === 'committed') throw checkpointDamaged('A committed rebuild has no finalization checkpoint or matching receipt. Restore its checkpoint from a verified backup before resuming.');
             inherited = 'not_committed';
           }
           phase = 'preparing';
-          const clearRecovery = inherited === 'not_committed' && !!job.recovery;
-          if (clearRecovery) delete job.recovery;
+          if (inherited === 'not_committed') delete job.recovery;
           delete job.next_retry_at;
           job.status = 'running';
           job.started_at ??= new Date().toISOString();
-          await trace.run('rebuild_start', () => boundary('storage', () => clearRecovery ? this.ctx.storage.transaction(async storage => {
-            await storage.delete(`rebuild-finalization:${job.id}`);
-            await storage.put(`job:${job.id}`, job);
-          }) : this.ctx.storage.put(`job:${job.id}`, job)));
+          await trace.run('rebuild_start', () => boundary('storage', () => this.ctx.storage.put(`job:${job!.id}`, job!)));
           let migrationBefore = initialMigration();
           const migration = await trace.run('migration', async () => {
             migrationBefore = await boundary('storage', () => this.ctx.storage.get<Migration>('migration')) ?? initialMigration();
@@ -600,9 +620,17 @@ export class DigestPublisher extends DurableObject<Env> {
           })));
           if (!migration.complete) return;
           const checkpoint = await trace.run('rebuild_archive_state', () => boundary('storage', () => this.ctx.storage.get<string>(`rebuild:${job.id}`)));
-          const rebuilt = await rebuildHomepage(this.env.SITE_BUCKET, job.origin, trace, migration.complete, baseline, { jobId: job.id, checkpoint,
+          const rebuilt = await rebuildHomepage(this.env.SITE_BUCKET, job.origin, trace, migration.complete, baseline, { jobId: job.id, generationId: job.generation_id, checkpoint,
             beforeCommit: async () => {
-              await trace.run('rebuild_finalization_checkpoint', () => boundary('storage', () => this.ctx.storage.put(`rebuild-finalization:${job!.id}`, { version: 1, ...(bootstrap ? { migration } : {}) })));
+              // Do not erase an earlier unresolved dispatch while preparing.
+              if (inherited === 'unknown' || inherited === 'committed') return;
+              await trace.run('rebuild_finalization_checkpoint', () => boundary('storage', () => this.ctx.storage.put(checkpointKey(job!.id),
+                job!.generation_id ? { version: 2, generation_id: job!.generation_id, phase: 'prepared', ...(bootstrap ? { migration } : {}) }
+                  : { version: 1, ...(bootstrap ? { migration } : {}) })));
+            }, beforeIndexDispatch: async () => {
+              await trace.run('rebuild_dispatch_checkpoint', () => boundary('storage', () => this.ctx.storage.put(checkpointKey(job!.id),
+                job!.generation_id ? { version: 2, generation_id: job!.generation_id, phase: 'dispatching', ...(bootstrap ? { migration } : {}) }
+                  : { version: 1, ...(bootstrap ? { migration } : {}) })));
             } });
           if (rebuilt.progress) job.archive_progress = rebuilt.progress;
           switch (rebuilt.kind) {

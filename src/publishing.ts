@@ -1,5 +1,5 @@
 import { storyRows, writeSyncIndex } from './sync-index';
-import { rebuildMetadata, REBUILD_MARKER, NEWS_ANCHOR } from './index-metadata';
+import { rebuildMetadata, REBUILD_MARKER, REBUILD_GENERATION, NEWS_ANCHOR } from './index-metadata';
 import { createCardCache, prepareArchives, rebuildArchives, stableJson, type PendingArchiveRebuild } from './archives';
 import { settledInOrder } from './batches';
 import { committedSnapshot, isLegacyId, requireCommittedManifest, type CommittedSnapshot } from './committed';
@@ -92,7 +92,7 @@ function legacyReceipts(previous: Publication, additional: PostReference[] = [])
 }
 
 async function prepareHomepage(bucket: ContentBucket, publication: Publication, posts: StoredPost[], origin: string, previous: Publication,
-  trace = new OperationTrace(), options: { migrationComplete?: boolean; allCards?: boolean; now?: Date; history?: HistoryIndex; sources?: Map<string, StoredPost>; archives?: string; imageCache?: ImageResolutionCache; index?: R2Object | null; rebuildId?: string } = {}): Promise<boolean> {
+  trace = new OperationTrace(), options: { migrationComplete?: boolean; allCards?: boolean; now?: Date; history?: HistoryIndex; sources?: Map<string, StoredPost>; archives?: string; imageCache?: ImageResolutionCache; index?: R2Object | null; rebuildId?: string; rebuildGeneration?: string } = {}): Promise<boolean> {
   publication = { ...publication, version: 3 };
   delete publication.legacy_receipts;
   if (!options.migrationComplete) {
@@ -134,7 +134,7 @@ async function prepareHomepage(bucket: ContentBucket, publication: Publication, 
   await trace.run('manifest_write', () => boundary('storage', () => bucket.put(manifest, serialized, { httpMetadata: { contentType: 'application/json' } })));
   await trace.run('rss_write', () => boundary('storage', () => bucket.put(rss, feed, { httpMetadata: { contentType: RSS_TYPE, cacheControl: HTML_CACHE } })));
   // The single index replacement commits HTML and both immutable snapshot references.
-  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { ...rebuildMetadata(options.index ?? null), ...(options.rebuildId ? { [REBUILD_MARKER]: options.rebuildId } : {}), manifest, rss, archives: publication.archives!, ...(!conditions.available ? { conditions_status: 'unavailable' } : {}) } })));
+  await trace.run('index_write', () => boundary('storage', () => bucket.put('pages/index.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8', cacheControl: HTML_CACHE }, customMetadata: { ...(options.rebuildId ? { [REBUILD_MARKER]: options.rebuildId, ...(options.rebuildGeneration ? { [REBUILD_GENERATION]: options.rebuildGeneration } : {}) } : rebuildMetadata(options.index ?? null)), manifest, rss, archives: publication.archives!, ...(!conditions.available ? { conditions_status: 'unavailable' } : {}) } })));
   return conditions.available;
 }
 
@@ -346,7 +346,7 @@ export type RebuildResult = PendingArchiveRebuild
   | { kind: 'committed'; conditionsAvailable: boolean; progress?: ArchiveProgress };
 
 export async function rebuildHomepage(bucket: ContentBucket, origin: string, trace = new OperationTrace(), migrationComplete = false, baseline?: RebuildBaseline,
-  work?: { jobId: string; checkpoint?: string; beforeCommit?: () => Promise<void> }): Promise<RebuildResult> {
+  work?: { jobId: string; generationId?: string; checkpoint?: string; beforeCommit?: () => Promise<void>; beforeIndexDispatch?: () => Promise<void> }): Promise<RebuildResult> {
   const durable = bucket;
   const prepared = prepareWrites(bucket, trace);
   bucket = prepared.bucket;
@@ -369,7 +369,7 @@ export async function rebuildHomepage(bucket: ContentBucket, origin: string, tra
     const archives = work ? await rebuildArchives(durable, posts, publication, origin, trace, work.jobId, work.checkpoint, imageCache) : undefined;
     if (archives?.kind === 'pending') return archives;
     const conditionsAvailable = await prepareHomepage(bucket, publication, posts, origin, previous, trace,
-      { migrationComplete, imageCache, index: snapshot.index, rebuildId: work?.jobId, ...(archives ? { archives: archives.archives } : { allCards: true }) });
+      { migrationComplete, imageCache, index: snapshot.index, rebuildId: work?.jobId, rebuildGeneration: work?.generationId, ...(archives ? { archives: archives.archives } : { allCards: true }) });
     if (work) {
       const current = await boundary('storage', () => durable.head('pages/index.html'));
       // The publisher queue prevents mutations between this check and commit.
@@ -380,7 +380,7 @@ export async function rebuildHomepage(bucket: ContentBucket, origin: string, tra
       }
     }
     await work?.beforeCommit?.();
-    try { await prepared.commit(snapshot.index); }
+    try { await prepared.commit(snapshot.index, work?.beforeIndexDispatch); }
     catch (error) {
       if (work && error instanceof PublicationConflict) return { kind: 'reconcile', progress: archives!.progress };
       throw error;
