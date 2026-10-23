@@ -110,24 +110,64 @@ it('binds history mode to cursors and rejects meaningless index-history combinat
   expect((await readAlerts(bucket, new URLSearchParams({ cursor: first.next_cursor }), 'key', at) as any).history).toBe('coalesced');
   await expect(readAlerts(bucket, new URLSearchParams('history=coalesced&fields=index'), 'key', at)).rejects.toMatchObject({ code: 'invalid_history' });
 });
+async function withConfirmationWrites<T>(enabled: boolean, action: () => Promise<T>): Promise<T> {
+  const publisher = bindings.PUBLISHER.getByName('site'); let prior: string | undefined;
+  await inPublisher(publisher, async instance => { prior = instance.env.ALERT_CONFIRMATIONS_ENABLED; instance.env = { ...instance.env, ALERT_CONFIRMATIONS_ENABLED: String(enabled) }; });
+  try { return await action(); }
+  finally { await inPublisher(publisher, async instance => { instance.env = { ...instance.env, ALERT_CONFIRMATIONS_ENABLED: prior }; }); }
+}
+const sendChecks = (inputs: ConfirmationInput[], suffix = '') => request('/api/alerts/confirmations' + suffix,
+  { method: 'POST', headers: auth, body: JSON.stringify({ confirmations: inputs }) });
+async function openHttp(observed_at: string) {
+  const response = await request('/api/alerts', { method: 'POST', headers: auth, body: JSON.stringify(validateAlertInput({
+    ...check(crypto.randomUUID()), alert_id: undefined, phase: 'open', category: 'traffic', kind: 'closure', routes: ['SR-138'], headline: 'HTTP', observed_at,
+  })) });
+  expect(response.status).toBe(200); return response.json<any>();
+}
 it('wires HTTP batching and stages writes behind the reader rollout gate', async () => {
-  const published = await request('/api/alerts', { method: 'POST', headers: auth, body: JSON.stringify(validateAlertInput({ ...check(crypto.randomUUID(), 1), alert_id: undefined, phase: 'open', category: 'traffic', kind: 'closure', routes: ['SR-138'], headline: 'HTTP', observed_at: new Date().toISOString() })) });
-  const a = await published.json<any>(); const input = { ...check(a.alert_id), observed_at: new Date().toISOString() };
-  const send = (suffix = '') => request('/api/alerts/confirmations' + suffix, { method: 'POST', headers: auth, body: JSON.stringify({ confirmations: [input] }) });
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const warnings = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const a = await openHttp(new Date(Date.now() - 5000).toISOString()); const input = { ...check(a.alert_id), observed_at: new Date().toISOString() };
   expect((await request('/api/alerts/confirmations')).status).toBe(401);
   expect((await request('/api/alerts/confirmations', { headers: auth })).status).toBe(405);
-  await inPublisher(bindings.PUBLISHER.getByName('site'), async (instance: any) => { instance.env = { ...instance.env, ALERT_CONFIRMATIONS_ENABLED: 'false' }; });
-  const before = await (await bucket.get(ALERTS_KEY))!.text();
-  const preview = await send('?dry_run=true'); expect(preview.status).toBe(200);
-  expect(await preview.json()).toMatchObject({ ok: true, dry_run: true, committed: false, counts: { confirmed: 1 } });
-  const blocked = await send(); expect(blocked.status).toBe(503);
-  expect(await blocked.json()).toMatchObject({ ok: false, code: 'confirmations_not_enabled', publication_status: 'not_attempted', suggestion: { action: 'complete_reader_rollout' } });
-  expect(await (await bucket.get(ALERTS_KEY))!.text()).toBe(before);
-  const fallback = await request('/api/alerts', { method: 'POST', headers: auth, body: JSON.stringify({ ...input, client_ref: crypto.randomUUID(), phase: 'update' }) });
-  expect(fallback.status).toBe(200); expect(await fallback.json()).toMatchObject({ ok: true, status: 'published', alert_id: a.alert_id });
-  await inPublisher(bindings.PUBLISHER.getByName('site'), async (instance: any) => { instance.env = { ...instance.env, ALERT_CONFIRMATIONS_ENABLED: 'true' }; });
-  const confirmed = await (await send()).json<ConfirmationsResult & { ok: boolean }>(); expect(confirmed).toMatchObject({ ok: true, counts: { confirmed: 1 } });
-  expect(await (await send()).json()).toMatchObject({ ok: true, counts: { duplicates: 1, confirmed: 0 } });
+  await withConfirmationWrites(false, async () => {
+    const before = await (await bucket.get(ALERTS_KEY))!.text();
+    const preview = await sendChecks([input], '?dry_run=true'); expect(preview.status).toBe(200);
+    expect(await preview.json()).toMatchObject({ ok: true, dry_run: true, committed: false, counts: { confirmed: 1 } });
+    const blocked = await sendChecks([input]); expect(blocked.status).toBe(503); expect(blocked.headers.get('Retry-After')).toBeNull();
+    const rejected = await blocked.json<any>();
+    expect(rejected).toMatchObject({ ok: false, code: 'confirmations_not_enabled', retryable: false, publication_status: 'not_attempted', suggestion: { action: 'use_ordinary_alert_update', method: 'POST', path: '/api/alerts' } });
+    expect(JSON.stringify(rejected)).not.toContain('ALERT_CONFIRMATIONS_ENABLED');
+    expect(await (await bucket.get(ALERTS_KEY))!.text()).toBe(before);
+    const fallback = await request('/api/alerts', { method: 'POST', headers: auth, body: JSON.stringify({ ...input, client_ref: crypto.randomUUID(), phase: 'update' }) });
+    expect(fallback.status).toBe(200); expect(await fallback.json()).toMatchObject({ ok: true, status: 'published', alert_id: a.alert_id });
+  });
+  // The fallback completed that logical check. A later check uses a new reference.
+  const next = { ...input, client_ref: crypto.randomUUID(), observed_at: new Date(Date.now() + 1000).toISOString() };
+  const confirmed = await (await sendChecks([next])).json<ConfirmationsResult & { ok: boolean }>(); expect(confirmed).toMatchObject({ ok: true, counts: { confirmed: 1 } });
+  expect(await (await sendChecks([next])).json()).toMatchObject({ ok: true, counts: { duplicates: 1, confirmed: 0 } });
+  expect(errors.mock.calls.map(([event]) => event).some(event => event.error_code === 'confirmations_not_enabled')).toBe(false);
+  expect(warnings.mock.calls.map(([event]) => event)).toContainEqual(expect.objectContaining({ event: 'request_error', publication_outcome: 'failed', publication_status: 'not_attempted' }));
+});
+it.each(['fresh', 'equal'])('confirms immediately over HTTP with a %s observation', async timing => {
+  const observed = new Date(Date.now() - 5000).toISOString(); const a = await openHttp(observed);
+  const input = { ...check(a.alert_id), observed_at: timing === 'equal' ? observed : new Date().toISOString() };
+  const response = await sendChecks([input]); expect(response.status).toBe(200); expect(await response.json()).toMatchObject({ ok: true, counts: { confirmed: 1 } });
+});
+it('rejects disabled writes before the publisher queue without reads or writes', async () => {
+  await withConfirmationWrites(false, async () => inPublisher(bindings.PUBLISHER.getByName('site'), async (instance, state) => {
+    const before = await state.storage.list(); const alarm = await state.storage.getAlarm();
+    let release!: () => void; const hold = new Promise<void>(resolve => { release = resolve; });
+    const held = instance.serialize(() => hold); let result: any;
+    const put = vi.spyOn(instance.env.SITE_BUCKET, 'put'); const get = vi.spyOn(instance.env.SITE_BUCKET, 'get');
+    const pending = instance.confirmAlertsV1([check(crypto.randomUUID())]).then((value: any) => { result = value; });
+    try {
+      await Promise.resolve(); await Promise.resolve();
+      expect(result).toMatchObject({ ok: false, failure: { code: 'confirmations_not_enabled', publication_status: 'not_attempted', retryable: false } });
+      expect(put).not.toHaveBeenCalled(); expect(get).not.toHaveBeenCalled();
+      expect(await state.storage.list()).toEqual(before); expect(await state.storage.getAlarm()).toBe(alarm);
+    } finally { release(); await Promise.allSettled([held, pending]); put.mockRestore(); get.mockRestore(); }
+  }));
 });
 
 it('keeps confirmation lookups within their original LA receipt-date window across DST', async () => {

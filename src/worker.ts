@@ -440,7 +440,7 @@ async function handle(request: Request, env: Env, state: RequestState): Promise<
     const diagnostics = { stage, ...(state.bytes_received !== undefined ? { bytes_received: state.bytes_received, body_complete: state.body_complete ?? false } : {}), ...(state.declared_body_bytes !== undefined ? { declared_body_bytes: state.declared_body_bytes } : {}), ...(state.body_sha256 ? { body_sha256: state.body_sha256 } : {}) };
     emit('request_error', context, { error_code: failure.code, status: failure.status, ...diagnostics, publication_status: state.publication_status, publication_outcome: state.publication_outcome,
       ...(Array.isArray(failure.details) ? { issues: failure.details.map(({ path, code }) => ({ path, code })), details_truncated: failure.details_truncated } : {}),
-      ...(!expected || failure.status >= 500 ? safeError(error) : {}) }, failure.status >= 500 ? 'error' : 'warn');
+      ...(!expected || failure.status >= 500 ? safeError(error) : {}) }, failure.status >= 500 && failure.code !== 'confirmations_not_enabled' ? 'error' : 'warn');
     if (!isApi && failure.status === 404) {
       const headers = noStoreHeaders('text/html; charset=utf-8', failure.headers);
       headers.set('X-Robots-Tag', 'noindex');

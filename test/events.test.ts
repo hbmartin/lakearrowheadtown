@@ -53,3 +53,14 @@ it('retains stage details on non-validation event storage failures', async () =>
   const result = await publishEvents(wrap({ get: async () => { throw new Error('offline'); } }), input(), at);
   expect(result).toMatchObject({ ok: false, failure: { code: 'storage_error', retryable: true, stage: 'event_manifest_loading', details: { stage: 'event_manifest_loading' } } });
 });
+
+it.each(['missing', 'corrupt'])('fails closed on a %s retained dedup index without changing committed state', async damage => {
+  await publishEvents(bucket, input('2026-10-23'), at);
+  const publication = await currentEvents(bucket); const before = await (await bucket.get(EVENTS_KEY))!.text();
+  if (damage === 'missing') await bucket.delete(publication.dedup_index!); else await bucket.put(publication.dedup_index!, '{broken');
+  const put = vi.fn((key: string, value: any, options: any) => bucket.put(key, value, options));
+  const result = await publishEvents(wrap({ put }), input('2026-10-24'), at);
+  expect(result).toMatchObject({ ok: false, failure: { code: 'manifest_damaged', publication_status: 'not_committed', retryable: false } });
+  expect(put).not.toHaveBeenCalled(); expect(await (await bucket.get(EVENTS_KEY))!.text()).toBe(before);
+  expect((await readEvents(bucket, new URLSearchParams(), at)).events).toHaveLength(1);
+});
