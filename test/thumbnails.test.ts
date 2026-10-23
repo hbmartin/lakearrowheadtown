@@ -345,6 +345,24 @@ it.each([false, true])('serves acknowledged fills without a winner reread (condi
   expect(result.status).toBe(conditional ? 304 : 200); await result.arrayBuffer(); expect(cacheReads).toBe(1);
 });
 
+it.each([false, true])('reconciles a competing oversized/derivative winner (oversized winner=%s)', async oversizedWinner => {
+  await source(); let injected = false; const url = `/thumbnails/v2/${hash}.jpg/160.webp`;
+  const store = new Proxy(bindings.SITE_BUCKET, { get(target, property) {
+    if (property === 'put') return async (key: string, body: any, options: any) => {
+      if (key.startsWith('thumbnail-cache/') && !injected) {
+        injected = true; const metadata = { ...options.customMetadata }; delete metadata.outcome; delete metadata.limit;
+        await target.put(key, oversizedWinner ? '' : png, { customMetadata: { ...metadata, ...(oversizedWinner ? { outcome: 'oversized-v1', limit: String(10 * 1024 * 1024) } : {}) }, httpMetadata: { contentType: oversizedWinner ? 'application/octet-stream' : 'image/webp' } });
+      }
+      return target.put(key, body, options);
+    };
+    const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const response = await fetch(url, {}, { ...(oversizedWinner ? encoder() : oversizedEncoder()), SITE_BUCKET: store });
+  expect(response.status).toBe(oversizedWinner ? 302 : 200);
+  if (!oversizedWinner) expect(new Uint8Array(await response.arrayBuffer())).toEqual(png);
+  expect((await bindings.SITE_BUCKET.list({ prefix: 'thumbnail-cache/' })).objects).toHaveLength(1);
+});
+
 it.each([false, true])('settles parallel cache reads and cancels unused bodies when original existence fails (%s)', async storageError => {
   await source(); const url = `/thumbnails/v2/${hash}.jpg/160.webp`; await (await fetch(url, {}, encoder())).arrayBuffer();
   let release!: () => void; let started!: () => void;

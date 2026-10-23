@@ -164,3 +164,11 @@ test('job timing uses server dates and remains private to the waiting tools', as
 test('waiting tools explain durable checkpoint damage immediately', async () => {
   await assert.rejects(waitForRebuild({ id, status: 'running', blocked: { reason: 'rebuild_checkpoint_damaged' } }, 'preview', options), /verified backup.*explicitly resume/);
 });
+
+test('invalid Retry-After falls back to the JSON deadline against server time', async () => {
+  const server = Date.parse('2026-10-23T12:00:00Z'); let clock = 0; let calls = 0; const waits = [];
+  await repairAndFollow('preview', undefined, { ...options, payload, now: () => clock, sleep: async ms => { waits.push(ms); clock += ms; }, request: async () => ++calls === 1
+    ? Response.json({ error: 'Pending', retryable: true, retry_at: new Date(server + 5000).toISOString() }, { status: 503, headers: { Date: new Date(server).toUTCString(), 'Retry-After': 'invalid' } })
+    : Response.json({ publication, unchanged: true }) });
+  assert.deepEqual(waits, [5000]);
+});

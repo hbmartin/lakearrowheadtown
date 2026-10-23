@@ -10,8 +10,9 @@ const monotonic = options => (options.now ?? (() => performance.now()))();
 function withTiming(value, response, retryAt, options) {
   const server = Date.parse(response.headers.get('Date'));
   const header = response.headers.get('Retry-After');
-  const delay = header !== null && /^\d+(?:\.\d+)?$/.test(header) ? Number(header) * 1000
-    : Number.isFinite(server) ? Date.parse(header ?? retryAt) - server : NaN;
+  let delay = header !== null && /^\d+(?:\.\d+)?$/.test(header) ? Number(header) * 1000
+    : Number.isFinite(server) ? Date.parse(header) - server : NaN;
+  if (!Number.isFinite(delay) && Number.isFinite(server)) delay = Date.parse(retryAt) - server;
   if (Number.isFinite(delay)) Object.defineProperty(value, retryDeadline, { value: monotonic(options) + Math.max(0, delay) });
   return value;
 }

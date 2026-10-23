@@ -464,7 +464,7 @@ export class DigestPublisher extends DurableObject<Env> {
         if (damaged) await storage.deleteAlarm();
       }));
     } catch (recordError) {
-      emit('rebuild_recovery_record_failed', trace.context, { original_error_code: failure.code, original_failed_stage: saved.recovery!.stage, ...safeError(recordError) }, 'error');
+      emit('rebuild_recovery_record_failed', trace.context, { original_error_code: failure.code, original_failed_stage: saved.recovery!.stage, publication_status: saved.recovery!.publication_status, ...safeError(recordError) }, 'error');
       throw recordError;
     }
     emit('rebuild_finalization_pending', trace.context, { ...saved.recovery, ...safeError(error) }, 'error');
