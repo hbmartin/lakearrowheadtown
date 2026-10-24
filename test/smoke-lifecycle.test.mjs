@@ -100,6 +100,11 @@ test('the full smoke and daily calendar reuse succeed twice over a built local W
   await assert.rejects(smoke([origin], { ...options, expectedConfirmations: true }), /Confirmation rollout mode differs/);
   assert.equal((await (await fetch(origin + '/api/posts', { headers })).json()).posts.length, 0);
   assert((await (await fetch(origin + '/api/alerts', { headers })).json()).alerts.every(alert => alert.state === 'retracted'));
+  const logs = []; let cleanupCalls = 0;
+  await assert.rejects(smoke([origin], { ...options, log: value => logs.push(value), cleanupRequest: async () => {
+    cleanupCalls++; return Response.json({ ok: false }, { status: 503 });
+  } }), /cleanup/);
+  assert(cleanupCalls > 0); assert(!logs.some(value => value.includes('passed')));
 });
 test('conditional HTML verification retries only an intervening publication and fails broken stable validators', async () => {
   const { verifyHtmlRevalidation } = await import('../scripts/smoke-support.mjs');

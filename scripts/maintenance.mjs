@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { checkEnvironment, readPublishingCredential, validateCredential } from './credentials.mjs';
+import { terminalValidation, TransportError, ValidationError } from './validation-errors.mjs';
 
 const defaults = { preview: 'https://lakearrowheadtown-preview.harold-martin.workers.dev', production: 'https://lakearrowhead.town' };
 const retryDeadline = Symbol('monotonic retry deadline');
@@ -49,9 +50,8 @@ export async function maintenance(operation, environment, id, options = {}) {
   let response;
   try { response = await (options.request ?? fetch)(origin + path, { method: ['status', 'snapshot'].includes(operation) ? 'GET' : 'POST', headers: { Authorization: `Bearer ${secret}`, ...(payload ? { 'Content-Type': 'application/json' } : {}) }, ...(payload ? { body: JSON.stringify(payload) } : {}), signal: AbortSignal.timeout(Math.min(30000, options.requestTimeoutMs ?? 30000)) }); }
   catch (cause) {
-    const error = new Error('Maintenance request transport failed', { cause });
-    error.transport = true;
-    throw error;
+    if (terminalValidation(cause) || cause instanceof TransportError) throw cause;
+    throw new TransportError('Maintenance request transport failed', cause);
   }
   let result;
   try { result = await response.json(); }
@@ -94,7 +94,9 @@ const blocked = job => job.blocked?.reason ? job.blocked.reason !== 'repair_pend
 const blockedAdvice = job => {
   const reason = job.blocked?.reason ?? (job.manual_resume ? 'manual_resume' : 'failed_rebuild');
   const target = job.blocked?.job_id ?? job.blocked_by ?? job.id;
-  if (reason === 'rebuild_checkpoint_damaged') return `Restore rebuild ${target}'s finalization checkpoint from a verified backup, then explicitly resume it.`;
+  if (reason === 'rebuild_checkpoint_damaged') return job.blocked?.repair_id
+    ? `Restore rebuild ${target}'s finalization checkpoint from a verified backup, then inspect publication repair ${job.blocked.repair_id} and explicitly resume repair recovery.`
+    : `Restore rebuild ${target}'s finalization checkpoint from a verified backup, then explicitly resume it.`;
   const recovery = job.recovery ? ` Last recovery failure: ${job.recovery.code} at ${job.recovery.stage}; publication ${job.recovery.publication_status}.` : '';
   return reason.startsWith('repair_')
     ? `Inspect publication repair${job.blocked?.repair_id ? ` ${job.blocked.repair_id}` : ''}; restore damaged records or explicitly resume stalled recovery.`
@@ -117,11 +119,15 @@ async function pauseUntilRetry(value, attempts, deadline, options, submission = 
   }
 }
 function completedJob(job) {
-  if (job.status !== 'completed') throw new Error(`Rebuild ${job.id} failed or is blocked (${job.blocked?.reason ?? job.status}). ${blockedAdvice(job)}`);
+  if (job.status !== 'completed') throw new ValidationError('rebuild_incomplete', `Rebuild ${job.id} failed or is blocked (${job.blocked?.reason ?? job.status}). ${blockedAdvice(job)}`, {
+    safeMessage: 'Rebuild failed or remains blocked; inspect the recorded rebuild identity and status.',
+  });
   return job;
 }
 function waitTimeout(job, cause) {
-  return new Error(`Rebuild ${job.id} exceeded the wait deadline; completion remains unconfirmed (last status: ${job.blocked?.reason ?? job.status}). Inspect its status; no resume was issued.`, cause ? { cause } : undefined);
+  return new ValidationError('rebuild_timeout', `Rebuild ${job.id} exceeded the wait deadline; completion remains unconfirmed (last status: ${job.blocked?.reason ?? job.status}). Inspect its status; no resume was issued.`, {
+    cause, safeMessage: 'Rebuild exceeded the wait deadline; completion remains unconfirmed. Inspect its status.',
+  });
 }
 function statusFailure(job, cause) {
   return repairFollowFailure(`Rebuild ${job.id} status check failed (last status: ${job.blocked?.reason ?? job.status}). ${cause.message}`, cause);
@@ -135,6 +141,7 @@ async function finalStatus(job, environment, deadline, options, awaitingActivati
     if (monotonic(options) > deadline + 30000) throw waitTimeout(job);
     options.onProgress?.(job);
   } catch (error) {
+    if (terminalValidation(error)) throw error;
     if (monotonic(options) <= deadline + 30000 && error[permanentApplicationError]
       && !(awaitingActivation && error.status === 404 && error.code === 'job_not_found')) {
       throw statusFailure(job, error);
@@ -154,6 +161,7 @@ async function followJob(job, environment, deadline, options) {
       job = await maintenance('status', environment, job.id, { ...options, requestTimeoutMs: Math.max(1, Math.ceil(deadline - monotonic(options))) });
       attempts = 0; retry = undefined; options.onProgress?.(job);
     } catch (error) {
+      if (terminalValidation(error)) throw error;
       if (error[permanentApplicationError] || !error.transport && !error[responseFailure]) throw statusFailure(job, error);
       attempts++; retry = error; options.onRetry?.(error, job);
     }

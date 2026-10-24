@@ -20,12 +20,12 @@ export async function smokeChanges(origin, request, headers, options = {}) {
     assert(page.sync_cursor); assert.equal(new Set(changes.map(change => JSON.stringify([change.resource, change.identity]))).size, changes.length);
     return { ...page, changes };
   };
+  return context.run(async () => {
   const initial = await collect();
   for (const change of initial.changes) { assert.equal(change.operation, 'upsert'); assert.match(change.revision, /^[a-f0-9]{64}$/); assert(change.data); assert(!('publisher_fingerprint' in change.data)); assert(!('source_key' in change.data)); }
   const run = `Reconciliation smoke ${crypto.randomUUID()}`; const posted_at = context.now().toISOString();
   const item = { group: 'Preview verification', group_url: origin + '/', headline: run, body: 'Preview reconciliation fixture.', post_url: origin + '/?sync-smoke=' + encodeURIComponent(run), category: 'announcement', posted_at };
   let published;
-  return context.run(async () => {
     context.registerDigest(run);
     published = await send('/api/digests', { title: run, source: 'deployment-smoke-test', client_ref: run, items: [item] });
     const dateParts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(context.now());

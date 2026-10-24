@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readPublishingCredential, validateCredential } from './credentials.mjs';
 import { maintenanceTarget } from './maintenance.mjs';
+import { safeFailure, terminalValidation, TransportError, ValidationError } from './validation-errors.mjs';
 
 export async function withCleanup(task, cleanup) {
   let result; let failure;
@@ -14,9 +15,13 @@ export async function withCleanup(task, cleanup) {
 
 export function createSmokeContext(origin, options = {}) {
   origin = maintenanceTarget('preview', origin);
+  if (options.context) {
+    assert.equal(options.context.origin, origin, 'Shared smoke context must have the same origin');
+    return options.context.scope(options);
+  }
   const secret = validateCredential((options.credential ?? readPublishingCredential)('preview'));
   const headers = { Authorization: `Bearer ${secret}` };
-  const references = new Set(); const alertReferences = new Set(); const events = []; let dropped = 0; let version = options.expectedVersion;
+  const events = []; let dropped = 0; let version = options.expectedVersion;
   const record = event => { if (events.length < 500) events.push(event); else dropped++; };
   const now = options.now ?? (() => new Date());
   const request = async (url, init = {}, cleanup = false) => {
@@ -26,42 +31,59 @@ export function createSmokeContext(origin, options = {}) {
     const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
     let response;
     try { response = await (cleanup ? options.cleanupRequest ?? options.request ?? globalThis.fetch : options.request ?? globalThis.fetch)(url, { ...init, signal }); }
-    catch { record({ path: target.pathname, method: init.method ?? 'GET', transport: 'failed' }); throw new Error(`Smoke transport failed: ${init.method ?? 'GET'} ${target.pathname}`); }
+    catch (cause) {
+      if (terminalValidation(cause) || cause instanceof TransportError) throw cause;
+      record({ path: target.pathname.slice(0, 256), method: init.method ?? 'GET', transport: 'failed' });
+      throw new TransportError(`Smoke transport failed: ${init.method ?? 'GET'} ${target.pathname}`, cause);
+    }
     const received = response.headers.get('X-Worker-Version');
-    record({ path: target.pathname, method: init.method ?? 'GET', status: response.status, request_id: response.headers.get('X-Request-ID'), worker_version: received });
+    record({ path: target.pathname.slice(0, 256), method: init.method ?? 'GET', status: response.status, request_id: response.headers.get('X-Request-ID')?.slice(0, 128), worker_version: received?.slice(0, 128) });
     if (target.pathname.startsWith('/api/') && !cleanup) {
-      assert(received, 'API must expose its Worker version');
-      version ??= received; assert.equal(received, version, 'Preview deployment changed during validation');
+      if (!received) throw new ValidationError('worker_version_missing', 'API must expose its Worker version');
+      version ??= received;
+      if (received !== version) throw new ValidationError('version_drift', 'Preview deployment changed during validation');
     }
     return response;
   };
-  const cleanup = async () => {
-    const deadline = performance.now() + (options.cleanupTimeoutMs ?? 120000); const failures = [];
-    for (const reference of references) {
-      try {
-        const remaining = Math.floor(deadline - performance.now()); assert(remaining > 0, 'Fixture cleanup deadline exceeded');
-        const init = { headers, signal: AbortSignal.timeout(remaining) };
-        const lookup = await request(`${origin}/api/digests?client_ref=${encodeURIComponent(reference)}`, init, true);
-        if (lookup.status === 404) continue;
-        assert.equal(lookup.status, 200, 'Cleanup reference lookup failed');
-        const found = await lookup.json(); assert(found.ok && found.post?.id, 'Cleanup lookup was malformed');
-        assert.equal(found.client_ref, reference, 'Cleanup lookup returned another reference');
-        if (found.status === 'retracted') continue;
-        const response = await request(`${origin}/api/posts/${found.post.id}/retract`, { ...init, method: 'POST' }, true);
-        assert.equal(response.status, 200, 'Fixture retraction failed');
-        const result = await response.json(); assert(['retracted', 'already_retracted'].includes(result.status));
-      } catch (error) { failures.push(error); }
-    }
-    if (failures.length) throw new AggregateError(failures, 'Fixture cleanup failed');
-  };
-  const persist = async () => {
-    if (!options.artifactsDirectory) return;
-    await mkdir(options.artifactsDirectory, { recursive: true });
-    await writeFile(join(options.artifactsDirectory, `${options.artifactName ?? 'smoke'}.json`), JSON.stringify({ candidate_sha: options.candidateSha, worker_version: version, fixture_references: [...references], alert_references: [...alertReferences], events, events_dropped: dropped }, null, 2));
-  };
-  return { secret, headers, request, cleanupRequest: (url, init) => request(url, init, true), now, registerDigest: reference => { assert(reference); references.add(reference); },
-    registerAlert: reference => { assert(reference); alertReferences.add(reference); },
-    run: task => withCleanup(() => withCleanup(task, cleanup), persist) };
+  return fixtureScope(true, options);
+
+  function fixtureScope(root, scopeOptions) {
+    const references = new Set(); const alertReferences = new Set();
+    const cleanup = async () => {
+      const deadline = performance.now() + (scopeOptions.cleanupTimeoutMs ?? 120000); const failures = [];
+      for (const reference of references) {
+        try {
+          const remaining = Math.floor(deadline - performance.now()); assert(remaining > 0, 'Fixture cleanup deadline exceeded');
+          const init = { headers, signal: AbortSignal.timeout(remaining) };
+          const lookup = await request(`${origin}/api/digests?client_ref=${encodeURIComponent(reference)}`, init, true);
+          if (lookup.status === 404) continue;
+          assert.equal(lookup.status, 200, 'Cleanup reference lookup failed');
+          const found = await lookup.json(); assert(found.ok && found.post?.id, 'Cleanup lookup was malformed');
+          assert.equal(found.client_ref, reference, 'Cleanup lookup returned another reference');
+          if (found.status === 'retracted') continue;
+          const response = await request(`${origin}/api/posts/${found.post.id}/retract`, { ...init, method: 'POST' }, true);
+          assert.equal(response.status, 200, 'Fixture retraction failed');
+          const result = await response.json(); assert(['retracted', 'already_retracted'].includes(result.status));
+        } catch (error) { failures.push(error); }
+      }
+      if (failures.length) throw new AggregateError(failures, 'Fixture cleanup failed');
+    };
+    const persist = async failure => {
+      if (!scopeOptions.artifactsDirectory) return;
+      await mkdir(scopeOptions.artifactsDirectory, { recursive: true });
+      await writeFile(join(scopeOptions.artifactsDirectory, `${scopeOptions.artifactName ?? 'smoke'}.json`), JSON.stringify({ candidate_sha: options.candidateSha, worker_version: version, fixture_references: [...references], alert_references: [...alertReferences],
+        ...(root ? { events, events_dropped: dropped } : {}), ...(failure ? { failure: safeFailure(failure, [secret]) } : {}) }, null, 2));
+    };
+    return { origin, secret, headers, request, cleanupRequest: (url, init) => request(url, init, true), now, registerDigest: reference => { assert(reference); references.add(reference); },
+      registerAlert: reference => { assert(reference); alertReferences.add(reference); },
+      scope: childOptions => fixtureScope(false, { ...scopeOptions, ...childOptions }),
+      run: task => {
+        let failure;
+        return withCleanup(async () => {
+          try { return await withCleanup(task, cleanup); } catch (error) { failure = error; throw error; }
+        }, () => persist(failure));
+      } };
+  }
 }
 
 export async function verifyHtmlRevalidation(origin, request, edge = false) {

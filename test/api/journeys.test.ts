@@ -150,8 +150,14 @@ it('dispatches scheduled weather pulls, revalidates upstream, and preserves the 
   const worker = server.getWorker();
   await worker.scheduled({ cron: '*/10 * * * *', scheduledTime: new Date() });
   const page = await request('/'); const html = await page.text(); expect(html).toContain('Today on the mountain');
-  upstream.mockImplementation(async (_url, init) => { expect(init?.headers?.['If-None-Match']).toBe('"weather-fixture"'); return new Response(null, { status: 304 }); });
+  const conditionalHeaders: Array<string | null> = []; let notModified = 0;
+  upstream.mockImplementation(async (_url, init) => {
+    const tag = new Headers(init?.headers).get('If-None-Match'); conditionalHeaders.push(tag);
+    if (tag === '"weather-fixture"') { notModified++; return new Response(null, { status: 304 }); }
+    return Response.json(fixture.expected);
+  });
   await worker.scheduled({ cron: '*/10 * * * *', scheduledTime: new Date() });
+  expect(conditionalHeaders).toEqual(['"weather-fixture"']); expect(notModified).toBe(1);
   expect((await request('/')).headers.get('ETag')).toBe(page.headers.get('ETag'));
   upstream.mockImplementation(async () => new Response('unavailable', { status: 503 }));
   await worker.scheduled({ cron: '*/10 * * * *', scheduledTime: new Date() });

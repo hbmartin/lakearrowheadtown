@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkEnvironment, readPublishingCredential, validateCredential } from './credentials.mjs';
 import { maintenance, maintenanceTarget, waitForRebuild } from './maintenance.mjs';
+import { ValidationError } from './validation-errors.mjs';
 
 export async function deploy(environment, options = {}) {
   checkEnvironment(environment);
@@ -11,7 +12,7 @@ export async function deploy(environment, options = {}) {
   // Validate the credential's format before deployment; authentication follows it.
   const secret = validateCredential(options.secret ?? readPublishingCredential(environment));
   const result = (options.run ?? spawnSync)('npx', ['wrangler', 'deploy', '--env', environment === 'preview' ? 'preview' : '', ...(options.tag ? ['--tag', options.tag] : []), ...(options.message ? ['--message', options.message] : [])], { stdio: 'inherit' });
-  if (result.error || result.status !== 0) throw new Error('Worker deployment failed; no rebuild was requested');
+  if (result.error || result.status !== 0) throw new ValidationError('deployment_failed', 'Worker deployment failed; no rebuild was requested', { cause: result.error });
   const job = await maintenance('start', environment, undefined, { origin, secret, request: options.request });
   return job;
 }

@@ -1,10 +1,15 @@
 export { fingerprint } from './primitives';
 import type { OperationContext, PublicationStatus } from './types';
-import { DamagedManifest, DamagedSource, OperationFailure } from './errors';
+import { DamagedManifest, DamagedSource, HttpError, OperationFailure } from './errors';
 
 // Never log an exception message: parsers and upstream services can echo inputs.
-export function safeError(error: unknown): Record<string, unknown> {
-  if (error instanceof OperationFailure) return { failure_kind: error.kind, ...safeError(error.cause) };
+export function safeError(error: unknown, seen = new Set<unknown>()): Record<string, unknown> {
+  if (seen.has(error) || seen.size >= 8) return { error_type: 'UnknownError' };
+  seen.add(error);
+  if (error instanceof OperationFailure) return { failure_kind: error.kind, ...safeError(error.cause, seen) };
+  // repairFailure retains the original exception behind its normalized envelope.
+  // Only unwrap our typed envelopes; never serialize arbitrary exception fields.
+  if (error instanceof HttpError && error.cause instanceof Error) return safeError(error.cause, seen);
   const known = ['Error', 'TypeError', 'SyntaxError', 'RangeError', 'HttpError', 'PublicationError'];
   if (!(error instanceof Error)) return { error_type: 'UnknownError' };
   const frames = (error.stack ?? '').split('\n').filter(line => /^\s+at /.test(line))

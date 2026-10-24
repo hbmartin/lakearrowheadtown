@@ -59,9 +59,6 @@ export async function conditionsSnapshot(bucket: ContentBucket, context?: Operat
 }
 
 export function replaceConditions(html: string, conditions: string): string {
-  // Saved templates from the first dismissal release still contain this controller.
-  // Replace it along with the snapshot so the fragment owns exactly one initializer.
-  html = html.replace(/<script id="alert-dismissals">[\s\S]*?<\/script>\s*/g, '');
   const block = `<!-- conditions:start -->${conditions}<!-- conditions:end -->`;
   if (marker.test(html)) return html.replace(marker, () => block);
   // Existing news pages acquire the slot without touching their saved feed.
@@ -74,7 +71,8 @@ export async function composeHomepageConditions(bucket: R2Bucket, origin: string
   const index = await boundary('storage', () => bucket.get('pages/index.html'));
   const base = index ? decodeIndex(await boundary('storage', () => index.arrayBuffer()), index.httpMetadata) : renderPage([], { origin });
   const snapshot = await conditionsSnapshot(bucket, context);
-  const body = replaceConditions(base, snapshot.html);
+  // Old saved templates have a controller outside the conditions fragment.
+  const body = replaceConditions(index ? base.replace(/<script id="alert-dismissals">[\s\S]*?<\/script>\s*/g, '') : base, snapshot.html);
   const metadata: Record<string, string> = { ...index?.customMetadata, ...(!index ? { conditions_only: 'true' } : {}) };
   if (index && !metadata.manifest && metadata.conditions_only !== 'true') {
     metadata[NEWS_ANCHOR] ??= index.uploaded.toISOString();

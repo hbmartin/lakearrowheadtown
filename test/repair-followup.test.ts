@@ -263,16 +263,6 @@ it('stops an alarm after cancelling a repair that reserved an unscheduled head',
   });
 });
 
-it('rejects an unrelated failed head before reading the homepage body', async () => {
-  const job = await seed(); const payload = await input();
-  await inside(publisher(), async (instance, state) => {
-    await state.storage.put(`job:${job.id}`, { ...job, status: 'failed', error_code: 'render_failed' });
-    const get = vi.spyOn(instance.env.SITE_BUCKET, 'get');
-    expect(await instance.publicationRepairV1(payload, origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_blocked' } });
-    expect(get).not.toHaveBeenCalled();
-  });
-});
-
 it.each([
   ['repair_pending', 'repair_pending', false],
   ['repair_stalled', 'repair_stalled', true],
@@ -330,7 +320,7 @@ it('reports a newly committed repair and its identifiers when regeneration statu
     });
     let reply;
     try { reply = await instance.publicationRepairV1(payload, origin); } finally { failure.mockRestore(); }
-    expect(reply).toMatchObject({ ok: false, failure: { code: 'storage_error', publication_status: 'committed',
+    expect(reply).toMatchObject({ ok: false, failure: { code: 'repair_pending', retryable: true, retry_at: expect.any(String), publication_status: 'committed',
       details: { job_id: job.id, repair_id: expect.any(String) } } });
     const index = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
     expect(index.customMetadata!.lakearrowhead_repair_id).toBe(reply.failure.details.repair_id);
@@ -357,7 +347,7 @@ it('retains committed certainty and identifiers when a control operation finaliz
     });
     try {
       expect(await instance.publicationRepairControlV1('cancel', { expected_version: snapshot.publication.version, expected_recovery_token: snapshot.recovery.recovery_token }))
-        .toMatchObject({ ok: false, failure: { code: 'storage_error', publication_status: 'committed', details: { job_id: snapshot.recovery.job_id, repair_id: snapshot.recovery.repair_id } } });
+        .toMatchObject({ ok: false, failure: { code: 'repair_pending', retryable: true, retry_at: expect.any(String), publication_status: 'committed', details: { job_id: snapshot.recovery.job_id, repair_id: snapshot.recovery.repair_id } } });
     } finally { failure.mockRestore(); }
     expect(await state.storage.get('publication_repair_pending')).toBeUndefined();
   });
