@@ -39,12 +39,12 @@ export function parseSmokeArgs(args = process.argv.slice(2)) {
 export async function smoke(args = process.argv.slice(2), options = {}) {
   const { origin } = parseSmokeArgs(args);
   const context = createSmokeContext(origin, options);
-  return context.run(() => smokeBody(args, { ...options, request: context.request, cleanupRequest: context.cleanupRequest, credential: () => context.secret }, context));
+  return context.run(() => smokeBody(args, { ...options, request: context.request, cleanupRequest: context.cleanupRequest, registerAlert: context.registerAlert, credential: () => context.secret }, context));
 }
 
 async function smokeBody(args, options, context) {
   const { origin, edge } = parseSmokeArgs(args);
-  const fetch = (url, init = {}) => (options.request ?? globalThis.fetch)(url, { ...init, signal: AbortSignal.timeout(30000) });
+  const fetch = (url, init = {}) => (options.request ?? globalThis.fetch)(url, init);
   const secret = validateCredential((options.credential ?? readPublishingCredential)('preview'));
   const headers = { Authorization: `Bearer ${secret}` };
   // Confirm support through a read before any dry_run request reaches an older writer.

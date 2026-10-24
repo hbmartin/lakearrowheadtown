@@ -272,7 +272,7 @@ Properties use seed `20261024` by default, 100 examples per pure property, and 2
 TEST_SEED=42 TEST_REPLAY_PATH='0:1' npm run test:unit -- -t 'property test name'
 ```
 
-Use `TEST_EXTENDED=1` when reproducing extended failures. The daily workflow runs at 10:17 UTC, selects and records a fresh seed, and sets `TEST_LIVE_WEATHER=1` for a read-only producer-contract check. Ordinary local runs make no live weather requests. Mutation testing and browser UI automation are outside this testing program.
+Use `TEST_EXTENDED=1` when reproducing extended failures. Extended validation also raises concurrent publication retries from five to 50 while retaining the compatibility and recovery fixtures. The daily workflow runs at 10:17 UTC, selects and records a fresh seed, and sets `TEST_LIVE_WEATHER=1` for a read-only producer-contract check. Ordinary local runs make no live weather requests. Mutation testing and browser UI automation are outside this testing program.
 
 The GitHub **Tests** workflow provides stable **Local validation** and **Preview API** checks. Local validation runs types, both coverage suites, HTTP journeys, and production/preview dry-run builds. Preview API runs after local checks for repository PRs and manual dispatch. Fork PRs receive local validation but deliberately fail the remote gate with import instructions: import the reviewed commit into a repository branch and open a replacement PR. A skipped remote check must not satisfy the merge requirement.
 

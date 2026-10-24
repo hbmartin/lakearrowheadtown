@@ -107,7 +107,8 @@ describe('source URL duplicate suppression', () => {
     expect((await (await request('/')).text()).match(/class="digest-item"/g)).toHaveLength(3);
   });
   it('serializes simultaneous submissions of the same URLs', async () => {
-    const responses = await Promise.all(Array.from({ length: 5 }, () => submit(input())));
+    const attempts = process.env.TEST_EXTENDED === '1' ? 50 : 5;
+    const responses = await Promise.all(Array.from({ length: attempts }, () => submit(input())));
     const results = await Promise.all(responses.map(response => response.json<PublishResult>()));
     expect(results.reduce((count, result) => count + result.counts.published, 0)).toBe(1);
     expect(new Set(results.map(result => result.items[0].post_id)).size).toBe(1);

@@ -4,9 +4,10 @@ import { withCleanup } from './smoke-support.mjs';
 // The caller validates the preview/local origin and loads its credential.
 export async function smokeAlerts(origin, request, headers, options = {}) {
   const now = options.now ?? (() => new Date());
+  let cleanupSignal;
   const send = async (path, input, cleanup = false) => {
     const response = await (cleanup ? options.cleanupRequest ?? request : request)(origin + path, { headers: { ...headers, 'Content-Type': 'application/json' },
-      ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}) });
+      ...(input ? { method: 'POST', body: JSON.stringify(input) } : {}), ...(cleanup ? { signal: cleanupSignal } : {}) });
     assert.equal(response.status, 200, 'Unexpected API response status');
     assert.equal(response.headers.get('X-API-Version'), '3');
     assert.equal(response.headers.get('Cache-Control'), 'no-store');
@@ -33,6 +34,7 @@ export async function smokeAlerts(origin, request, headers, options = {}) {
     const absent = await request(`${origin}/api/alerts?client_ref=${encodeURIComponent(traffic.client_ref)}`, { headers });
     assert.equal(absent.status, 404);
     openings.push(traffic.client_ref);
+    options.registerAlert?.(traffic.client_ref);
     const published = await send('/api/alerts', traffic);
     const duplicate = await send('/api/alerts', traffic);
     assert.equal(duplicate.status, 'duplicate'); assert.equal(duplicate.entry_id, published.entry_id);
@@ -45,6 +47,7 @@ export async function smokeAlerts(origin, request, headers, options = {}) {
     assert(!('history' in compact.alert)); assert(!('detail' in compact.alert));
     assert.equal((await send('/api/alerts?fields=index')).fields, 'index');
     openings.push(power.client_ref);
+    options.registerAlert?.(power.client_ref);
     const outage = await send('/api/alerts', power);
     const checks = { confirmations: [{ client_ref: `${run}:batch-confirm`, alert_id: outage.alert_id, source: power.source, source_url: power.source_url, observed_at: now().toISOString() }] };
     const checkPreview = await send('/api/alerts/confirmations?dry_run=true', checks);
@@ -96,8 +99,9 @@ export async function smokeAlerts(origin, request, headers, options = {}) {
     assert(found, 'Paginated history must include the published alert and its confirmation.');
   }, async () => {
     // Remove the labeled public fixtures even if a later smoke assertion fails.
+    cleanupSignal = AbortSignal.timeout(options.cleanupTimeoutMs ?? 120000);
     const results = await Promise.allSettled(openings.map(async reference => {
-      const response = await (options.cleanupRequest ?? request)(`${origin}/api/alerts?client_ref=${encodeURIComponent(reference)}`, { headers });
+      const response = await (options.cleanupRequest ?? request)(`${origin}/api/alerts?client_ref=${encodeURIComponent(reference)}`, { headers, signal: cleanupSignal });
       if (response.status === 404) return;
       assert.equal(response.status, 200); const opened = await response.json();
       assert.equal(opened.ok, true); assert(opened.alert_id && opened.entry_id);

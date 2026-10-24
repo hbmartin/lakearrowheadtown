@@ -108,9 +108,11 @@ test('diagnostics cap stored requests and injected timeouts abort pending transp
   const clock = new Date('2026-10-24T18:00:00Z');
   const context = createSmokeContext(remote, { credential: () => secret, request: async () => api(), now: () => clock, artifactsDirectory: directory });
   assert.equal(context.now(), clock);
+  context.registerAlert('owned-alert-reference');
   await context.run(async () => { for (let i = 0; i < 503; i++) await context.request(remote + '/api/posts'); });
   const saved = JSON.parse(await readFile(join(directory, 'smoke.json'), 'utf8'));
   assert.equal(saved.events.length, 500); assert.equal(saved.events_dropped, 3);
+  assert.deepEqual(saved.alert_references, ['owned-alert-reference']);
   let aborted = false;
   const hanging = createSmokeContext(remote, { credential: () => secret, requestTimeoutMs: 1,
     request: async (_url, { signal }) => new Promise((_resolve, reject) => {

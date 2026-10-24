@@ -16,7 +16,7 @@ export function createSmokeContext(origin, options = {}) {
   origin = maintenanceTarget('preview', origin);
   const secret = validateCredential((options.credential ?? readPublishingCredential)('preview'));
   const headers = { Authorization: `Bearer ${secret}` };
-  const references = new Set(); const events = []; let dropped = 0; let version = options.expectedVersion;
+  const references = new Set(); const alertReferences = new Set(); const events = []; let dropped = 0; let version = options.expectedVersion;
   const record = event => { if (events.length < 500) events.push(event); else dropped++; };
   const now = options.now ?? (() => new Date());
   const request = async (url, init = {}, cleanup = false) => {
@@ -56,9 +56,10 @@ export function createSmokeContext(origin, options = {}) {
   const persist = async () => {
     if (!options.artifactsDirectory) return;
     await mkdir(options.artifactsDirectory, { recursive: true });
-    await writeFile(join(options.artifactsDirectory, `${options.artifactName ?? 'smoke'}.json`), JSON.stringify({ candidate_sha: options.candidateSha, worker_version: version, fixture_references: [...references], events, events_dropped: dropped }, null, 2));
+    await writeFile(join(options.artifactsDirectory, `${options.artifactName ?? 'smoke'}.json`), JSON.stringify({ candidate_sha: options.candidateSha, worker_version: version, fixture_references: [...references], alert_references: [...alertReferences], events, events_dropped: dropped }, null, 2));
   };
   return { secret, headers, request, cleanupRequest: (url, init) => request(url, init, true), now, registerDigest: reference => { assert(reference); references.add(reference); },
+    registerAlert: reference => { assert(reference); alertReferences.add(reference); },
     run: task => withCleanup(() => withCleanup(task, cleanup), persist) };
 }
 
