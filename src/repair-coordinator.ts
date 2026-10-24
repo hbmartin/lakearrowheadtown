@@ -2,6 +2,7 @@ import { asHttpError, boundary, HttpError } from './errors';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { fingerprint, record as object } from './primitives';
 import { prepareWrites } from './prepared-writes';
+import { repairErrorState, repairFailure, type RepairFailureContext } from './repair-errors';
 import { decodeIndex } from './index-fence';
 import { PublicationConflict } from './publication-conflict';
 import { validateIndexMetadata } from './index-metadata';
@@ -12,6 +13,7 @@ import type { ContentBucket, OperationContext, PublicationStatus, RebuildJob, Re
 export const REPAIR_MARKER = 'lakearrowhead_repair_id';
 const ACTIVE = 'publication_repair_pending';
 const MAX_ATTEMPTS = 10;
+export type RepairRecoveryOutcome = 'none' | 'activated' | 'cancelled';
 interface RepairRecord {
   id: string; key: string; input: RepairInput; job: RebuildJob; etag: string;
   state: 'pending' | 'committed' | 'conflict'; publication?: PublicationHead;
@@ -42,13 +44,14 @@ export const publicationChanged = (status: PublicationStatus = 'not_committed') 
 const matches = (index: R2Object, input: RepairInput) => ['manifest', 'rss', 'archives'].every(key => (index.customMetadata?.[key] ?? null) === input[key as keyof RepairInput]);
 const certainty = (record: RepairRecord): PublicationStatus => record.publication ? 'committed' : record.phase === 'prepared' ? 'not_committed' : 'unknown';
 const checkpointBlocked = (record: RepairRecord) => record.stalled && record.last_error?.code === 'rebuild_checkpoint_damaged';
+const recoveryCode = (record: RepairRecord) => checkpointBlocked(record) ? 'rebuild_checkpoint_damaged' : record.stalled ? 'repair_stalled' : 'repair_pending';
 const checkpointFailure = (record: RepairRecord) => new HttpError(503,
   'Repair committed, but rebuild migration evidence is missing or damaged. Restore the matching finalization checkpoint from a verified backup, then explicitly resume repair recovery.', {},
   { code: 'rebuild_checkpoint_damaged', stage: 'repair_activation', retryable: false, publication_status: certainty(record),
     details: { repair_id: record.id, job_id: record.job.id, checkpoint_key: checkpointKey(record.job.id), generation_id: record.handoff?.prior_job.generation_id } });
 const pending = (record: RepairRecord, status = certainty(record)) => checkpointBlocked(record) ? checkpointFailure(record) : new HttpError(503,
   record.stalled ? 'Repair recovery is stalled. Inspect the repair, correct the cause, then explicitly resume it.' : status === 'committed' ? 'Repair committed; regeneration activation is being recovered.' : 'Repair outcome is being reconciled. Retry the identical repair request.', {},
-  { code: record.stalled ? 'repair_stalled' : 'repair_pending', retryable: !record.stalled, publication_status: status,
+  { code: recoveryCode(record), retryable: !record.stalled, publication_status: status,
     ...(!record.stalled ? { retry_at: record.next_retry_at ?? new Date(Date.now() + 1000).toISOString() } : {}), details: { repair_id: record.id, job_id: record.job.id } });
 const damaged = () => new HttpError(503, 'The repair journal is damaged. Restore the active journal and its referenced record from a verified backup before resuming. Do not force-clear an unknown write.', {}, { code: 'repair_journal_damaged', retryable: false });
 function repairMetadata(index: R2Object, record: Pick<RepairRecord, 'id' | 'input'>): Record<string, string> {
@@ -78,7 +81,7 @@ export class RepairCoordinator {
     const active = await this.active();
     if (active.key === undefined) return;
     const saved = active.record;
-    return { reason: !saved || checkpointBlocked(saved) ? 'repair_damaged' : saved.stalled ? 'repair_stalled' : 'repair_pending',
+    return { reason: repairErrorState(saved ? recoveryCode(saved) : 'repair_journal_damaged')!.reason,
       ...(saved ? { repair_id: saved.id, job_id: saved.job.id, ...(saved.next_retry_at && !saved.stalled ? { retry_at: saved.next_retry_at } : {}) } : {}) };
   }
 
@@ -144,50 +147,54 @@ export class RepairCoordinator {
     emit('rebuild_queued', record.job.context ?? context, { job_id: record.job.id, generation_id: record.job.generation_id, reused: !!record.handoff,
       scheduling: record.job.scheduling, manual_resume: isPaused(record.job), ...(isPaused(record.job) ? { pause_reason: pauseReason(record.job) } : {}) });
   }
-  private async reconcile(record: RepairRecord, index: R2Object | null, trace: OperationTrace, uncertain: boolean): Promise<boolean> {
+  private async reconcile(record: RepairRecord, index: R2Object | null, trace: OperationTrace, uncertain: boolean): Promise<Exclude<RepairRecoveryOutcome, 'none'> | undefined> {
     if (index?.customMetadata?.[REPAIR_MARKER] === record.id && matches(index, record.input)) {
       trace.publication_status = 'committed'; record.phase = 'activation'; record.publication = publicationHead(index);
-      await trace.run('repair_activation', () => this.activate(record, index, trace.context)); return true;
+      await trace.run('repair_activation', () => this.activate(record, index, trace.context)); return 'activated';
     }
     if (!index || index.etag !== record.etag || !uncertain && index.version !== record.input.expected_version) {
-      await trace.run('repair_cancellation', () => this.cancel(record, uncertain ? 'unknown' : 'not_committed')); return true;
+      await trace.run('repair_cancellation', () => this.cancel(record, uncertain ? 'unknown' : 'not_committed')); return 'cancelled';
     }
     // R2's condition tests bytes, not version or metadata. A metadata-only
     // replacement cannot fence an earlier write whose acknowledgement was lost.
     if (index.version !== record.input.expected_version) throw pending(record);
-    return false;
+    return undefined;
   }
   private async attempt(record: RepairRecord, trace: OperationTrace, validated?: { index: R2Object; bytes: ArrayBuffer }) {
     const uncertain = certainty(record) !== 'not_committed';
     let body: R2ObjectBody | null = null;
     try {
       const head = await trace.run('repair_index_loading', () => boundary('storage', () => this.bucket.head('pages/index.html')));
-      if (await this.reconcile(record, head, trace, uncertain)) return;
+      const reconciledHead = await this.reconcile(record, head, trace, uncertain);
+      if (reconciledHead) return reconciledHead;
       const cached = validated && head?.version === validated.index.version && head.etag === validated.index.etag ? validated : undefined;
       const index = cached?.index ?? await boundary('storage', () => this.bucket.get('pages/index.html'));
       body = cached ? null : index as R2ObjectBody | null;
-      if (await this.reconcile(record, index, trace, uncertain)) return;
-      if (!index) return;
+      const reconciledIndex = await this.reconcile(record, index, trace, uncertain);
+      if (reconciledIndex) return reconciledIndex;
+      if (!index) return 'cancelled' as const;
       const metadata = repairMetadata(index, record);
       const prepared = prepareWrites(this.bucket, trace, record.id);
       let committed: R2Object;
       try {
         const bytes = cached?.bytes ?? await trace.run('repair_body_loading', () => boundary('storage', () => (index as R2ObjectBody).arrayBuffer()));
-        await trace.run('repair_representation_validation', () => decodeIndex(bytes, index.httpMetadata, true));
+        if (!cached) await trace.run('repair_representation_validation', () => decodeIndex(bytes, index.httpMetadata, true));
         await trace.run('index_write', () => prepared.bucket.put('pages/index.html', bytes, { httpMetadata: index.httpMetadata, customMetadata: metadata }));
         record.phase = 'writing';
         await trace.run('repair_dispatch', () => boundary('storage', () => this.storage.put(record.key, record)));
         try { committed = (await prepared.commit(index))!; }
         catch (error) {
           if (!(error instanceof PublicationConflict)) throw error;
-          if (!uncertain) { await trace.run('repair_cancellation', () => this.cancel(record, 'not_committed')); return; }
+          if (!uncertain) { await trace.run('repair_cancellation', () => this.cancel(record, 'not_committed')); return 'cancelled' as const; }
           const latest = await boundary('storage', () => this.bucket.head('pages/index.html'));
-          if (await this.reconcile(record, latest, trace, true)) return;
+          const reconciledLatest = await this.reconcile(record, latest, trace, true);
+          if (reconciledLatest) return reconciledLatest;
           throw pending(record);
         }
       } finally { prepared.close(); }
       record.phase = 'activation'; record.publication = publicationHead(committed);
       await trace.run('repair_activation', () => this.activate(record, committed, trace.context));
+      return 'activated' as const;
     } catch (error) {
       const failure = asHttpError(error);
       if (!uncertain && record.phase === 'prepared' && failure.status < 500 && !failure.retryable) {
@@ -209,22 +216,22 @@ export class RepairCoordinator {
       throw pending(record, trace.publication_status === 'committed' ? 'committed' : certainty(record));
     } finally { if (body && !body.bodyUsed) await body.body.cancel().catch(() => {}); }
   }
-  async recover(trace: OperationTrace, respectDeadline = true): Promise<boolean> {
+  async recover(trace: OperationTrace, respectDeadline = true): Promise<RepairRecoveryOutcome> {
     const active = await this.active();
-    if (active.key === undefined) return false;
+    if (active.key === undefined) return 'none';
     const saved = active.record; if (!saved) throw damaged();
     if (saved.stalled) throw pending(saved);
     if (respectDeadline && saved.next_retry_at && Date.parse(saved.next_retry_at) > Date.now()) {
       await boundary('storage', () => this.storage.setAlarm(Date.parse(saved.next_retry_at!))); throw pending(saved);
     }
-    await this.attempt(saved, trace); return true;
+    return this.attempt(saved, trace);
   }
   async gate(context?: OperationContext): Promise<void> {
     const trace = new OperationTrace(context);
     try { await this.recover(trace, true); }
     catch (error) {
       const failure = asHttpError(error);
-      if (!['repair_pending', 'repair_stalled', 'repair_journal_damaged', 'rebuild_checkpoint_damaged'].includes(failure.code)) throw error;
+      if (!repairErrorState(failure.code)) throw error;
       throw new HttpError(503, 'A different publication repair blocks index replacement. Inspect its recovery state before retrying this operation.', {}, {
         code: 'repair_blocked', stage: trace.failed_stage ?? failure.stage ?? 'repair_recovery', retryable: failure.retryable, retry_at: failure.retry_at,
         publication_status: 'not_committed', details: { blocking_repair: failure.details } });
@@ -232,22 +239,32 @@ export class RepairCoordinator {
   }
   async control(action: 'resume' | 'cancel', input: unknown, trace: OperationTrace): Promise<RepairResult> {
     if (!object(input) || Object.keys(input).some(key => !['expected_recovery_token', 'expected_version'].includes(key)) || typeof input.expected_recovery_token !== 'string' || typeof input.expected_version !== 'string') throw new HttpError(400, 'Supply expected_recovery_token and expected_version.');
-    const snapshot = await this.snapshot(trace);
-    if (!snapshot.recovery || snapshot.recovery.recovery_token !== input.expected_recovery_token || snapshot.publication.version !== input.expected_version) throw new HttpError(409, 'Recovery state changed. Inspect it again.', {}, { code: 'repair_recovery_changed' });
-    const saved = (await this.active()).record; if (!saved) throw damaged();
-    if (action === 'resume') {
-      await boundary('storage', () => this.storage.transaction(async storage => {
-        await storage.put(saved.key, { ...saved, attempts: 0, stalled: false, next_retry_at: new Date(Date.now() + 1000).toISOString() });
-        await storage.setAlarm(Date.now() + 1000);
-      }));
-    } else {
-      const head = await boundary('storage', () => this.bucket.head('pages/index.html'));
-      if (!head || head.version !== input.expected_version) throw publicationChanged();
-      if (head.customMetadata?.[REPAIR_MARKER] === saved.id && matches(head, saved.input)) await this.activate(saved, head, trace.context);
-      else if (saved.phase === 'prepared' || head.etag !== saved.etag) await this.cancel(saved, certainty(saved));
-      else throw new HttpError(409, 'Cannot cancel an unresolved conditional write. Reconcile or resume this repair.', {}, { code: 'unsafe_repair_cancellation', publication_status: certainty(saved) });
+    let saved: RepairRecord | undefined;
+    let failureContext: RepairFailureContext = { publication_status: 'not_attempted' };
+    try {
+      const snapshot = await this.snapshot(trace);
+      if (snapshot.recovery) failureContext = { publication_status: snapshot.recovery.publication_status,
+        repair_id: snapshot.recovery.repair_id, job_id: snapshot.recovery.job_id };
+      if (!snapshot.recovery || snapshot.recovery.recovery_token !== input.expected_recovery_token || snapshot.publication.version !== input.expected_version) throw new HttpError(409, 'Recovery state changed. Inspect it again.', {}, { code: 'repair_recovery_changed' });
+      saved = (await this.active()).record;
+      if (!saved) throw damaged();
+      const record = saved;
+      if (action === 'resume') {
+        await boundary('storage', () => this.storage.transaction(async storage => {
+          await storage.put(record.key, { ...record, attempts: 0, stalled: false, next_retry_at: new Date(Date.now() + 1000).toISOString() });
+          await storage.setAlarm(Date.now() + 1000);
+        }));
+      } else {
+        const head = await boundary('storage', () => this.bucket.head('pages/index.html'));
+        if (!head || head.version !== input.expected_version) throw publicationChanged(certainty(record));
+        if (head.customMetadata?.[REPAIR_MARKER] === record.id && matches(head, record.input)) await this.activate(record, head, trace.context);
+        else if (record.phase === 'prepared' || head.etag !== record.etag) await this.cancel(record, certainty(record));
+        else throw new HttpError(409, 'Cannot cancel an unresolved conditional write. Reconcile or resume this repair.', {}, { code: 'unsafe_repair_cancellation', publication_status: certainty(record) });
+      }
+      return await this.snapshot(trace);
+    } catch (error) {
+      throw repairFailure(error, saved ? { publication_status: certainty(saved), repair_id: saved.id, job_id: saved.job.id } : failureContext);
     }
-    return this.snapshot(trace);
   }
   private async regenerationStatus(job: RebuildJob): Promise<{ regeneration_status?: 'awaiting_resume' }> {
     if (!['queued', 'running'].includes(job.status) || !isPaused(job) || pauseReason(job) === 'rebuild_checkpoint_damaged'
@@ -258,73 +275,79 @@ export class RepairCoordinator {
     return provenance ? { regeneration_status: 'awaiting_resume' } : {};
   }
   async submit(input: RepairInput, origin: string, trace: OperationTrace, context?: OperationContext): Promise<RepairResult> {
-    const key = `repair-request:${fingerprint(JSON.stringify([input.expected_version, input.manifest, input.rss, input.archives]))}`;
-    const before = await boundary('storage', () => this.storage.get<RepairRecord>(key));
-    const active = await this.active();
-    let worked = false;
-    if (active.key !== undefined) {
-      if (active.key === key) worked = await this.recover(trace);
-      else await this.gate(context);
-    }
-    let record = await boundary('storage', () => this.storage.get<RepairRecord>(key));
-    if (record && !valid(record)) throw damaged();
-    if (record?.state === 'conflict') throw publicationChanged(record.conflict_status);
-    if (!record) {
-      const index = await trace.run('repair_index_loading', () => boundary('storage', () => this.bucket.head('pages/index.html')));
-      if (!index) throw indexNotFound();
-      if (matches(index, input)) {
-        const receipt = await boundary('storage', () => this.storage.get<string>(`repair:${index.version}`));
-        const job = receipt ? await boundary('storage', () => this.storage.get<RebuildJob>(`job:${receipt}`)) : undefined;
-        return { publication: publicationHead(index), unchanged: true, ...(job ? { job, ...await this.regenerationStatus(job) } : {}) };
-      }
-      if (index.version !== input.expected_version) throw publicationChanged();
-      const id = crypto.randomUUID();
-      repairMetadata(index, { id, input });
-      const validated = await trace.run('repair_representation_validation', async () => {
-        const object = await boundary('storage', () => this.bucket.get('pages/index.html'));
-        try {
-          if (!object || object.version !== index.version || object.etag !== index.etag) throw publicationChanged();
-          const bytes = await boundary('storage', () => object.arrayBuffer());
-          decodeIndex(bytes, object.httpMetadata, true);
-          return { index: object, bytes };
-        } finally { if (object && !object.bodyUsed) await object.body.cancel().catch(() => {}); }
-      });
-      const { job, handoff } = await this.reserve(origin, trace, context, index, id);
-      const migration = await boundary('storage', () => this.storage.get<{ complete: boolean; processed: number }>('migration'));
-      await trace.run('repair_validation', () => validateRepairTargets(this.bucket, input, migration?.complete ?? false));
-      record = { id, key, input, etag: index.etag, job, ...(handoff ? { handoff } : {}), state: 'pending', phase: 'prepared', attempts: 0 };
-      const saved = record;
-      try {
-        await trace.run('repair_preparation', () => boundary('storage', () => this.storage.transaction(async storage => {
-          const alarm = await storage.getAlarm();
-          // A delivery can register while target validation is awaiting R2.
-          // In that case preserve the working head and reserve a separate job.
-          if (saved.handoff?.repairable_code === 'unscheduled' && !isPaused(saved.handoff.prior_job)
-            && (alarm !== null || this.alarmDelivered())) {
-            saved.job = newRebuild(crypto.randomUUID(), origin, migration ?? { complete: false, processed: 0 }, context);
-            delete saved.handoff;
-          }
-          await storage.put(key, saved); await storage.put(ACTIVE, key);
-          await storage.setAlarm(Math.min(alarm ?? Infinity, Date.now() + 1000));
-        })));
-      } catch (error) {
-        emit('repair_preparation_failed', context, { ...safeError(error), error_code: asHttpError(error).code }, 'error');
-        throw pending(saved);
-      }
-      await this.attempt(record, trace, validated); worked = true;
-    }
+    let failureContext: RepairFailureContext = { publication_status: 'not_committed' };
     try {
-    const saved = (await boundary('storage', () => this.storage.get<RepairRecord>(key)))!;
-    if (saved?.state === 'conflict') throw publicationChanged(saved.conflict_status);
-    if (!saved || saved.state !== 'committed' || !saved.publication) throw pending(record);
-    const job = await boundary('storage', () => this.storage.get<RebuildJob>(`job:${saved.job.id}`)) ?? saved.job;
-    return { publication: saved.publication, repair_id: saved.id, unchanged: !worked && before?.state === 'committed', job, ...await this.regenerationStatus(job) };
-    } catch (error) {
-      if (error instanceof HttpError) {
-        if (error.publication_status !== undefined) throw error;
-        throw new HttpError(error.status, error.message, error.headers, { ...error, publication_status: certainty(record) });
+      const key = `repair-request:${fingerprint(JSON.stringify([input.expected_version, input.manifest, input.rss, input.archives]))}`;
+      const before = await boundary('storage', () => this.storage.get<RepairRecord>(key));
+      if (before && valid(before)) failureContext = { publication_status: certainty(before), repair_id: before.id, job_id: before.job.id };
+      const active = await this.active();
+      let worked = false;
+      if (active.key !== undefined) {
+        if (active.key === key) worked = await this.recover(trace) === 'activated';
+        else await this.gate(context);
       }
-      throw pending(record, trace.publication_status === 'committed' ? 'committed' : certainty(record));
+      let record = await boundary('storage', () => this.storage.get<RepairRecord>(key));
+      if (record && !valid(record)) throw damaged();
+      if (record?.state === 'conflict') throw publicationChanged(record.conflict_status);
+      if (!record) {
+        const index = await trace.run('repair_index_loading', () => boundary('storage', () => this.bucket.head('pages/index.html')));
+        if (!index) throw indexNotFound();
+        if (matches(index, input)) {
+          const repairId = index.customMetadata?.[REPAIR_MARKER];
+          failureContext = { publication_status: repairId ? 'committed' : 'not_attempted', ...(repairId ? { repair_id: repairId } : {}) };
+          const receipt = await boundary('storage', () => this.storage.get<string>(`repair:${index.version}`));
+          if (receipt) failureContext = { ...failureContext, publication_status: 'committed', job_id: receipt };
+          const job = receipt ? await boundary('storage', () => this.storage.get<RebuildJob>(`job:${receipt}`)) : undefined;
+          return { publication: publicationHead(index), unchanged: true, ...(job ? { job, ...await this.regenerationStatus(job) } : {}) };
+        }
+        if (index.version !== input.expected_version) throw publicationChanged();
+        const id = crypto.randomUUID();
+        repairMetadata(index, { id, input });
+        const { job, handoff } = await this.reserve(origin, trace, context, index, id);
+        failureContext = { publication_status: 'not_committed', repair_id: id, job_id: job.id };
+        const validated = await trace.run('repair_representation_validation', async () => {
+          const object = await boundary('storage', () => this.bucket.get('pages/index.html'));
+          try {
+            if (!object || object.version !== index.version || object.etag !== index.etag) throw publicationChanged();
+            const bytes = await boundary('storage', () => object.arrayBuffer());
+            decodeIndex(bytes, object.httpMetadata, true);
+            return { index: object, bytes };
+          } finally { if (object && !object.bodyUsed) await object.body.cancel().catch(() => {}); }
+        });
+        const migration = await boundary('storage', () => this.storage.get<{ complete: boolean; processed: number }>('migration'));
+        await trace.run('repair_validation', () => validateRepairTargets(this.bucket, input, migration?.complete ?? false));
+        record = { id, key, input, etag: index.etag, job, ...(handoff ? { handoff } : {}), state: 'pending', phase: 'prepared', attempts: 0 };
+        const saved = record;
+        failureContext = { publication_status: certainty(record), repair_id: record.id, job_id: record.job.id };
+        try {
+          await trace.run('repair_preparation', () => boundary('storage', () => this.storage.transaction(async storage => {
+            const alarm = await storage.getAlarm();
+            // A delivery can register while target validation is awaiting R2.
+            // In that case preserve the working head and reserve a separate job.
+            if (saved.handoff?.repairable_code === 'unscheduled' && !isPaused(saved.handoff.prior_job)
+              && (alarm !== null || this.alarmDelivered())) {
+              saved.job = newRebuild(crypto.randomUUID(), origin, migration ?? { complete: false, processed: 0 }, context);
+              delete saved.handoff;
+            }
+            await storage.put(key, saved); await storage.put(ACTIVE, key);
+            await storage.setAlarm(Math.min(alarm ?? Infinity, Date.now() + 1000));
+          })));
+        } catch (error) {
+          failureContext = { publication_status: certainty(saved), repair_id: saved.id, job_id: saved.job.id };
+          emit('repair_preparation_failed', context, { ...safeError(error), error_code: asHttpError(error).code }, 'error');
+          throw pending(saved);
+        }
+        failureContext = { publication_status: certainty(record), repair_id: record.id, job_id: record.job.id };
+        await this.attempt(record, trace, validated); worked = true;
+      }
+      const saved = (await boundary('storage', () => this.storage.get<RepairRecord>(key)))!;
+      if (saved?.state === 'conflict') throw publicationChanged(saved.conflict_status);
+      if (!saved || saved.state !== 'committed' || !saved.publication) throw pending(record);
+      failureContext = { publication_status: certainty(saved), repair_id: saved.id, job_id: saved.job.id };
+      const job = await boundary('storage', () => this.storage.get<RebuildJob>(`job:${saved.job.id}`)) ?? saved.job;
+      return { publication: saved.publication, repair_id: saved.id, unchanged: !worked && before?.state === 'committed', job, ...await this.regenerationStatus(job) };
+    } catch (error) {
+      throw repairFailure(error, { ...failureContext, publication_status: trace.publication_status === 'committed' ? 'committed' : failureContext.publication_status });
     }
   }
 }

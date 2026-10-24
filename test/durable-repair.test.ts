@@ -125,11 +125,11 @@ it.each(['preparation_ack', 'index_ack', 'activation', 'activation_ack', 'result
       }));
     }
     try {
-      const response = await request(input); expect(response.status).toBe(503);
+      const response = await request(input); expect(response.status).toBe(fault === 'result_read' ? 500 : 503);
       failed = await response.json<any>();
-      expect(failed).toMatchObject({ code: 'repair_pending', retryable: true,
+      expect(failed).toMatchObject({ code: fault === 'result_read' ? 'storage_error' : 'repair_pending', retryable: true,
         publication_status: fault === 'preparation_ack' ? 'not_committed' : fault === 'index_ack' ? 'unknown' : 'committed',
-        details: { repair_id: expect.any(String), job_id: expect.any(String) }, retry_at: expect.any(String) });
+        details: { repair_id: expect.any(String), job_id: expect.any(String) }, ...(fault === 'result_read' ? {} : { retry_at: expect.any(String) }) });
     } finally { spies.forEach(spy => spy.mockRestore()); }
   });
   expect(injected).toBe(true);
@@ -187,7 +187,7 @@ it('rejects an unrelated failed head before any candidate content reads', async 
   await inside(publisher(), async (instance, state) => {
     await state.storage.put(`job:${job.id}`, { ...job, status: 'failed', error_code: 'render_failed' });
     const get = vi.spyOn(instance.env.SITE_BUCKET, 'get');
-    try { expect(await instance.publicationRepairV1(input, origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_blocked' } }); expect(get.mock.calls.every(([key]) => key === 'pages/index.html')).toBe(true); }
+    try { expect(await instance.publicationRepairV1(input, origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_blocked' } }); expect(get).not.toHaveBeenCalled(); }
     finally { get.mockRestore(); }
   });
 });
@@ -583,12 +583,15 @@ it.each([false, true])('retains recovery diagnostics through retry exhaustion an
     await legacyCheckpoint(state.storage, queued);
     await state.storage.put(`job:${queued.id}`, { ...queued, status: 'running', ...(known ? { recovery: { code: 'storage_error', stage: 'rebuild_finalize', retryable: true, publication_status: 'committed', failed_at: new Date().toISOString() } } : {}) });
     const head = instance.env.SITE_BUCKET.head.bind(instance.env.SITE_BUCKET);
-    const fault = vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => { if (key === 'pages/index.html') throw new Error('Private receipt outage'); return head(key); });
+    const get = state.storage.get.bind(state.storage) as any;
+    const fault = known
+      ? vi.spyOn(state.storage, 'get').mockImplementation((key: any) => { if (key === 'migration') throw new Error('Private receipt outage'); return get(key); })
+      : vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => { if (key === 'pages/index.html') throw new Error('Private receipt outage'); return head(key); });
     try { for (let attempt = 0; attempt <= 6; attempt++) { await state.storage.deleteAlarm(); await expect(instance.alarm()).rejects.toBeInstanceOf(OperationFailure); } }
     finally { fault.mockRestore(); }
   });
   await evictDurableObject(publisher());
-  expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'running', blocked: { reason: 'unscheduled' }, recovery: { code: 'storage_error', stage: 'rebuild_receipt_read', retryable: true, publication_status: known ? 'committed' : 'unknown' } });
+  expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'running', blocked: { reason: 'unscheduled' }, recovery: { code: 'storage_error', stage: known ? 'rebuild_migration_receipt' : 'rebuild_receipt_read', retryable: true, publication_status: known ? 'committed' : 'unknown' } });
   expect(await publisher().resumeRebuild(queued.id)).toMatchObject({ status: 'queued' }); await runDurableObjectAlarm(publisher());
   expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'completed' });
   expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(version);
@@ -712,7 +715,7 @@ it('recovery routing survives renamed diagnostic stages and logs transient failu
   });
 });
 
-it.each(['unknown', 'committed'] as const)('preserves %s evidence across explicit resume and another receipt outage', async certainty => {
+it.each(['unknown', 'committed'] as const)('preserves %s evidence across explicit resume and another recovery read outage', async certainty => {
   await seed(); const queued = await publisher().enqueueRebuild(origin);
   await inside(publisher(), async (instance, state) => {
     await state.storage.put(`job:${queued.id}`, { ...queued, status: 'running', recovery: { code: 'storage_error', stage: 'rebuild_finalize', retryable: true, publication_status: certainty, failed_at: new Date().toISOString() } });
@@ -720,7 +723,10 @@ it.each(['unknown', 'committed'] as const)('preserves %s evidence across explici
     const resumed = await instance.resumeRebuild(queued.id);
     expect(resumed).toMatchObject({ status: 'queued', recovery: { publication_status: certainty } });
     const head = instance.env.SITE_BUCKET.head.bind(instance.env.SITE_BUCKET);
-    const fault = vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => { if (key === 'pages/index.html') throw new Error('Receipt outage after resume'); return head(key); });
+    const get = state.storage.get.bind(state.storage) as any;
+    const fault = certainty === 'committed'
+      ? vi.spyOn(state.storage, 'get').mockImplementation((key: any) => { if (key === 'migration') throw new Error('Recovery outage after resume'); return get(key); })
+      : vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => { if (key === 'pages/index.html') throw new Error('Recovery outage after resume'); return head(key); });
     try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { fault.mockRestore(); }
     expect(await instance.jobStatus(queued.id)).toMatchObject({ recovery: { publication_status: certainty } });
   });

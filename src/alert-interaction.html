@@ -1,0 +1,95 @@
+<style id="alert-dismissal-styles">
+  .conditions-pending .homepage-conditions { visibility: hidden; }
+  .alert-item { position: relative; }
+  .alert-row > summary { min-height: 44px; padding-inline-end: 3.5rem; }
+  .alert-dismiss { position: absolute; top: 1px; right: .35rem; display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; padding: .5rem; border: 0; border-radius: .3rem; background: transparent; color: var(--muted); font-size: 1.25rem; }
+  .alert-dismiss:hover { background: var(--surface); color: var(--text); }
+  .alert-dismiss:focus-visible { outline-offset: -4px; }
+</style>
+<script id="alert-dismissal-bootstrap">
+  (() => {
+    document.documentElement.classList.add('conditions-pending');
+    // Weather must remain available even if the following initializer cannot run.
+    setTimeout(() => document.documentElement.classList.remove('conditions-pending'), 1000);
+  })();
+</script>
+<!-- alert-conditions -->
+<script id="alert-dismissals">
+  (() => {
+    const finish = () => document.documentElement.classList.remove('conditions-pending');
+    const banner = document.querySelector('.alerts-banner');
+    if (!banner || banner.dataset.dismissalsReady === '2') { finish(); return; }
+    const root = banner.closest('.homepage-conditions');
+    const rows = [...banner.querySelectorAll('.alert-item')];
+    const groups = [...banner.querySelectorAll('.alert-group')];
+    const memory = new Set();
+    const saved = new Set();
+    const key = row => 'lakearrowhead-dismissed-alert:v1:' + row.dataset.alertId;
+
+    function containers(visible) {
+      banner.hidden = !visible;
+      if (!root) return;
+      const weather = !!root.querySelector('.weather-card');
+      const notice = !!root.querySelector('.conditions-unavailable');
+      root.classList.toggle('has-alerts', visible);
+      const container = root.querySelector('.conditions-row');
+      if (container) container.hidden = !visible && !weather;
+      root.hidden = !visible && !weather && !notice;
+    }
+
+    function revealLegacy() {
+      for (const row of rows) row.hidden = false;
+      for (const group of groups) group.hidden = false;
+      containers(true);
+    }
+
+    function update(pending = false) {
+      const focused = rows.findIndex(row => row.contains(document.activeElement));
+      for (const row of rows) row.hidden = pending || memory.has(row.dataset.alertId) || saved.has(row.dataset.alertId);
+      for (const group of groups) group.hidden = !rows.some(row => !row.hidden && group.contains(row));
+      containers(rows.some(row => !row.hidden));
+      if (pending || focused < 0 || !rows[focused].hidden) return;
+      const next = rows.find((row, index) => index > focused && !row.hidden)
+        || rows.slice(0, focused).reverse().find(row => !row.hidden);
+      const target = next?.querySelector('summary') || root?.querySelector('.weather-card h2')
+        || document.querySelector('main .digest h3, main .empty-state') || document.querySelector('main');
+      if (!target) return;
+      if (target.tagName !== 'SUMMARY' && !target.hasAttribute('tabindex')) target.setAttribute('tabindex', '-1');
+      target.focus({ preventScroll: true });
+      target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+
+    function checkStorage() {
+      try {
+        saved.clear();
+        for (const row of rows) {
+          try { if (localStorage.getItem(key(row)) === '1') saved.add(row.dataset.alertId); }
+          catch { /* Show alerts whose saved dismissal cannot be read. */ }
+        }
+        update();
+      } finally { finish(); }
+    }
+
+    try {
+      // Older composers have no dismissal IDs. Their alerts must stay visible.
+      if (!rows.length || rows.some(row => !row.dataset.alertId)) { revealLegacy(); return; }
+      for (const row of rows) row.querySelector('.alert-dismiss')?.addEventListener('click', () => {
+        memory.add(row.dataset.alertId);
+        update();
+        try {
+          localStorage.setItem(key(row), '1');
+          saved.add(row.dataset.alertId);
+          memory.delete(row.dataset.alertId);
+        } catch { /* Only unsuccessful writes need the page-local fallback. */ }
+      });
+      window.addEventListener('pagehide', () => {
+        document.documentElement.classList.add('conditions-pending');
+        update(true);
+      });
+      window.addEventListener('pageshow', event => { if (event.persisted) checkStorage(); });
+      checkStorage();
+      banner.dataset.dismissalsReady = '2';
+    } catch { revealLegacy(); }
+    finally { finish(); }
+  })();
+</script>

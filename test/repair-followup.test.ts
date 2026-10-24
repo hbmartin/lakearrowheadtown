@@ -90,7 +90,7 @@ it('tags dispatch checkpoint duration as commit phase', async () => {
   await inside(publisher(), async instance => instance.alarm());
   expect(events).toContainEqual(expect.objectContaining({ event: 'operation_stage', stage: 'rebuild_dispatch_checkpoint', phase: 'commit' }));
 });
-it('retains conditional read revalidation and does not rely on upload-time fencing', async () => {
+it('checks emulator conditional behavior and retains HTTP revalidation without upload-time fencing', async () => {
   const first = (await bindings.SITE_BUCKET.put('probe', 'same'))!;
   const second = await bindings.SITE_BUCKET.put('probe', 'replacement', { onlyIf: { etagMatches: first.etag, uploadedBefore: new Date(0) } });
   expect(second).not.toBeNull();
@@ -123,6 +123,10 @@ it('pauses committed activation immediately for missing migration evidence', asy
     expect(await state.storage.getAlarm()).toBeNull();
     const snapshot = (await instance.publicationRepairV1(undefined, origin)).result;
     expect(snapshot.recovery).toMatchObject({ state: 'damaged', publication_status: 'committed' });
+    await expect(instance.alarm()).resolves.toBeUndefined();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ blocked: { reason: 'rebuild_checkpoint_damaged' } });
+    expect(await instance.publicationRepairControlV1('cancel', { expected_version: snapshot.publication.version, expected_recovery_token: snapshot.recovery.recovery_token })).toMatchObject({ ok: false,
+      failure: { code: 'rebuild_checkpoint_damaged', publication_status: 'committed', details: { job_id: job.id } } });
     const committedVersion = snapshot.publication.version;
     await state.storage.put(checkpointKey(job.id), { version: 2, generation_id: job.generation_id, phase: 'dispatching', migration: { complete: true, processed: 1 } });
     await instance.publicationRepairControlV1('resume', { expected_version: snapshot.publication.version, expected_recovery_token: snapshot.recovery.recovery_token });
@@ -203,6 +207,158 @@ it('rejects pause provenance inconsistent with its retained handoff and preserve
   });
   expect(await publisher().publicationRepairV1(await input(), origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_checkpoint_damaged', stage: 'repair_pause_validation', publication_status: 'not_committed' } });
   expect(await publisher().publicationRepairV1(first, origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_checkpoint_damaged', publication_status: 'committed' } });
+  const index = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
+  expect(await publisher().publicationRepairV1({ expected_version: index.version, manifest: index.customMetadata!.manifest, rss: index.customMetadata!.rss, archives: index.customMetadata!.archives ?? null }, origin))
+    .toMatchObject({ ok: false, failure: { code: 'rebuild_checkpoint_damaged', publication_status: 'committed', details: { job_id: job.id } } });
   expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(before);
   await inside(publisher(), async (_instance, state) => expect(await state.storage.get('jobs')).toEqual([job.id]));
+});
+
+it('finishes a proven committed generation from its checkpoint without touching a different current index', async () => {
+  const job = await seed();
+  const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`job:${job.id}`, { ...job, recovery: { code: 'storage_error', stage: 'rebuild_finalize', retryable: true, publication_status: 'committed', failed_at: new Date().toISOString() } });
+    await state.storage.put(checkpointKey(job.id), { version: 2, generation_id: job.generation_id, phase: 'dispatching', migration: { complete: true, processed: 77 } });
+    const put = vi.spyOn(instance.env.SITE_BUCKET, 'put');
+    await instance.alarm();
+    expect(put).not.toHaveBeenCalled();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'completed' });
+    expect(await state.storage.get('migration')).toEqual({ complete: true, processed: 77 });
+    expect(await state.storage.get(checkpointKey(job.id))).toBeUndefined();
+  });
+  expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(before.version);
+});
+
+it.each(['prepared', 'wrong-generation', 'missing-migration', 'missing-checkpoint'])('keeps contradictory or incomplete committed evidence paused: %s', async fault => {
+  const job = await seed();
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`job:${job.id}`, { ...job, recovery: { code: 'storage_error', stage: 'rebuild_finalize', retryable: true, publication_status: 'committed', failed_at: new Date().toISOString() } });
+    if (fault !== 'missing-checkpoint') await state.storage.put(checkpointKey(job.id), { version: 2, generation_id: fault === 'wrong-generation' ? crypto.randomUUID() : job.generation_id, phase: fault === 'prepared' ? 'prepared' : 'dispatching' });
+    if (fault === 'missing-migration') await state.storage.put('migration', { complete: false, processed: 1 });
+    const put = vi.spyOn(instance.env.SITE_BUCKET, 'put');
+    await instance.alarm();
+    expect(put).not.toHaveBeenCalled();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ manual_resume: true, recovery: { code: 'rebuild_checkpoint_damaged', publication_status: 'committed' } });
+  });
+});
+
+it('stops an alarm after cancelling a repair that reserved an unscheduled head', async () => {
+  const job = await seed();
+  await inside(publisher(), async (_instance, state) => state.storage.deleteAlarm());
+  const payload = await input();
+  await inside(publisher(), async (instance, state) => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const fail = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => key === 'pages/index.html' ? Promise.reject(new Error('Uncertain write')) : put(key, ...args));
+    try { expect(await instance.publicationRepairV1(payload, origin)).toMatchObject({ ok: false, failure: { code: 'repair_pending' } }); }
+    finally { fail.mockRestore(); }
+    await put('pages/index.html', 'A different publication', { httpMetadata: { contentType: 'text/html' } });
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(Date.now() + 10000);
+    const writes = vi.spyOn(instance.env.SITE_BUCKET, 'put');
+    await instance.alarm();
+    expect(writes).not.toHaveBeenCalled();
+    expect(await state.storage.get(`job:${job.id}`)).toEqual(job);
+    expect(await state.storage.getAlarm()).toBeNull();
+    expect(await state.storage.get('publication_repair_pending')).toBeUndefined();
+  });
+});
+
+it('rejects an unrelated failed head before reading the homepage body', async () => {
+  const job = await seed(); const payload = await input();
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(`job:${job.id}`, { ...job, status: 'failed', error_code: 'render_failed' });
+    const get = vi.spyOn(instance.env.SITE_BUCKET, 'get');
+    expect(await instance.publicationRepairV1(payload, origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_blocked' } });
+    expect(get).not.toHaveBeenCalled();
+  });
+});
+
+it.each([
+  ['repair_pending', 'repair_pending', false],
+  ['repair_stalled', 'repair_stalled', true],
+  ['rebuild_checkpoint_damaged', 'rebuild_checkpoint_damaged', true],
+  ['repair_journal_damaged', 'repair_damaged', true],
+] as const)('classifies %s consistently in alarms, mutation gates, and job status', async (code, reason, stalled) => {
+  const job = await seed(); const payload = await input();
+  await inside(publisher(), async (instance, state) => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const failure = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation((key: any, ...args: any[]) => key === 'pages/index.html' ? Promise.reject(new Error('Uncertain dispatch')) : put(key, ...args));
+    try { await instance.publicationRepairV1(payload, origin); } finally { failure.mockRestore(); }
+    const key = (await state.storage.get<string>('publication_repair_pending'))!;
+    const record = await state.storage.get<any>(key);
+    if (code === 'repair_journal_damaged') await state.storage.delete(key);
+    else await state.storage.put(key, { ...record, stalled, last_error: { code, stage: 'repair_activation', retryable: false } });
+    if (code === 'repair_journal_damaged') await expect(instance.alarm()).rejects.toMatchObject({ code });
+    else await expect(instance.alarm()).resolves.toBeUndefined();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ blocked: { reason } });
+    await expect(instance.resumeRebuild(job.id)).rejects.toMatchObject({ code: 'repair_blocked' });
+  });
+});
+
+it('redelivers alarms when the active repair journal cannot be read', async () => {
+  await seed();
+  await inside(publisher(), async (instance, state) => {
+    const get = state.storage.get.bind(state.storage) as any;
+    const failure = vi.spyOn(state.storage, 'get').mockImplementation((key: any) => {
+      if (key === 'publication_repair_pending') throw new Error('Durable storage unavailable');
+      return get(key);
+    });
+    try { await expect(instance.alarm()).rejects.toMatchObject({ kind: 'storage' }); }
+    finally { failure.mockRestore(); }
+  });
+});
+
+it('recomputes prepared checkpoint bookkeeping during rebuild recovery', async () => {
+  const job = await seed();
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.put(checkpointKey(job.id), { version: 2, generation_id: job.generation_id, phase: 'prepared', migration: { complete: true, processed: 77, cursor: 'outdated' } });
+    await instance.alarm();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'completed' });
+    expect(await state.storage.get('migration')).toEqual({ complete: true, processed: 1 });
+    expect(await state.storage.get(checkpointKey(job.id))).toBeUndefined();
+  });
+});
+
+it('reports a newly committed repair and its identifiers when regeneration status cannot be read', async () => {
+  const job = await seed(); const payload = await input();
+  await inside(publisher(), async (instance, state) => {
+    await state.storage.deleteAlarm();
+    const get = state.storage.get.bind(state.storage) as any;
+    const failure = vi.spyOn(state.storage, 'get').mockImplementation((key: any) => {
+      if (Array.isArray(key) && key.length === 2 && key.includes(pauseKey(job.id))) throw new Error('Regeneration status unavailable');
+      return get(key);
+    });
+    let reply;
+    try { reply = await instance.publicationRepairV1(payload, origin); } finally { failure.mockRestore(); }
+    expect(reply).toMatchObject({ ok: false, failure: { code: 'storage_error', publication_status: 'committed',
+      details: { job_id: job.id, repair_id: expect.any(String) } } });
+    const index = (await bindings.SITE_BUCKET.head('pages/index.html'))!;
+    expect(index.customMetadata!.lakearrowhead_repair_id).toBe(reply.failure.details.repair_id);
+    expect(await state.storage.get('publication_repair_pending')).toBeUndefined();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ manual_resume: true });
+  });
+});
+
+it('retains committed certainty and identifiers when a control operation finalizes but its snapshot read fails', async () => {
+  await seed(); const payload = await input();
+  await inside(publisher(), async (instance, state) => {
+    const put = instance.env.SITE_BUCKET.put.bind(instance.env.SITE_BUCKET);
+    const lostAck = vi.spyOn(instance.env.SITE_BUCKET, 'put').mockImplementation(async (key: any, ...args: any[]) => {
+      const result = await put(key, ...args);
+      if (key === 'pages/index.html') throw new Error('Lost write acknowledgement');
+      return result;
+    });
+    try { await instance.publicationRepairV1(payload, origin); } finally { lostAck.mockRestore(); }
+    const snapshot = (await instance.publicationRepairV1(undefined, origin)).result;
+    const head = instance.env.SITE_BUCKET.head.bind(instance.env.SITE_BUCKET); let calls = 0;
+    const failure = vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => {
+      if (key === 'pages/index.html' && ++calls === 3) throw new Error('Control snapshot unavailable');
+      return head(key);
+    });
+    try {
+      expect(await instance.publicationRepairControlV1('cancel', { expected_version: snapshot.publication.version, expected_recovery_token: snapshot.recovery.recovery_token }))
+        .toMatchObject({ ok: false, failure: { code: 'storage_error', publication_status: 'committed', details: { job_id: snapshot.recovery.job_id, repair_id: snapshot.recovery.repair_id } } });
+    } finally { failure.mockRestore(); }
+    expect(await state.storage.get('publication_repair_pending')).toBeUndefined();
+  });
 });
