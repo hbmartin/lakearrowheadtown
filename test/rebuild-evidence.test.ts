@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { checkpointFor, readCheckpoint, readPause } from '../src/rebuild-evidence';
+import { checkpointFor, readCheckpoint, readPause, type GenerationHandoff } from '../src/rebuild-evidence';
 import type { RebuildJob } from '../src/types';
 
 const job: RebuildJob = { id: crypto.randomUUID(), generation_id: crypto.randomUUID(), status: 'running', phase: 'render',
@@ -17,10 +17,14 @@ it('preserves legacy checkpoints without assigning a generation', () => {
 });
 it('validates active pause provenance against the current generation', () => {
   const pause = { version: 1, generation_id: job.generation_id, repair_id: crypto.randomUUID(), code: 'unscheduled' };
-  expect(readPause(pause, job)).toEqual(pause);
-  expect(readPause(undefined, job)).toBeUndefined();
-  expect(() => readPause({ ...pause, generation_id: crypto.randomUUID() }, job)).toThrow(/provenance/);
-  expect(() => readPause({ ...pause, code: 'render_failed' }, job)).toThrow(/provenance/);
+  const handoff: GenerationHandoff = { version: 1, job_id: job.id, generation_id: job.generation_id!, repair_id: pause.repair_id,
+    prior_job: job, prior_checkpoint: null, prior_archive_checkpoint: null, prior_committed: false, repairable_code: 'unscheduled' };
+  expect(readPause(pause, job, handoff)).toEqual(pause);
+  expect(() => readPause(pause, job, undefined)).toThrow(/provenance/);
+  expect(() => readPause(pause, job, { ...handoff, repair_id: crypto.randomUUID() })).toThrow(/provenance/);
+  expect(readPause(undefined, job, undefined)).toBeUndefined();
+  expect(() => readPause({ ...pause, generation_id: crypto.randomUUID() }, job, handoff)).toThrow(/provenance/);
+  expect(() => readPause({ ...pause, code: 'render_failed' }, job, handoff)).toThrow(/provenance/);
 });
 it('attributes checkpoint validation to the operation inspecting it', () => {
   try { readCheckpoint({}, job, 'repair_rebuild_evidence'); throw new Error('Expected damage'); }

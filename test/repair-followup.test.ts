@@ -132,6 +132,8 @@ it('pauses committed activation immediately for missing migration evidence', asy
     expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(committedVersion);
     expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'queued', manual_resume: true });
     expect(await state.storage.get('jobs')).toEqual([job.id]);
+    await instance.resumeRebuild(job.id); await instance.alarm();
+    expect(await instance.jobStatus(job.id)).toMatchObject({ status: 'completed' });
   });
 });
 
@@ -188,4 +190,19 @@ it('rechecks alarm delivery after validating targets before reusing an initially
       expect((await instance.jobStatus(job.id)).manual_resume).toBeUndefined();
     } finally { release(); wait.mockRestore(); }
   });
+});
+it('rejects pause provenance inconsistent with its retained handoff and preserves accepted repair certainty', async () => {
+  const job = await seed();
+  await inside(publisher(), async (_instance, state) => state.storage.deleteAlarm());
+  const first = await input();
+  expect(await publisher().publicationRepairV1(first, origin)).toMatchObject({ ok: true });
+  const before = (await bindings.SITE_BUCKET.head('pages/index.html'))!.version;
+  await inside(publisher(), async (_instance, state) => {
+    const pause = await state.storage.get<any>(pauseKey(job.id));
+    await state.storage.put(pauseKey(job.id), { ...pause, repair_id: crypto.randomUUID() });
+  });
+  expect(await publisher().publicationRepairV1(await input(), origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_checkpoint_damaged', stage: 'repair_pause_validation', publication_status: 'not_committed' } });
+  expect(await publisher().publicationRepairV1(first, origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_checkpoint_damaged', publication_status: 'committed' } });
+  expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(before);
+  await inside(publisher(), async (_instance, state) => expect(await state.storage.get('jobs')).toEqual([job.id]));
 });

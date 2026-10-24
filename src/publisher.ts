@@ -272,10 +272,10 @@ export class DigestPublisher extends DurableObject<Env> {
       const unscheduled = prior && prior.status !== 'failed' && !isPaused(prior)
         && await trace.run('repair_alarm_read', () => boundary('storage', () => this.ctx.storage.getAlarm())) === null && !this.alarmDeliveries;
       if (prior && (prior.status === 'failed' || isPaused(prior) || unscheduled)) {
-        if (prior.generation_id) await trace.run('repair_generation_read', async () => readHandoff(
-          await boundary('storage', () => this.ctx.storage.get(generationKey(prior.id, prior.generation_id!))), prior, 'repair_generation_read'));
+        const previousHandoff = prior.generation_id ? await trace.run('repair_generation_read', async () => readHandoff(
+          await boundary('storage', () => this.ctx.storage.get(generationKey(prior.id, prior.generation_id!))), prior, 'repair_generation_read')) : undefined;
         const provenance = await trace.run('repair_pause_read', async () => readPause(
-          await boundary('storage', () => this.ctx.storage.get(pauseKey(prior.id))), prior));
+          await boundary('storage', () => this.ctx.storage.get(pauseKey(prior.id))), prior, previousHandoff));
         const code = prior.status === 'failed' ? prior.error_code : unscheduled ? 'unscheduled' : prior.recovery?.code ?? provenance?.code;
         if (!(repairableCodes.includes(code ?? '') || code === 'unscheduled') || isPaused(prior) && pauseReason(prior) === 'rebuild_checkpoint_damaged') {
           throw new HttpError(409, 'An unrelated or damaged rebuild blocks regeneration. Inspect its recovery evidence before resuming.', {}, { code: 'rebuild_blocked', details: { job_id: prior.id } });

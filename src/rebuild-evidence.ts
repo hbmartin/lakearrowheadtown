@@ -41,10 +41,11 @@ export function checkpointFor(job: RebuildJob, phase: 'prepared' | 'dispatching'
 // Active provenance is removed on resume; immutable handoffs are historical and
 // cannot establish that a later pause still belongs to the repair.
 export interface RepairPause { version: 1; generation_id: string; repair_id: string; code: string }
-export function readPause(value: unknown, job: RebuildJob): RepairPause | undefined {
+export function readPause(value: unknown, job: RebuildJob, handoff: GenerationHandoff | undefined): RepairPause | undefined {
   if (value === undefined) return;
   if (!record(value) || value.version !== 1 || value.generation_id !== job.generation_id || !validGeneration(value.generation_id)
-    || !validGeneration(value.repair_id) || !['unscheduled', ...repairableCodes].includes(String(value.code))) {
+    || !validGeneration(value.repair_id) || !['unscheduled', ...repairableCodes].includes(String(value.code))
+    || !handoff || handoff.repair_id !== value.repair_id || handoff.repairable_code !== value.code) {
     throw checkpointDamaged('Active repair pause provenance is damaged. Restore its exact private record before repairing this job.', 'repair_pause_validation');
   }
   return value as unknown as RepairPause;

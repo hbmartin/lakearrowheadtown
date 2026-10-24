@@ -252,7 +252,9 @@ export class RepairCoordinator {
   private async regenerationStatus(job: RebuildJob): Promise<{ regeneration_status?: 'awaiting_resume' }> {
     if (!['queued', 'running'].includes(job.status) || !isPaused(job) || pauseReason(job) === 'rebuild_checkpoint_damaged'
       || job.recovery && !repairableCodes.includes(job.recovery.code)) return {};
-    const provenance = readPause(await boundary('storage', () => this.storage.get(pauseKey(job.id))), job);
+    const evidence = await boundary('storage', () => this.storage.get([pauseKey(job.id), generationKey(job.id, job.generation_id ?? '')]));
+    const handoff = readHandoff(evidence.get(generationKey(job.id, job.generation_id ?? '')), job, 'repair_generation_read');
+    const provenance = readPause(evidence.get(pauseKey(job.id)), job, handoff);
     return provenance ? { regeneration_status: 'awaiting_resume' } : {};
   }
   async submit(input: RepairInput, origin: string, trace: OperationTrace, context?: OperationContext): Promise<RepairResult> {
@@ -317,6 +319,12 @@ export class RepairCoordinator {
     if (!saved || saved.state !== 'committed' || !saved.publication) throw pending(record);
     const job = await boundary('storage', () => this.storage.get<RebuildJob>(`job:${saved.job.id}`)) ?? saved.job;
     return { publication: saved.publication, repair_id: saved.id, unchanged: !worked && before?.state === 'committed', job, ...await this.regenerationStatus(job) };
-    } catch (error) { if (error instanceof HttpError) throw error; throw pending(record, trace.publication_status === 'committed' ? 'committed' : certainty(record)); }
+    } catch (error) {
+      if (error instanceof HttpError) {
+        if (error.publication_status !== undefined) throw error;
+        throw new HttpError(error.status, error.message, error.headers, { ...error, publication_status: certainty(record) });
+      }
+      throw pending(record, trace.publication_status === 'committed' ? 'committed' : certainty(record));
+    }
   }
 }
