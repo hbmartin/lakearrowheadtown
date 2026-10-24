@@ -24,11 +24,13 @@ export function safeFailure(error, secrets = [], seen = new Set()) {
   };
   const safeMessage = error instanceof ValidationError || error instanceof TransportError
     || error instanceof AssertionError && !error.generatedMessage;
+  // Node appends actual/expected diffs even to an explicitly messaged assertion.
+  const reason = error instanceof AssertionError ? error.message.split('\n', 1)[0] : error?.safeMessage ?? error?.message;
   const frames = (error instanceof Error ? error.stack ?? '' : '').split('\n').filter(line => /^\s+at /.test(line))
     .map(line => /(?:\(|at )([\w./@:-]+):(\d+):(\d+)\)?$/.exec(line)).filter(Boolean).slice(0, 12)
     .map(match => clean(`${match[1]}:${match[2]}:${match[3]}`));
   const result = { code: error instanceof ValidationError || error instanceof TransportError ? error.code : error instanceof AssertionError ? 'assertion_failed' : error instanceof AggregateError ? 'multiple_failures' : 'operation_failed',
-    message: safeMessage ? clean(error.safeMessage ?? error.message) : error instanceof AggregateError ? 'Multiple operation or cleanup failures' : 'Operation failed; inspect frames and causes', stack_frames: frames };
+    message: safeMessage ? clean(reason) : error instanceof AggregateError ? 'Multiple operation or cleanup failures' : 'Operation failed; inspect frames and causes', stack_frames: frames };
   if (Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599) result.http_status = error.status;
   if (error instanceof AggregateError) result.errors = error.errors.slice(0, 8).map(value => safeFailure(value, secrets, seen));
   if (error?.cause !== undefined) result.cause = safeFailure(error.cause, secrets, seen);

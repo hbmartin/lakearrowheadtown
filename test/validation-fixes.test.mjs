@@ -72,6 +72,10 @@ test('diagnostics expose fixed reasons and bounded causes without generated diff
   let generated;
   try { assert.equal(secret, 'expected'); } catch (error) { generated = error; }
   const processFailure = Object.assign(Error(secret), { stderr: Buffer.from(secret), stdout: secret });
+  let explicitlyMessaged;
+  try { assert.equal(secret, 'expected', 'Safe explicit reason'); } catch (error) { explicitlyMessaged = error; }
+  assert.equal(safeFailure(explicitlyMessaged).message, 'Safe explicit reason');
+  assert(!JSON.stringify(safeFailure(explicitlyMessaged)).includes(secret));
   const original = new ValidationError('candidate_superseded', `Candidate changed ${secret}`, { cause: processFailure });
   const summary = safeFailure(new AggregateError([original, generated]), [secret]);
   assert.equal(summary.errors[0].code, 'candidate_superseded');
