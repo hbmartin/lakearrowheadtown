@@ -1,12 +1,14 @@
 import { settledInOrder } from './batches';
-import { boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply, publicationFailure, type ValidationIssue } from './errors';
 import { emit, OperationTrace, safeError } from './diagnostics';
+import { boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply, publicationFailure } from './errors';
 import { localDate, recentDates } from './feed';
 import { canonicalJson, fingerprint, record } from './primitives';
-import { eventData, eventRows, refsBinding, validSyncIndexKey, writeSyncIndex, type SyncRow } from './sync-index';
-import { isDate, isTimestamp, validateDigest } from './validation';
-import { digestItemWarnings } from './warnings';
+import { eventSchema } from './schemas/events';
+import { parseSchema } from './schemas/shared';
+import { eventData, refsBinding, validSyncIndexKey, writeSyncIndex, type SyncRow } from './sync-index';
 import type { ContentBucket, DigestItem, OperationContext, PostReference, PublishReply, PublishResult, StoryIdentity } from './types';
+import { isDate, isTimestamp } from './validation';
+import { digestItemWarnings } from './warnings';
 
 export interface EventItem extends DigestItem {
   starts_at: string;
@@ -27,36 +29,7 @@ const eventKey = (post: Pick<PostReference, 'date' | 'id'>) => `events/batches/$
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 
 export function validateEvents(value: unknown): EventDigest {
-  // Share the post fields, URL rules and bounded field-level error format.
-  let digest: ReturnType<typeof validateDigest> | undefined;
-  const issues: ValidationIssue[] = []; let issueCount = 0;
-  try { digest = validateDigest(value, { requireItems: true }); }
-  catch (error) { if (!(error instanceof HttpError) || error.status !== 400) throw error; if (Array.isArray(error.details)) issues.push(...error.details); else throw error; issueCount = issues.length + (error.details_truncated ? 1 : 0); }
-  const inputs = record(value) && Array.isArray(value.items) ? value.items : [];
-  const invalid = (path: string, code: string, message: string) => {
-    issueCount++;
-    if (issues.length < 50) issues.push({ path, code, message });
-  };
-  const items = inputs.flatMap((raw, i): EventItem[] => {
-    if (!record(raw)) return [];
-    const input = raw; const item = digest?.items[i] ?? {} as DigestItem;
-    const field = (name: string) => `items[${i}].${name}`;
-    if (input.all_day !== undefined && typeof input.all_day !== 'boolean') invalid(field('all_day'), 'invalid_type', 'Expected a boolean.');
-    const all_day = input.all_day === true;
-    const validTime = (time: unknown): time is string => all_day ? typeof time === 'string' && isDate(time) : isTimestamp(time);
-    const message = all_day ? 'Expected a real YYYY-MM-DD date for an all-day event.' : 'Expected an ISO timestamp with an explicit timezone for a timed event.';
-    if (!validTime(input.starts_at)) invalid(field('starts_at'), 'invalid_timestamp', message);
-    if (input.ends_at !== undefined) {
-      if (!validTime(input.ends_at)) invalid(field('ends_at'), 'invalid_timestamp', message);
-      else if (validTime(input.starts_at) && Date.parse(input.ends_at) <= Date.parse(input.starts_at)) invalid(field('ends_at'), 'invalid_range', 'ends_at must be later than starts_at; all-day end dates are exclusive.');
-    }
-    if (input.location !== undefined && typeof input.location !== 'string') invalid(field('location'), 'invalid_type', 'Expected a string.');
-    return [{ ...item, starts_at: input.starts_at as string, all_day,
-      ...(input.ends_at === undefined ? {} : { ends_at: input.ends_at as string }),
-      ...(input.location === undefined ? {} : { location: input.location as string }) }];
-  });
-  if (issueCount) throw new HttpError(400, 'Event validation failed', {}, { code: 'validation_failed', details: issues, details_truncated: issueCount > issues.length });
-  return { title: digest!.title, source: digest!.source, items };
+  return parseSchema(eventSchema, value, 'Event validation failed', 'digest');
 }
 
 export function addDays(date: string, count: number): string {
