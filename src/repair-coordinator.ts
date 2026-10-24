@@ -2,6 +2,7 @@ import { asHttpError, boundary, HttpError } from './errors';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { fingerprint, record as object } from './primitives';
 import { prepareWrites } from './prepared-writes';
+import { decodeIndex } from './index-fence';
 import { PublicationConflict } from './publication-conflict';
 import { validateIndexMetadata } from './index-metadata';
 import { checkpointKey, completeMigration, generationKey, pauseKey, readPause, readCheckpoint, checkpointDamaged, repairableCodes, readHandoff, receiptMatches, type GenerationHandoff } from './rebuild-evidence';
@@ -156,21 +157,23 @@ export class RepairCoordinator {
     if (index.version !== record.input.expected_version) throw pending(record);
     return false;
   }
-  private async attempt(record: RepairRecord, trace: OperationTrace) {
+  private async attempt(record: RepairRecord, trace: OperationTrace, validated?: { index: R2Object; bytes: ArrayBuffer }) {
     const uncertain = certainty(record) !== 'not_committed';
     let body: R2ObjectBody | null = null;
     try {
       const head = await trace.run('repair_index_loading', () => boundary('storage', () => this.bucket.head('pages/index.html')));
       if (await this.reconcile(record, head, trace, uncertain)) return;
-      const index = await boundary('storage', () => this.bucket.get('pages/index.html'));
-      body = index;
+      const cached = validated && head?.version === validated.index.version && head.etag === validated.index.etag ? validated : undefined;
+      const index = cached?.index ?? await boundary('storage', () => this.bucket.get('pages/index.html'));
+      body = cached ? null : index as R2ObjectBody | null;
       if (await this.reconcile(record, index, trace, uncertain)) return;
       if (!index) return;
       const metadata = repairMetadata(index, record);
       const prepared = prepareWrites(this.bucket, trace, record.id);
       let committed: R2Object;
       try {
-        const bytes = await trace.run('repair_body_loading', () => boundary('storage', () => index.arrayBuffer()));
+        const bytes = cached?.bytes ?? await trace.run('repair_body_loading', () => boundary('storage', () => (index as R2ObjectBody).arrayBuffer()));
+        await trace.run('repair_representation_validation', () => decodeIndex(bytes, index.httpMetadata, true));
         await trace.run('index_write', () => prepared.bucket.put('pages/index.html', bytes, { httpMetadata: index.httpMetadata, customMetadata: metadata }));
         record.phase = 'writing';
         await trace.run('repair_dispatch', () => boundary('storage', () => this.storage.put(record.key, record)));
@@ -275,6 +278,15 @@ export class RepairCoordinator {
       if (index.version !== input.expected_version) throw publicationChanged();
       const id = crypto.randomUUID();
       repairMetadata(index, { id, input });
+      const validated = await trace.run('repair_representation_validation', async () => {
+        const object = await boundary('storage', () => this.bucket.get('pages/index.html'));
+        try {
+          if (!object || object.version !== index.version || object.etag !== index.etag) throw publicationChanged();
+          const bytes = await boundary('storage', () => object.arrayBuffer());
+          decodeIndex(bytes, object.httpMetadata, true);
+          return { index: object, bytes };
+        } finally { if (object && !object.bodyUsed) await object.body.cancel().catch(() => {}); }
+      });
       const { job, handoff } = await this.reserve(origin, trace, context, index, id);
       const migration = await boundary('storage', () => this.storage.get<{ complete: boolean; processed: number }>('migration'));
       await trace.run('repair_validation', () => validateRepairTargets(this.bucket, input, migration?.complete ?? false));
@@ -297,7 +309,7 @@ export class RepairCoordinator {
         emit('repair_preparation_failed', context, { ...safeError(error), error_code: asHttpError(error).code }, 'error');
         throw pending(saved);
       }
-      await this.attempt(record, trace); worked = true;
+      await this.attempt(record, trace, validated); worked = true;
     }
     try {
     const saved = (await boundary('storage', () => this.storage.get<RepairRecord>(key)))!;

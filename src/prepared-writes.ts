@@ -1,7 +1,7 @@
 import { boundary } from './errors';
 import { indexCondition, PublicationConflict } from './publication-conflict';
 import { OperationTrace } from './diagnostics';
-import { fenceIndex } from './index-fence';
+import { fencedIndexBytes } from './index-fence';
 import type { ContentBucket } from './types';
 
 // All source, renderer-cache, archive, and snapshot writes first land here.
@@ -19,7 +19,7 @@ export function prepareWrites(bucket: ContentBucket, trace: OperationTrace, fenc
     async put(key, value, options) {
       let bytes = typeof value === 'string' ? new TextEncoder().encode(value)
         : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice() : new Uint8Array(value).slice();
-      if (key === 'pages/index.html') bytes = new TextEncoder().encode(fenceIndex(new TextDecoder().decode(bytes), fenceToken));
+      if (key === 'pages/index.html') bytes = fencedIndexBytes(bytes, options?.httpMetadata, fenceToken);
       const object = {
         key, size: bytes.byteLength, uploaded: new Date(), customMetadata: options?.customMetadata,
         text: async () => new TextDecoder().decode(bytes), arrayBuffer: async () => bytes.slice().buffer,
