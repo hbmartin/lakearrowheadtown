@@ -11,7 +11,7 @@ export interface RepairPointers { manifest: string; rss: string; archives: strin
 export interface RepairInput extends RepairPointers { expected_version: string }
 export interface PublicationHead { version: string; manifest: string | null; rss: string | null; archives: string | null }
 export interface RecoverySummary { state: 'pending' | 'stalled' | 'damaged'; recovery_token: string; publication_status: import('./types').PublicationStatus; attempts: number; repair_id?: string; job_id?: string; next_retry_at?: string; last_error?: { code: string; stage: string; retryable: boolean } }
-export interface RepairResult { recovery?: RecoverySummary | null; publication: PublicationHead; unchanged: boolean; repair_id?: string; job?: RebuildJob }
+export interface RepairResult { regeneration_status?: 'awaiting_resume'; recovery?: RecoverySummary | null; publication: PublicationHead; unchanged: boolean; repair_id?: string; job?: RebuildJob }
 export type RepairReply = { ok: true; result: RepairResult } | { ok: false; failure: PublishFailure };
 
 export function publicationHead(index: R2Object): PublicationHead {
@@ -59,7 +59,9 @@ export function isRepairReply(value: unknown): value is RepairReply {
   const result = value.result;
   if (value.ok !== true || !record(result) || typeof result.unchanged !== 'boolean' || !record(result.publication)) return false;
   const head = result.publication;
-  return (result.repair_id === undefined || typeof result.repair_id === 'string' && /^[a-f0-9-]{36}$/.test(result.repair_id))
+  return (result.regeneration_status === undefined || result.regeneration_status === 'awaiting_resume'
+    && record(result.job) && ['queued', 'running'].includes(String(result.job.status)) && (result.job.manual_resume === true || result.job.scheduling === 'manual'))
+    && (result.repair_id === undefined || typeof result.repair_id === 'string' && /^[a-f0-9-]{36}$/.test(result.repair_id))
     && typeof head.version === 'string' && !!head.version && ['manifest', 'rss', 'archives'].every(key => head[key] === null || typeof head[key] === 'string')
     && (result.job === undefined || record(result.job) && typeof result.job.id === 'string' && /^[a-f0-9-]{36}$/.test(result.job.id)
       && ['queued', 'running', 'completed', 'failed'].includes(String(result.job.status)));

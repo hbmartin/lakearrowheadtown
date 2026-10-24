@@ -7,6 +7,7 @@ import { checkEnvironment, readPublishingCredential, validateCredential } from '
 const defaults = { preview: 'https://lakearrowheadtown-preview.harold-martin.workers.dev', production: 'https://lakearrowhead.town' };
 const retryDeadline = Symbol('monotonic retry deadline');
 const permanentApplicationError = Symbol('validated permanent application error');
+const responseFailure = Symbol('maintenance response failure');
 const monotonic = options => (options.now ?? (() => performance.now()))();
 function withTiming(value, response, retryAt, options) {
   const server = Date.parse(response.headers.get('Date'));
@@ -56,12 +57,14 @@ export async function maintenance(operation, environment, id, options = {}) {
   try { result = await response.json(); }
   catch {
     const failure = new Error(response.ok ? `Invalid maintenance response (${response.status}): expected JSON` : `Maintenance request failed (${response.status}): non-JSON response`);
+    failure[responseFailure] = true;
     failure.status = response.status;
     failure.retryable = response.ok || response.status >= 500;
     throw withTiming(failure, response, undefined, options);
   }
   if (!response.ok) {
     const failure = new Error(`Maintenance request failed (${response.status}${typeof result?.code === 'string' ? ` ${result.code}` : ''}): ${typeof result?.error === 'string' ? result.error : 'Unknown error'}`);
+    failure[responseFailure] = true;
     failure.code = result?.code;
     failure.retryAt = result?.retry_at;
     failure.retryable = result?.retryable === true;
@@ -73,13 +76,18 @@ export async function maintenance(operation, environment, id, options = {}) {
     failure.status = response.status;
     throw withTiming(failure, response, failure.retryAt, options);
   }
+  const malformed = message => Object.assign(new Error(`Invalid maintenance response (${response.status}): ${message}`), { [responseFailure]: true, status: response.status, retryable: true });
   if (repairing) {
     const head = result?.publication;
-    if (!head || typeof head.version !== 'string' || !head.version || !['manifest', 'rss', 'archives'].every(key => head[key] === null || typeof head[key] === 'string')) throw new Error(`Invalid maintenance response (${response.status}): expected a publication snapshot`);
+    if (!head || typeof head.version !== 'string' || !head.version || !['manifest', 'rss', 'archives'].every(key => head[key] === null || typeof head[key] === 'string')) throw malformed('expected a publication snapshot');
+    if (result.regeneration_status !== undefined && (result.regeneration_status !== 'awaiting_resume' || !result.job
+      || !/^[a-f0-9-]{36}$/.test(result.job.id ?? '') || !['queued', 'running'].includes(result.job.status)
+      || !(result.job.manual_resume === true || result.job.scheduling === 'manual') || result.job.blocked_by
+      || result.job.blocked && result.job.blocked.reason !== 'manual_resume')) throw malformed('invalid regeneration status');
     if (result.job) withTiming(result.job, response, result.job.blocked?.retry_at ?? result.job.next_retry_at, options);
     return result;
   }
-  if (typeof result?.job?.id !== 'string' || !/^[a-f0-9-]{36}$/.test(result.job.id) || !['queued', 'running', 'completed', 'failed'].includes(result.job.status)) throw new Error(`Invalid maintenance response (${response.status}): expected a rebuild job`);
+  if (typeof result?.job?.id !== 'string' || !/^[a-f0-9-]{36}$/.test(result.job.id) || !['queued', 'running', 'completed', 'failed'].includes(result.job.status)) throw malformed('expected a rebuild job');
   return withTiming(result.job, response, result.job.blocked?.retry_at ?? result.job.next_retry_at, options);
 }
 const blocked = job => job.blocked?.reason ? job.blocked.reason !== 'repair_pending' : Boolean(job.manual_resume || job.blocked_by);
@@ -115,8 +123,8 @@ function completedJob(job) {
 function waitTimeout(job, cause) {
   return new Error(`Rebuild ${job.id} exceeded the wait deadline; completion remains unconfirmed (last status: ${job.blocked?.reason ?? job.status}). Inspect its status; no resume was issued.`, cause ? { cause } : undefined);
 }
-function statusFailure(job, cause, awaitingActivation = false) {
-  return repairFollowFailure(`Rebuild ${job.id} status check failed (last status: ${awaitingActivation ? 'awaiting activation' : job.blocked?.reason ?? job.status}). ${cause.message}`, cause);
+function statusFailure(job, cause) {
+  return repairFollowFailure(`Rebuild ${job.id} status check failed (last status: ${job.blocked?.reason ?? job.status}). ${cause.message}`, cause);
 }
 async function finalStatus(job, environment, deadline, options, awaitingActivation = false) {
   const remaining = Math.ceil(deadline + 30000 - monotonic(options));
@@ -129,7 +137,7 @@ async function finalStatus(job, environment, deadline, options, awaitingActivati
   } catch (error) {
     if (monotonic(options) <= deadline + 30000 && error[permanentApplicationError]
       && !(awaitingActivation && error.status === 404 && error.code === 'job_not_found')) {
-      throw statusFailure(job, error, awaitingActivation);
+      throw statusFailure(job, error);
     }
     throw waitTimeout(job, error);
   }
@@ -146,7 +154,7 @@ async function followJob(job, environment, deadline, options) {
       job = await maintenance('status', environment, job.id, { ...options, requestTimeoutMs: Math.max(1, Math.ceil(deadline - monotonic(options))) });
       attempts = 0; retry = undefined; options.onProgress?.(job);
     } catch (error) {
-      if (!error.transport && !error.retryable) throw statusFailure(job, error);
+      if (error[permanentApplicationError] || !error.transport && !error[responseFailure]) throw statusFailure(job, error);
       attempts++; retry = error; options.onRetry?.(error, job);
     }
   }
@@ -187,6 +195,7 @@ export async function repairAndFollow(environment, file, options = {}) {
   }
   jobId = result.job?.id;
   options.onProgress?.(result);
+  if (result.regeneration_status === 'awaiting_resume') return result;
   if (result.job) {
     try {
       result.job = await followJob(result.job, environment, deadline, { ...options,
@@ -203,7 +212,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     if (operation === 'repair') {
       const extra = process.argv.slice(5);
       if (extra.length && (extra.length !== 2 || extra[0] !== '--timeout-ms' || !/^[1-9][0-9]*$/.test(extra[1]))) throw new Error('Use --timeout-ms <positive integer>');
-      await repairAndFollow(environment, id, { ...(extra.length ? { timeoutMs: Number(extra[1]) } : {}), onProgress: value => console.log(JSON.stringify(value, null, 2)) });
+      const result = await repairAndFollow(environment, id, { ...(extra.length ? { timeoutMs: Number(extra[1]) } : {}), onProgress: value => console.log(JSON.stringify(value, null, 2)) });
+      if (result.regeneration_status === 'awaiting_resume') console.log(`Repair committed; rebuild ${result.job.id} awaits explicit resume. Regeneration is not complete; resume it after review and verify completion.`);
     }
     else {
       const result = await maintenance(operation, environment, id);

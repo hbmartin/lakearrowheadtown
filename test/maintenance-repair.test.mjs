@@ -108,7 +108,7 @@ test('transient status errors retry while permanent status errors retain committ
   assert.equal(result.job.status, 'completed'); assert.equal(progress[1].job_id, id);
   calls = 0;
   await assert.rejects(repairAndFollow('preview', undefined, { ...options, payload, sleep: advance, request: async () => ++calls === 1
-    ? Response.json({ publication, job: { id, status: 'queued' } }) : Response.json({ error: 'Job unavailable' }, { status: 404 }) }),
+    ? Response.json({ publication, job: { id, status: 'queued' } }) : Response.json({ error: 'Job unavailable', code: 'job_not_found', retryable: false }, { status: 404 }) }),
     error => error.message.includes(`Repair committed; rebuild ${id}`) && error.message.includes('404'));
 });
 
@@ -298,4 +298,43 @@ test('submission timeout with a committed job performs only a final GET and pres
         : Response.json({ job: { id, status: 'completed' } });
     } }), /repair result remains unconfirmed.*Final rebuild status: completed/);
   assert.deepEqual(methods, ['POST', 'GET']);
+});
+
+test('repair succeeds with explicit pending regeneration when its current generation retains a verified pause', async () => {
+  const timing = fakeClock(); const calls = [];
+  const job = { id, status: 'queued', manual_resume: true, scheduling: 'manual', pause_reason: 'manual_resume' };
+  const result = await repairAndFollow('preview', undefined, { ...options, ...timing, payload, request: async (url, init) => {
+    calls.push({ url, method: init.method });
+    return Response.json({ publication, repair_id: id, job, regeneration_status: 'awaiting_resume' });
+  } });
+  assert.equal(result.regeneration_status, 'awaiting_resume'); assert.equal(result.job.status, 'queued');
+  assert.equal(calls.length, 1); assert.equal(calls[0].method, 'POST'); assert.deepEqual(timing.waits, []);
+  await assert.rejects(waitForRebuild(job, 'preview', { ...options, ...timing }), /failed or is blocked/);
+});
+for (const [name, reply] of [
+  ['html-403', () => new Response('<html>Forbidden</html>', { status: 403 })],
+  ['html-429', () => new Response('<html>Rate limited</html>', { status: 429, headers: { 'Retry-After': '5' } })],
+  ['missing-retryability', () => Response.json({ code: 'edge_error', error: 'Indeterminate' }, { status: 403 })],
+  ['malformed-application', () => Response.json({ error: 'No code', retryable: false }, { status: 401 })],
+  ['malformed-success', () => Response.json({ unexpected: true })],
+]) {
+  test(`ordinary status polling retries ${name} within its deadline`, async () => {
+    const timing = fakeClock(); let calls = 0;
+    const result = await waitForRebuild({ id, status: 'running' }, 'preview', { ...options, ...timing, timeoutMs: 10000,
+      request: async (_url, init) => { assert.equal(init.method, 'GET'); return ++calls === 1 ? reply() : Response.json({ job: { id, status: 'completed' } }); } });
+    assert.equal(result.status, 'completed'); assert.equal(calls, 2);
+    if (name === 'html-429') assert.deepEqual(timing.waits, [1000, 5000]);
+  });
+}
+test('ordinary indeterminate errors reach one final check and remain unconfirmed', async () => {
+  const timing = fakeClock(); let calls = 0;
+  await assert.rejects(waitForRebuild({ id, status: 'running' }, 'preview', { ...options, ...timing, timeoutMs: 2500,
+    request: async () => { calls++; return new Response('Forbidden', { status: 403 }); } }), error => error.message.includes(id) && error.message.includes('unconfirmed'));
+  assert.equal(calls, 2); assert.equal(timing.now(), 2500);
+});
+test('repair refuses malformed awaiting-resume markers', async () => {
+  for (const job of [{ id, status: 'completed' }, { id, status: 'queued' }, { id, status: 'queued', manual_resume: true, blocked_by: id }]) {
+    await assert.rejects(maintenance('repair', 'preview', undefined, { ...options, payload,
+      request: async () => Response.json({ publication, job, regeneration_status: 'awaiting_resume' }) }), /invalid regeneration status/);
+  }
 });

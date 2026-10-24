@@ -187,7 +187,7 @@ it('rejects an unrelated failed head before any candidate content reads', async 
   await inside(publisher(), async (instance, state) => {
     await state.storage.put(`job:${job.id}`, { ...job, status: 'failed', error_code: 'render_failed' });
     const get = vi.spyOn(instance.env.SITE_BUCKET, 'get');
-    try { expect(await instance.publicationRepairV1(input, origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_blocked' } }); expect(get).not.toHaveBeenCalled(); }
+    try { expect(await instance.publicationRepairV1(input, origin)).toMatchObject({ ok: false, failure: { code: 'rebuild_blocked' } }); expect(get.mock.calls.every(([key]) => key === 'pages/index.html')).toBe(true); }
     finally { get.mockRestore(); }
   });
 });
@@ -368,13 +368,14 @@ it('never attributes a blocking repair commit to a different request', async () 
   const other = await request({ ...input, manifest: `publications/${crypto.randomUUID()}.json` });
   expect(await other.json()).toMatchObject({ code: 'repair_blocked', publication_status: 'not_committed', details: { blocking_repair: { repair_id: expect.any(String) } } });
 });
-it.each([undefined, 'automatic'] as const)('does not revive an unrelated unscheduled rebuild with scheduling=%s', async scheduling => {
+it.each([undefined, 'automatic'] as const)('reuses unscheduled rebuilds without reviving them, scheduling=%s', async scheduling => {
   const { input } = await seed(); const id = crypto.randomUUID();
   await inside(publisher(), async (_, state) => {
     await state.storage.put('jobs', [id]); await state.storage.put(`job:${id}`, { id, origin, status: 'running', phase: 'render', processed: 0, ...(scheduling ? { scheduling } : {}), created_at: new Date().toISOString() }); await state.storage.deleteAlarm();
   });
   const repaired = await (await request(input)).json<any>(); expect(repaired.ok).toBe(true);
-  expect(await publisher().jobStatus(repaired.job.id)).toMatchObject({ status: 'queued', blocked_by: id });
+  expect(repaired).toMatchObject({ regeneration_status: 'awaiting_resume', job: { id, status: 'queued', manual_resume: true } });
+  expect(await publisher().jobStatus(id)).toMatchObject({ blocked: { reason: 'manual_resume' } });
   await inside(publisher(), async (_, state) => { expect(await state.storage.getAlarm()).toBeNull(); expect(await state.storage.get(`job:${id}`)).toMatchObject({ manual_resume: true }); });
 });
 it('propagates a failed recovery backoff write instead of acknowledging alarm delivery', async () => {
@@ -702,7 +703,7 @@ it('recovery routing survives renamed diagnostic stages and logs transient failu
       return run.call(this, stage === 'rebuild_finalization_read' ? 'renamed_checkpoint_inspection' : stage, action, fields);
     });
     const get = state.storage.get.bind(state.storage) as any;
-    const readFault = vi.spyOn(state.storage, 'get').mockImplementation((key: any) => { if (key === `rebuild-finalization:${queued.id}`) throw new Error('Private checkpoint outage'); return get(key); });
+    const readFault = vi.spyOn(state.storage, 'get').mockImplementation((key: any) => { if ((Array.isArray(key) ? key : [key]).includes(`rebuild-finalization:${queued.id}`)) throw new Error('Private checkpoint outage'); return get(key); });
     const writeFault = vi.spyOn(state.storage, 'transaction').mockRejectedValue(new Error('Private diagnostics outage'));
     try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { renamed.mockRestore(); readFault.mockRestore(); writeFault.mockRestore(); }
     expect(events).toContainEqual(expect.objectContaining({ event: 'rebuild_finalization_pending', stage: 'renamed_checkpoint_inspection', error_code: 'storage_error', publication_status: 'unknown' }));
@@ -731,7 +732,7 @@ it('clears inspection-only uncertainty across eviction and lets a related repair
   await inside(publisher(), async (instance, state) => {
     const get = state.storage.get.bind(state.storage) as any;
     const fault = vi.spyOn(state.storage, 'get').mockImplementation((key: any) => {
-      if (key === `rebuild-finalization:${job.id}`) throw new Error('Private checkpoint outage'); return get(key);
+      if ((Array.isArray(key) ? key : [key]).includes(`rebuild-finalization:${job.id}`)) throw new Error('Private checkpoint outage'); return get(key);
     });
     await state.storage.deleteAlarm();
     try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { fault.mockRestore(); }
@@ -794,7 +795,8 @@ it('does not reuse historical checkpoint damage as the reason for an unrelated r
     const resumed = await instance.resumeRebuild(job.id); expect(resumed.pause_reason).toBeUndefined();
     await state.storage.deleteAlarm();
     expect(await instance.publicationRepairV1(input, origin)).toMatchObject({ ok: true });
-    expect(await instance.jobStatus(job.id)).toMatchObject({ pause_reason: 'manual_resume', blocked: { reason: 'manual_resume' }, recovery: { code: 'rebuild_checkpoint_damaged' } });
+    expect(await instance.jobStatus(job.id)).toMatchObject({ pause_reason: 'manual_resume', blocked: { reason: 'manual_resume' } });
+    expect((await instance.jobStatus(job.id)).recovery).toBeUndefined();
   });
 });
 

@@ -6,7 +6,7 @@ import { renderPage } from './render';
 import { indexCondition, PublicationConflict } from './publication-conflict';
 import { validateWeather, WEATHER_KEY, weatherTime, renderWeather } from './weather';
 import { NEWS_ANCHOR, validateIndexMetadata } from './index-metadata';
-import { fenceIndex } from './index-fence';
+import { decodeIndex, fencedIndexBytes } from './index-fence';
 import type { ContentBucket, OperationContext } from './types';
 
 const marker = /<!-- conditions:start -->[\s\S]*?<!-- conditions:end -->/;
@@ -67,7 +67,7 @@ export function replaceConditions(html: string, conditions: string): string {
 /** A derived homepage write: all committed news references and dates survive. */
 export async function composeHomepageConditions(bucket: R2Bucket, origin: string, context?: OperationContext): Promise<boolean> {
   const index = await boundary('storage', () => bucket.get('pages/index.html'));
-  const base = index ? await boundary('storage', () => index.text()) : renderPage([], { origin });
+  const base = index ? decodeIndex(await boundary('storage', () => index.arrayBuffer()), index.httpMetadata) : renderPage([], { origin });
   const snapshot = await conditionsSnapshot(bucket, context);
   const rendered = replaceConditions(base, snapshot.html);
   const previous = marker.exec(base)?.[0];
@@ -83,7 +83,7 @@ export async function composeHomepageConditions(bucket: R2Bucket, origin: string
   if (snapshot.available) delete metadata.conditions_status; else metadata.conditions_status = 'unavailable';
   if (body === base && JSON.stringify(metadata) === JSON.stringify(index?.customMetadata ?? {})) return snapshot.available;
   validateIndexMetadata(metadata);
-  const result = await boundary('storage', () => bucket.put('pages/index.html', fenceIndex(body), {
+  const result = await boundary('storage', () => bucket.put('pages/index.html', fencedIndexBytes(new TextEncoder().encode(body), index?.httpMetadata), {
     onlyIf: indexCondition(index), customMetadata: metadata,
     httpMetadata: { ...index?.httpMetadata, contentType: 'text/html; charset=utf-8', cacheControl: 'public, max-age=0, must-revalidate' },
   }));
