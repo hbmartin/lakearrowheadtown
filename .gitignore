@@ -9,3 +9,4 @@ coverage/
 .secrets/
 /triage_decisions.db
 /reviews_triage/*.json
+/worker-configuration.d.ts

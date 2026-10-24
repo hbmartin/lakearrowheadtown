@@ -225,6 +225,30 @@ Credential saves always use single-quoted dotenv assignments and verify that the
 
 ## Local development and verification
 
+### API implementation
+
+`src/worker.ts` dispatches `/api` and `/api/*` to the Hono v4 application in
+`src/http/api.ts`. Feature modules register digest, post, event, alert, change,
+image-upload, and maintenance routes. Public serving and the scheduled weather
+handler remain in the Worker. Request services resolve bindings lazily, and the
+shared lifecycle preserves API v3 diagnostics, response headers, and publication
+certainty. Method checks intentionally retain each endpoint's existing order
+relative to authentication; raw encoded identities and unsupported `HEAD`
+requests also retain their existing behavior.
+
+Zod v4 schemas live in `src/schemas/`. The existing validator exports delegate to
+these schemas so HTTP, publishing, and legacy stored-data readers use the same
+rules. Bounded body reading and UTF-8/JSON parsing happen before Zod; schema errors
+map to the existing API v3 field diagnostics. Confirmation envelopes are validated
+separately from individual items so a bad item does not reject the whole batch.
+
+Run `npm run cf-typegen` after changing Wrangler bindings. `npm run typecheck`
+regenerates ignored `worker-configuration.d.ts` before checking application and
+test types, including in CI. Runtime and binding declarations come from Wrangler;
+the application type only adds secret typing and optional configuration handling.
+No API version, client, storage format, or deployment-configuration change is
+required for the Hono migration.
+
 Create a local preview credential without changing any remote secret:
 
 ```sh

@@ -52,3 +52,39 @@ it('passes percent-encoded identity segments to RPC unchanged', async () => {
   expect(read).toHaveBeenCalledWith('', expect.any(Object), '%61%2Fb');
 });
 
+it('isolates request services, credentials and diagnostics across concurrent requests', async () => {
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const contexts: Array<{ request_id: string; environment: string }> = [];
+  const read = (wait: boolean) => async (_query: string, context: typeof contexts[number]) => {
+    contexts.push(context);
+    if (wait) await pending;
+    return { ok: true, result: { days: 30, as_of: '2026-10-24T12:00:00Z', published_at: null, events: [] } };
+  };
+  const bindings = (name: string, wait: boolean) => ({ ...env, API_SECRET: secret + name, ENVIRONMENT: name, CF_VERSION_METADATA: { id: name }, PUBLISHER: { getByName: () => ({ readEventsV1: read(wait) }) } }) as unknown as Env;
+  const request = (name: string) => new Request('https://lakearrowhead.town/api/events', { headers: { Authorization: `Bearer ${secret}${name}` } });
+  const first = worker.fetch(request('first'), bindings('first', true));
+  const second = await worker.fetch(request('second'), bindings('second', false));
+  release();
+  const responses = [await first, second];
+  for (const [i, name] of ['first', 'second'].entries()) {
+    expect(responses[i].status).toBe(200);
+    const id = responses[i].headers.get('X-Request-ID');
+    expect(responses[i].headers.get('X-Worker-Version')).toBe(name);
+    expect((await responses[i].json<any>()).request_id).toBe(id);
+    expect(contexts.find(context => context.request_id === id)?.environment).toBe(name);
+    expect(logs.filter(log => log.event === 'request_completed' && log.request_id === id)).toHaveLength(1);
+  }
+  expect(contexts[0].request_id).not.toBe(contexts[1].request_id);
+});
+
+it('normalizes non-Error failures without losing finalization or leaking the thrown value', async () => {
+  const bindings = { ...env, get API_SECRET(): string { throw 'sensitive unexpected value'; } } as unknown as Env;
+  const response = await worker.fetch(new Request('https://lakearrowhead.town/api/posts'), bindings);
+  expect(response.status).toBe(500);
+  const body: any = await response.json();
+  expect(body.request_id).toBe(response.headers.get('X-Request-ID'));
+  expect(logs.filter(log => log.event === 'request_completed')).toHaveLength(1);
+  expect(logs.filter(log => log.event === 'request_error')).toHaveLength(1);
+  expect(JSON.stringify([body, logs])).not.toContain('sensitive unexpected value');
+});
