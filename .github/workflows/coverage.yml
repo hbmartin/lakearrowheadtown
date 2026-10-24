@@ -45,6 +45,7 @@ jobs:
             .artifacts/
             coverage/
           retention-days: 14
+          include-hidden-files: true
       - name: Upload application coverage
         if: env.CODECOV_TOKEN != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: codecov/codecov-action@v7
@@ -113,6 +114,7 @@ jobs:
           name: preview-api-reports
           path: .artifacts/preview/
           retention-days: 14
+          include-hidden-files: true
 
   extended:
     name: Extended validation
@@ -139,3 +141,4 @@ jobs:
           name: extended-test-reports
           path: .artifacts/
           retention-days: 14
+          include-hidden-files: true
