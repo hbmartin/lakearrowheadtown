@@ -16,7 +16,8 @@ export function createSmokeContext(origin, options = {}) {
   origin = maintenanceTarget('preview', origin);
   const secret = validateCredential((options.credential ?? readPublishingCredential)('preview'));
   const headers = { Authorization: `Bearer ${secret}` };
-  const references = new Set(); const events = []; let version = options.expectedVersion;
+  const references = new Set(); const events = []; let dropped = 0; let version = options.expectedVersion;
+  const record = event => { if (events.length < 500) events.push(event); else dropped++; };
   const now = options.now ?? (() => new Date());
   const request = async (url, init = {}, cleanup = false) => {
     const target = new URL(url);
@@ -25,9 +26,9 @@ export function createSmokeContext(origin, options = {}) {
     const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
     let response;
     try { response = await (cleanup ? options.cleanupRequest ?? options.request ?? globalThis.fetch : options.request ?? globalThis.fetch)(url, { ...init, signal }); }
-    catch { events.push({ path: target.pathname, method: init.method ?? 'GET', transport: 'failed' }); throw new Error(`Smoke transport failed: ${init.method ?? 'GET'} ${target.pathname}`); }
+    catch { record({ path: target.pathname, method: init.method ?? 'GET', transport: 'failed' }); throw new Error(`Smoke transport failed: ${init.method ?? 'GET'} ${target.pathname}`); }
     const received = response.headers.get('X-Worker-Version');
-    events.push({ path: target.pathname, method: init.method ?? 'GET', status: response.status, request_id: response.headers.get('X-Request-ID'), worker_version: received });
+    record({ path: target.pathname, method: init.method ?? 'GET', status: response.status, request_id: response.headers.get('X-Request-ID'), worker_version: received });
     if (target.pathname.startsWith('/api/') && !cleanup) {
       assert(received, 'API must expose its Worker version');
       version ??= received; assert.equal(received, version, 'Preview deployment changed during validation');
@@ -55,7 +56,7 @@ export function createSmokeContext(origin, options = {}) {
   const persist = async () => {
     if (!options.artifactsDirectory) return;
     await mkdir(options.artifactsDirectory, { recursive: true });
-    await writeFile(join(options.artifactsDirectory, `${options.artifactName ?? 'smoke'}.json`), JSON.stringify({ candidate_sha: options.candidateSha, worker_version: version, fixture_references: [...references], events }, null, 2));
+    await writeFile(join(options.artifactsDirectory, `${options.artifactName ?? 'smoke'}.json`), JSON.stringify({ candidate_sha: options.candidateSha, worker_version: version, fixture_references: [...references], events, events_dropped: dropped }, null, 2));
   };
   return { secret, headers, request, cleanupRequest: (url, init) => request(url, init, true), now, registerDigest: reference => { assert(reference); references.add(reference); },
     run: task => withCleanup(() => withCleanup(task, cleanup), persist) };

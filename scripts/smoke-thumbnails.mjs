@@ -111,5 +111,5 @@ return { origin, post_id: published.post.id };
 });
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { await smokeThumbnails(); } catch (error) { console.error(error.message); process.exitCode = 1; }
+  try { await smokeThumbnails(undefined, { artifactsDirectory: '.artifacts/preview' }); } catch (error) { console.error(`Thumbnail acceptance failed (${error.name}); inspect .artifacts/preview/thumbnails.json.`); process.exitCode = 1; }
 }

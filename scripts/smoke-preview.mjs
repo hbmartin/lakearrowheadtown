@@ -301,6 +301,6 @@ async function smokeBody(args, options, context) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { await smoke(); }
-  catch (error) { console.error(error.message); process.exitCode = 1; }
+  try { await smoke(undefined, { artifactsDirectory: '.artifacts/preview' }); }
+  catch (error) { console.error(`Preview smoke failed (${error.name}); inspect .artifacts/preview/smoke.json.`); process.exitCode = 1; }
 }

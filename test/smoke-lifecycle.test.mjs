@@ -103,3 +103,19 @@ test('conditional HTML verification retries only an intervening publication and 
   let sequence = 0;
   await assert.rejects(verifyHtmlRevalidation(remote, async () => new Response(null, { headers: headers(`W/"${sequence++}"`) })), /three attempts/);
 });
+test('diagnostics cap stored requests and injected timeouts abort pending transport', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bounded-smoke-')); t.after(() => rm(directory, { recursive: true, force: true }));
+  const clock = new Date('2026-10-24T18:00:00Z');
+  const context = createSmokeContext(remote, { credential: () => secret, request: async () => api(), now: () => clock, artifactsDirectory: directory });
+  assert.equal(context.now(), clock);
+  await context.run(async () => { for (let i = 0; i < 503; i++) await context.request(remote + '/api/posts'); });
+  const saved = JSON.parse(await readFile(join(directory, 'smoke.json'), 'utf8'));
+  assert.equal(saved.events.length, 500); assert.equal(saved.events_dropped, 3);
+  let aborted = false;
+  const hanging = createSmokeContext(remote, { credential: () => secret, requestTimeoutMs: 1,
+    request: async (_url, { signal }) => new Promise((_resolve, reject) => {
+      const timer = setTimeout(() => reject(Error('Unexpected timer expiry')), 1000);
+      signal.addEventListener('abort', () => { aborted = true; clearTimeout(timer); reject(signal.reason); }, { once: true });
+    }) });
+  await assert.rejects(hanging.request(remote + '/api/posts'), /Smoke transport failed/); assert.equal(aborted, true);
+});
