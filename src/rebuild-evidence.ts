@@ -29,6 +29,10 @@ export function readCheckpoint(value: unknown, job: RebuildJob, stage?: string):
 }
 
 export function checkpointFor(job: RebuildJob, phase: 'prepared' | 'dispatching', migration?: Migration, prior?: RebuildCheckpoint): RebuildCheckpoint {
+  // This generation has not dispatched. Its recomputed bootstrap evidence can change.
+  if (prior?.version === 2 && prior.phase === 'prepared') {
+    return { version: 2, generation_id: prior.generation_id, phase, ...(migration ? { migration } : {}) };
+  }
   if (migration && prior?.migration && (migration.processed !== prior.migration.processed || migration.cursor !== prior.migration.cursor)) {
     throw checkpointDamaged('Conflicting migration bookkeeping. Restore and reconcile the original finalization checkpoint before dispatching again.');
   }

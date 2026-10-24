@@ -15,6 +15,15 @@ it('preserves legacy checkpoints without assigning a generation', () => {
   const prior = readCheckpoint({ version: 1, migration: { complete: true, processed: 2 } }, legacy);
   expect(checkpointFor(legacy, 'dispatching', undefined, prior)).toEqual(prior);
 });
+it('replaces prepared migration bookkeeping before dispatch while preserving uncertain legacy evidence', () => {
+  const prior = { version: 2 as const, generation_id: job.generation_id!, phase: 'prepared' as const, migration: { complete: true, processed: 1 } };
+  const migration = { complete: true, processed: 2, cursor: 'later' };
+  expect(checkpointFor(job, 'prepared', migration, prior)).toEqual({ ...prior, migration });
+  expect(checkpointFor(job, 'dispatching', migration, prior)).toEqual({ ...prior, phase: 'dispatching', migration });
+  expect(checkpointFor(job, 'prepared', undefined, prior)).not.toHaveProperty('migration');
+  const legacy = { version: 1 as const, migration: prior.migration };
+  expect(() => checkpointFor(job, 'prepared', migration, legacy)).toThrow(/Conflicting migration/);
+});
 it('validates active pause provenance against the current generation', () => {
   const pause = { version: 1, generation_id: job.generation_id, repair_id: crypto.randomUUID(), code: 'unscheduled' };
   const handoff: GenerationHandoff = { version: 1, job_id: job.id, generation_id: job.generation_id!, repair_id: pause.repair_id,

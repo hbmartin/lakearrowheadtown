@@ -3,6 +3,8 @@ import { env } from 'cloudflare:workers';
 import { reset, runInDurableObject } from 'cloudflare:test';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import fixture from './fixtures/town-card.json';
+import preDismissal from './fixtures/pre-dismissal-conditions.html';
+import originalDismissal from './fixtures/original-dismissal-conditions.html';
 import worker from '../src/worker';
 import { validateWeather, renderWeather, renderWeatherChart, WEATHER_KEY, WEATHER_URL } from '../src/weather';
 import { composeHomepageConditions, conditionsSnapshot, replaceConditions } from '../src/homepage-conditions';
@@ -95,6 +97,29 @@ describe('static weather publication', () => {
     expect(unavailable.html).toContain('<section class="homepage-conditions" aria-label="Mountain conditions snapshot">');
     expect(unavailable.html).toContain('Weather is temporarily unavailable.');
     expect(unavailable.html).toContain('<div class="conditions-row" hidden>');
+  });
+  it.each([
+    ['pre-dismissal template', preDismissal, ''],
+    ['original dismissal template', originalDismissal, '<script id="alert-dismissals">throw new Error("old initializer must be removed");</script>'],
+  ])('composes a self-contained fragment into a %s before a full rebuild', async (_, previous, initializer) => {
+    const now = new Date();
+    await submitAlert(bucket, validateAlertInput({ client_ref: 'upgrade-alert', phase: 'open', category: 'traffic', kind: 'closure',
+      routes: ['SR-18'], headline: 'Upgraded closure', source: 'caltrans', source_url: 'https://roads.dot.ca.gov/', observed_at: now.toISOString() }), 'a'.repeat(64), now);
+    await bucket.put(WEATHER_KEY, JSON.stringify(sample()));
+    const template = replaceConditions(renderPage([], { origin: base }), previous).replace('</body>', `${initializer}</body>`);
+    await bucket.put('pages/index.html', template);
+    expect(await composeHomepageConditions(bucket, base)).toBe(true);
+    const upgraded = await (await bucket.get('pages/index.html'))!.text();
+    expect(upgraded).toContain('Upgraded closure');
+    for (const id of ['alert-dismissal-styles', 'alert-dismissal-bootstrap', 'alert-dismissals', 'weather-interaction']) {
+      expect(upgraded.match(new RegExp(`id="${id}"`, 'g'))).toHaveLength(1);
+    }
+    expect(upgraded.indexOf('id="alert-dismissals"')).toBeLessThan(upgraded.indexOf('id="weather-interaction"'));
+    expect(upgraded).not.toContain('old initializer');
+    const version = (await bucket.head('pages/index.html'))!.version;
+    expect(await composeHomepageConditions(bucket, base)).toBe(true);
+    expect((await bucket.head('pages/index.html'))!.version).toBe(version);
+    expect(replaceConditions(upgraded, (await conditionsSnapshot(bucket, undefined, now)).html)).toBe(upgraded);
   });
   it('pulls conditionally, builds only on changes, and serves without upstream or conditions reads', async () => {
     const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify(sample()), { headers: { ETag: '"one"' } }));

@@ -2,11 +2,12 @@ import { boundary, HttpError } from './errors';
 import { emit, safeError } from './diagnostics';
 import { currentAlertViews } from './alerts';
 import { renderAlertBanner } from './alert-banner';
+import alertInteraction from './alert-interaction.html';
 import { renderPage } from './render';
 import { indexCondition, PublicationConflict } from './publication-conflict';
 import { validateWeather, WEATHER_KEY, renderWeather } from './weather';
 import { NEWS_ANCHOR, validateIndexMetadata } from './index-metadata';
-import { decodeIndex, fencedIndexBytes } from './index-fence';
+import { decodeIndex, fenceIndex } from './index-fence';
 import type { ContentBucket, OperationContext } from './types';
 
 const marker = /<!-- conditions:start -->[\s\S]*?<!-- conditions:end -->/;
@@ -20,9 +21,10 @@ async function loadWeather(bucket: ContentBucket): Promise<ReturnType<typeof ren
 
 function conditionsHtml(banner: string, weather: ReturnType<typeof renderWeather> | null, notice = ''): string {
   if (!banner && !weather && !notice) return '';
-  return `<section class="homepage-conditions${weather ? ' has-weather' : ''}" aria-label="Mountain conditions snapshot"${!weather && !notice ? ' hidden' : ''}>
+  const conditions = `<section class="homepage-conditions${weather ? ' has-weather' : ''}" aria-label="Mountain conditions snapshot"${!weather && !notice ? ' hidden' : ''}>
     ${notice}${banner || weather ? `<div class="conditions-row"${!weather ? ' hidden' : ''}>${banner}${weather?.summary ?? ''}</div>` : ''}${weather?.details ?? ''}
-    </section>${weather ? `<script id="weather-interaction">
+    </section>`;
+  return `${banner ? alertInteraction.replace('<!-- alert-conditions -->', () => conditions) : conditions}${weather ? `<script id="weather-interaction">
     (() => {
       const root = document.querySelector('.homepage-conditions');
       const button = root?.querySelector('.weather-toggle');
@@ -57,6 +59,9 @@ export async function conditionsSnapshot(bucket: ContentBucket, context?: Operat
 }
 
 export function replaceConditions(html: string, conditions: string): string {
+  // Saved templates from the first dismissal release still contain this controller.
+  // Replace it along with the snapshot so the fragment owns exactly one initializer.
+  html = html.replace(/<script id="alert-dismissals">[\s\S]*?<\/script>\s*/g, '');
   const block = `<!-- conditions:start -->${conditions}<!-- conditions:end -->`;
   if (marker.test(html)) return html.replace(marker, () => block);
   // Existing news pages acquire the slot without touching their saved feed.
@@ -78,7 +83,7 @@ export async function composeHomepageConditions(bucket: R2Bucket, origin: string
   if (snapshot.available) delete metadata.conditions_status; else metadata.conditions_status = 'unavailable';
   if (body === base && JSON.stringify(metadata) === JSON.stringify(index?.customMetadata ?? {})) return snapshot.available;
   validateIndexMetadata(metadata);
-  const result = await boundary('storage', () => bucket.put('pages/index.html', fencedIndexBytes(new TextEncoder().encode(body), index?.httpMetadata), {
+  const result = await boundary('storage', () => bucket.put('pages/index.html', new TextEncoder().encode(fenceIndex(body)), {
     onlyIf: indexCondition(index), customMetadata: metadata,
     httpMetadata: { ...index?.httpMetadata, contentType: 'text/html; charset=utf-8', cacheControl: 'public, max-age=0, must-revalidate' },
   }));
