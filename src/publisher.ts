@@ -10,6 +10,7 @@ import { readPosts, type PostsReply } from './posts';
 import { publishEvents, readEvents, type EventDigest, type EventsReply } from './events';
 import { validateRepair, type RepairReply } from './publication-repair';
 import { RepairCoordinator, restartRebuild, newRebuild, isPaused, pauseReason } from './repair-coordinator';
+import { repairErrorState } from './repair-errors';
 import { composeHomepageConditions } from './homepage-conditions';
 import { checkpointKey, checkpointDamaged, checkpointFor, completeMigration, generationKey, pauseKey, readPause, repairableCodes, readCheckpoint, readHandoff, receiptMatches, type GenerationHandoff } from './rebuild-evidence';
 import { validateWeather, WEATHER_KEY, WEATHER_URL } from './weather';
@@ -540,8 +541,8 @@ export class DigestPublisher extends DurableObject<Env> {
       const bootstrapContext: OperationContext = { request_id: crypto.randomUUID(), worker_version: this.env.CF_VERSION_METADATA?.id ?? 'local', environment: this.env.ENVIRONMENT ?? 'local', operation: 'rebuild' };
       return await this.serialize(async () => {
         const bootstrap = new OperationTrace(bootstrapContext);
-        try { await this.repairCoordinator().recover(bootstrap, true); }
-        catch (error) { if (['repair_pending', 'repair_stalled'].includes(asHttpError(error).code)) return; throw error; }
+        try { if (await this.repairCoordinator().recover(bootstrap, true) === 'cancelled') return; }
+        catch (error) { if (repairErrorState(asHttpError(error).code)?.stopAlarm) return; throw error; }
         let ids: string[];
         let job: RebuildJob | null | undefined;
         try {
@@ -574,6 +575,14 @@ export class DigestPublisher extends DurableObject<Env> {
           const evidence = await trace.run('rebuild_finalization_read', () => boundary('storage', () => this.ctx.storage.get(keys)));
           if (job.generation_id) await trace.run('rebuild_generation_read', () => readHandoff(evidence.get(generationKey(job!.id, job!.generation_id!)), job!));
           let finalization = await trace.run('rebuild_finalization_validation', () => readCheckpoint(evidence.get(checkpointKey(job!.id)), job!));
+          if (inherited === 'committed' && finalization) {
+            if (finalization.version === 2 && finalization.phase === 'prepared') throw checkpointDamaged('Committed recovery contradicts a prepared checkpoint. Restore the matching dispatch checkpoint before resuming.');
+            const migration = finalization.migration ?? await trace.run('rebuild_migration_receipt', () => boundary('storage', () => this.ctx.storage.get('migration')));
+            if (!completeMigration(migration)) throw checkpointDamaged('Committed migration bookkeeping is missing. Restore the matching finalization checkpoint before resuming.');
+            trace.publication_status = 'committed';
+            phase = 'finalizing';
+            await this.finalizeRebuild(job, ids, migration, undefined, trace); return;
+          }
           if (inherited !== 'committed' && (!finalization || finalization.version === 2 && finalization.phase === 'prepared')) inherited = 'not_committed';
           // A prepared checkpoint proves non-dispatch. Absence still needs a
           // receipt lookup for supported missing-checkpoint recovery, but a failed

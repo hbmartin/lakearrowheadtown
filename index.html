@@ -17,12 +17,8 @@
     .alerts-banner { margin-bottom: 2rem; overflow: hidden; }
     .alert-group + .alert-group { border-top: 1px solid var(--border); }
     .alert-group > h2, .conditions-row > .weather-card > h2 { padding: 1rem var(--card-inset); border-bottom: 1px solid var(--border); color: var(--primary); font: 600 1rem var(--body-font); }
-    .alert-item { position: relative; }
     .alert-item:not([hidden]) ~ .alert-item .alert-row { border-top: 1px solid var(--border); }
     .alert-row > summary { display: grid; grid-template-columns: .65em minmax(0, 1fr); column-gap: .5rem; min-height: 44px; padding: .65rem 3.5rem .65rem var(--card-inset); cursor: pointer; list-style: none; }
-    .alert-dismiss { position: absolute; top: 1px; right: .35rem; display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; padding: .5rem; border: 0; border-radius: .3rem; background: transparent; color: var(--muted); font-size: 1.25rem; }
-    .alert-dismiss:hover { background: var(--surface); color: var(--text); }
-    .alert-dismiss:focus-visible { outline-offset: -4px; }
     .alert-row > summary::marker { content: ''; }
     .alert-row > summary::-webkit-details-marker { display: none; }
     .alert-row > summary::before { content: ''; width: .65em; height: .75em; margin-top: .375em; background: currentColor; clip-path: polygon(15% 0, 100% 50%, 15% 100%); }
@@ -433,57 +429,6 @@
       <path d="m6 12 6-6 6 6M12 6v12"/>
     </svg>
   </button>
-  <script id="alert-dismissals">
-    (() => {
-      const banner = document.querySelector('.alerts-banner');
-      if (!banner) return;
-      const root = banner.closest('.homepage-conditions');
-      const rows = [...banner.querySelectorAll('.alert-item')];
-      const groups = [...banner.querySelectorAll('.alert-group')];
-      const dismissed = new Set();
-      const savedDismissals = new Set();
-      const key = row => 'lakearrowhead-dismissed-alert:v1:' + row.dataset.alertId;
-
-      function update(pending = false) {
-        const focusedRow = rows.find(row => row.contains(document.activeElement));
-        for (const row of rows) row.hidden = pending || dismissed.has(row.dataset.alertId) || savedDismissals.has(row.dataset.alertId);
-        for (const group of groups) group.hidden = !rows.some(row => !row.hidden && group.contains(row));
-        const visible = rows.filter(row => !row.hidden);
-        banner.hidden = visible.length === 0;
-        if (root) {
-          const weather = !!root.querySelector('.weather-card');
-          const notice = !!root.querySelector('.conditions-unavailable');
-          root.classList.toggle('has-alerts', !banner.hidden);
-          root.querySelector('.conditions-row').hidden = banner.hidden && !weather;
-          root.hidden = banner.hidden && !weather && !notice;
-        }
-        if (!pending && focusedRow?.hidden) {
-          const target = visible[0]?.querySelector('summary') || document.querySelector('.site-title');
-          target?.focus({ preventScroll: true });
-        }
-      }
-
-      function checkStorage() {
-        savedDismissals.clear();
-        for (const row of rows) {
-          try {
-            if (localStorage.getItem(key(row)) === '1') savedDismissals.add(row.dataset.alertId);
-          } catch { /* Show alerts whose saved dismissal cannot be read. */ }
-        }
-        update();
-      }
-
-      for (const row of rows) row.querySelector('.alert-dismiss').addEventListener('click', () => {
-        dismissed.add(row.dataset.alertId);
-        update();
-        try { localStorage.setItem(key(row), '1'); } catch { /* Keep this page's dismissal in memory. */ }
-      });
-      // A back/forward-cache snapshot must also wait for a fresh storage check.
-      window.addEventListener('pagehide', () => update(true));
-      window.addEventListener('pageshow', checkStorage);
-      checkStorage();
-    })();
-  </script>
   <script id="scroll-to-top">
     (() => {
       const button = document.getElementById('back-to-top');
