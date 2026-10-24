@@ -284,6 +284,11 @@ describe('API and homepage integration', () => {
     await submitAlert(bucket, traffic({ client_ref: 'older', headline: 'Older closure' }), owner, start);
     await submitAlert(bucket, power({ kind: 'psps', power: { stage: 'watch', customer_count: 200 } }), owner, start);
     const html = renderAlertBanner(await currentAlertViews(bucket, later(1)));
+    expect(html).toContain('<aside class="alerts-banner" aria-label="Local alerts" hidden>');
+    expect(html).toContain(`data-alert-id="${opened.alert_id}"`);
+    expect(html).toContain('aria-label="Dismiss alert: Newer closure"');
+    expect(html).toMatch(/<\/details><button class="alert-dismiss" type="button"/);
+    expect(html.match(/class="alert-dismiss"/g)).toHaveLength(3);
     expect(html).toContain('id="traffic-alerts">Traffic'); expect(html).toContain('id="power-alerts">Power');
     expect(html).toContain('<details class="alert-row">'); expect(html).not.toMatch(/<details[^>]*\bopen/);
     expect(html.indexOf('Newer closure')).toBeLessThan(html.indexOf('Older closure'));
@@ -292,6 +297,17 @@ describe('API and homepage integration', () => {
     expect(html).not.toContain('class="alert-status"'); expect(html).not.toContain('PSPS · Watch');
     expect(html).toContain('Customers potentially affected'); expect(html).not.toContain('Power off');
     expect(html).toContain('PDT');
+  });
+  it('escapes dismissal IDs and labels, and omits closed alerts and empty banners', async () => {
+    await submitAlert(bucket, traffic(), owner, start);
+    const [alert] = await currentAlertViews(bucket, start);
+    const html = renderAlertBanner([{ ...alert, alert_id: '" data-injected="bad', headline: '<img src=x onerror="bad"> & \'quoted\'' }]);
+    expect(html).toContain('data-alert-id="&quot; data-injected=&quot;bad"');
+    expect(html).toContain('aria-label="Dismiss alert: &lt;img src=x onerror=&quot;bad&quot;&gt; &amp; &#39;quoted&#39;"');
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain(' data-injected="');
+    expect(renderAlertBanner([{ ...alert, state: 'resolved' }])).toBe('');
+    expect(renderAlertBanner([])).toBe('');
   });
   it('builds alerts above stories and retains the snapshot at expiry', async () => {
     const now = new Date();
