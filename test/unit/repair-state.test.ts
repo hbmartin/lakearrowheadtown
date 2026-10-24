@@ -157,3 +157,19 @@ it('surfaces a durably cancelled recovery rejection to API callers', async () =>
   await expect(repair.submit(input, origin, new OperationTrace())).rejects.toMatchObject({ status: 400, cause: original });
   expect(await storage.get(record.key)).toMatchObject({ state: 'conflict' });
 }));
+
+it('reports the newly persisted resume deadline when a committed recovery snapshot fails', async () => inStorage(async storage => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  try {
+    const { record, index } = await journal(storage, 'activation');
+    const oldDeadline = new Date(Date.now() + 300000).toISOString();
+    await storage.put(record.key, { ...record, publication: { version: index.version }, stalled: true, next_retry_at: oldDeadline });
+    const snapshot = await coordinator(storage).snapshot(new OperationTrace()); let heads = 0;
+    const repair = coordinator(storage, bucketWith(bucket, { head: key => ++heads === 2 ? Promise.reject(Error('Snapshot unavailable')) : bucket.head(key) }));
+    const failure = await repair.control('resume', { expected_version: snapshot.publication.version, expected_recovery_token: snapshot.recovery!.recovery_token }, new OperationTrace()).catch(error => error);
+    const resumed = await storage.get<any>(record.key);
+    expect(failure).toMatchObject({ status: 503, code: 'repair_pending', publication_status: 'committed', retry_at: resumed.next_retry_at });
+    expect(Date.parse(failure.retry_at)).toBeLessThan(Date.parse(oldDeadline));
+    expect(await storage.getAlarm()).toBe(Date.parse(failure.retry_at));
+  } finally { vi.useRealTimers(); }
+}));

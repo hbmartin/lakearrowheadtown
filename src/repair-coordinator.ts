@@ -255,10 +255,12 @@ export class RepairCoordinator {
       if (!saved) throw damaged();
       const record = saved;
       if (action === 'resume') {
+        const resumed = { ...record, attempts: 0, stalled: false, next_retry_at: new Date(Date.now() + 1000).toISOString() };
         await boundary('storage', () => this.storage.transaction(async storage => {
-          await storage.put(record.key, { ...record, attempts: 0, stalled: false, next_retry_at: new Date(Date.now() + 1000).toISOString() });
-          await storage.setAlarm(Date.now() + 1000);
+          await storage.put(record.key, resumed);
+          await storage.setAlarm(Date.parse(resumed.next_retry_at));
         }));
+        saved = resumed;
       } else {
         const head = await boundary('storage', () => this.bucket.head('pages/index.html'));
         if (!head || head.version !== input.expected_version) throw publicationChanged(certainty(record));
