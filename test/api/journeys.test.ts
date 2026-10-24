@@ -20,6 +20,12 @@ async function request(path: string, init: RequestInit = {}) {
     expect(response.headers.get('X-Request-ID')).toBeTruthy(); expect(response.headers.get('X-Worker-Version')).toBeTruthy();
     if (init.method !== 'HEAD') {
       const body: any = await response.clone().json(); expect(body.request_id).toBe(response.headers.get('X-Request-ID'));
+      if (response.status >= 400) {
+        expect(body.ok).toBe(false); expect(typeof body.code).toBe('string'); expect(typeof body.message).toBe('string');
+        expect(typeof body.retryable).toBe('boolean'); expect(typeof body.suggestion.action).toBe('string'); expect(typeof body.suggestion.message).toBe('string');
+        if (!body.retryable) expect(response.headers.get('Retry-After')).toBeNull();
+        if (body.publication_status !== undefined) expect(['not_attempted', 'not_committed', 'committed', 'unknown']).toContain(body.publication_status);
+      }
     }
   }
   return response;
@@ -153,11 +159,15 @@ it('dispatches scheduled weather pulls, revalidates upstream, and preserves the 
 });
 it('keeps ownership across credential rotation and derives expiry through HTTP reads', async () => {
   const input = digest(); const published: any = await (await send('/api/digests', input)).json();
+  const ownedAlert: any = await (await send('/api/alerts', { source: 'caltrans', source_url: 'https://example.com/owned', observed_at: new Date().toISOString(), client_ref: crypto.randomUUID(), phase: 'open', category: 'traffic', kind: 'hazard', routes: ['SR-18'], headline: 'Owned alert' })).json();
+  const alertRetraction = `/api/alerts/${ownedAlert.alert_id}/entries/${ownedAlert.entry_id}/retract`;
   const rotated = secret + '-rotated';
   await server.update({ workers: [{ ...options().workers[0], secrets: { API_SECRET: rotated } }] });
   const rejected = await request(`/api/posts/${published.post.id}/retract`, { method: 'POST', headers: { Authorization: `Bearer ${rotated}` } });
   expect(rejected.status).toBe(403);
+  expect((await request(alertRetraction, { method: 'POST', headers: { Authorization: `Bearer ${rotated}` } })).status).toBe(403);
   await server.update(options());
+  expect((await send(alertRetraction)).status).toBe(200);
   const old = { source: 'caltrans', source_url: 'https://example.com/expired', observed_at: new Date(Date.now() - 25 * 3600000).toISOString(), client_ref: crypto.randomUUID(), phase: 'open', category: 'traffic', kind: 'hazard', routes: ['SR-18'], headline: 'Needs confirmation' };
   const opened: any = await (await send('/api/alerts', old)).json(); expect(opened.state).toBe('expired-unconfirmed');
   expect((await json(`/api/alerts/${opened.alert_id}`)).alert.state).toBe('expired-unconfirmed');
