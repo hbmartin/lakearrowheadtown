@@ -23,7 +23,7 @@ test('version and transport failures retain registered references for cleanup an
   const directory = await mkdtemp(join(tmpdir(), 'smoke-lifecycle-')); t.after(() => rm(directory, { recursive: true, force: true }));
   let retracted = false;
   const request = async (url, init = {}) => {
-    if (url.includes('client_ref=')) return api({ post: { id: 'fixture' }, status: retracted ? 'retracted' : 'published' });
+    if (url.includes('client_ref=')) return api({ client_ref: new URL(url).searchParams.get('client_ref'), post: { id: 'fixture' }, status: retracted ? 'retracted' : 'published' });
     if (url.endsWith('/retract')) { retracted = true; return api({ status: 'retracted' }); }
     return api({}, 200, 'another-version');
   };
@@ -38,13 +38,15 @@ test('version and transport failures retain registered references for cleanup an
   await assert.rejects(context.request('https://evil.example/api/posts'), /validated preview origin/);
 });
 test('cleanup handles absent and already retracted references and rejects malformed or failed lookups', async () => {
-  for (const response of [api({}, 404), api({ post: { id: 'fixture' }, status: 'retracted' })]) {
+  for (const response of [api({}, 404), api({ client_ref: 'test', post: { id: 'fixture' }, status: 'retracted' })]) {
     const context = createSmokeContext(remote, { credential: () => secret, request: async () => response });
     context.registerDigest('test'); await context.run(async () => {});
   }
-  for (const response of [api({}, 503), api({}), new Response('malformed')]) {
-    const context = createSmokeContext(remote, { credential: () => secret, request: async () => response });
+  for (const response of [api({}, 503), api({}), new Response('malformed'), api({ client_ref: 'different', post: { id: 'fixture' }, status: 'published' })]) {
+    const methods = [];
+    const context = createSmokeContext(remote, { credential: () => secret, request: async (_url, init) => { methods.push(init.method ?? 'GET'); return response; } });
     context.registerDigest('test'); await assert.rejects(context.run(async () => {}), /cleanup failed/);
+    assert.deepEqual(methods, ['GET'], 'A failed identity lookup must not authorize retraction');
   }
   const context = createSmokeContext(remote, { credential: () => secret, cleanupTimeoutMs: 0 });
   context.registerDigest('test'); await assert.rejects(context.run(async () => {}), /cleanup failed/);

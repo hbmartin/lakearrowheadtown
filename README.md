@@ -286,7 +286,7 @@ Smoke stories and alerts have unique persisted references registered before subm
 
 Requests have a 30-second timeout, rebuilds a five-minute wait, and cleanup a two-minute budget. There are no blanket test retries. `.artifacts/preview/` records bounded request status/version/ID summaries, fixture references, the tested SHA, and rebuild identity, without credentials or arbitrary response bodies. GitHub retains test, coverage, and diagnostic artifacts for 14 days. For a failed run, inspect these artifacts and the correlated request/rebuild IDs, correct the underlying issue, and rerun; never clear uncertain publication evidence to make a check pass.
 
-Before enabling branch enforcement, obtain three consecutive green remote runs and verify intentional local and remote failures. Then require **Local validation** and **Preview API** on `main`, with up-to-date branches, keeping administrator bypass and adding no mandatory reviewer count. Verify both failure types block merging. Production deployment continues through the existing Cloudflare Workers Builds integration.
+`main` requires **Local validation** and **Preview API** from GitHub Actions and an up-to-date branch. Administrator bypass remains available; no mandatory reviewer count is configured. Before enabling these requirements elsewhere, obtain three consecutive green preview runs and verify deliberate local and remote failures block merging. Production deployment continues through the existing Cloudflare Workers Builds integration.
 
 ## Credentials and rotation
 

@@ -45,6 +45,7 @@ export function createSmokeContext(origin, options = {}) {
         if (lookup.status === 404) continue;
         assert.equal(lookup.status, 200, 'Cleanup reference lookup failed');
         const found = await lookup.json(); assert(found.ok && found.post?.id, 'Cleanup lookup was malformed');
+        assert.equal(found.client_ref, reference, 'Cleanup lookup returned another reference');
         if (found.status === 'retracted') continue;
         const response = await request(`${origin}/api/posts/${found.post.id}/retract`, { ...init, method: 'POST' }, true);
         assert.equal(response.status, 200, 'Fixture retraction failed');

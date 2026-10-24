@@ -35,11 +35,13 @@ export async function smokeChanges(origin, request, headers, options = {}) {
     const found = delta.changes.find(change => change.resource === 'story' && change.identity.post_id === published.post.id && change.identity.item_index === 0);
     assert.equal(found?.operation, 'upsert'); assert.equal(found.data.headline, run);
     const eventId = calendar.items[0].post_id;
-    if (calendar.counts.published) assert(delta.changes.some(change => change.resource === 'event' && change.identity.post_id === eventId && change.data.starts_at === date));
+    const matchesEvent = event => event.starts_at === date && event.headline === `Preview daily event ${date}`
+      && event.all_day === true && event.body === item.body && event.post_url === `${origin}/?api-smoke-event=${date}`;
+    if (calendar.counts.published) assert(delta.changes.some(change => change.resource === 'event' && change.identity.post_id === eventId && matchesEvent(change.data)));
     else {
       assert.equal(calendar.counts.duplicates, 1);
       const events = await send('/api/events');
-      assert(events.events.some(event => event.post_id === eventId && event.starts_at === date && event.headline === `Preview daily event ${date}`));
+      assert(events.events.some(event => event.post_id === eventId && matchesEvent(event)));
     }
     const update = { group: item.group, post_url: item.post_url + '&update=1', body: 'Reconciliation update.', posted_at: context.now().toISOString() };
     await send(`/api/posts/${published.post.id}/items/0/updates`, update);

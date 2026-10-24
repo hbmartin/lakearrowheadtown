@@ -105,6 +105,7 @@ export async function smokeAlerts(origin, request, headers, options = {}) {
       if (response.status === 404) return;
       assert.equal(response.status, 200); const opened = await response.json();
       assert.equal(opened.ok, true); assert(opened.alert_id && opened.entry_id);
+      assert.equal(opened.client_ref, reference, 'Alert cleanup lookup returned another reference');
       const path = `/api/alerts/${opened.alert_id}/entries/${opened.entry_id}/retract`;
       assert.equal((await send(path, {}, true)).status, 'retracted');
       const again = await send(path, {}, true); assert.equal(again.status, 'already_retracted'); assert.equal(again.expires_at, null);
