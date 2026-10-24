@@ -4,7 +4,7 @@ import { currentAlertViews } from './alerts';
 import { renderAlertBanner } from './alert-banner';
 import { renderPage } from './render';
 import { indexCondition, PublicationConflict } from './publication-conflict';
-import { validateWeather, WEATHER_KEY, weatherTime, renderWeather } from './weather';
+import { validateWeather, WEATHER_KEY, renderWeather } from './weather';
 import { NEWS_ANCHOR, validateIndexMetadata } from './index-metadata';
 import { decodeIndex, fencedIndexBytes } from './index-fence';
 import type { ContentBucket, OperationContext } from './types';
@@ -18,10 +18,10 @@ async function loadWeather(bucket: ContentBucket): Promise<ReturnType<typeof ren
   catch { throw new HttpError(500, 'Stored weather is damaged.', {}, { code: 'weather_damaged' }); }
 }
 
-function conditionsHtml(banner: string, weather: ReturnType<typeof renderWeather> | null, now: Date, notice = ''): string {
+function conditionsHtml(banner: string, weather: ReturnType<typeof renderWeather> | null, notice = ''): string {
   if (!banner && !weather && !notice) return '';
   return `<section class="homepage-conditions${weather ? ' has-weather' : ''}" aria-label="Mountain conditions snapshot"${!weather && !notice ? ' hidden' : ''}>
-    <p class="conditions-as-of">Conditions snapshot: ${weatherTime(now.toISOString())}</p>${notice}${banner || weather ? `<div class="conditions-row"${!weather ? ' hidden' : ''}>${banner}${weather?.summary ?? ''}</div>` : ''}${weather?.details ?? ''}
+    ${notice}${banner || weather ? `<div class="conditions-row"${!weather ? ' hidden' : ''}>${banner}${weather?.summary ?? ''}</div>` : ''}${weather?.details ?? ''}
     </section>${weather ? `<script id="weather-interaction">
     (() => {
       const root = document.querySelector('.homepage-conditions');
@@ -52,7 +52,7 @@ export async function conditionsSnapshot(bucket: ContentBucket, context?: Operat
   }
   const failedAlerts = alerts.status === 'rejected'; const failedWeather = weather.status === 'rejected';
   const notice = failedAlerts && failedWeather ? 'Mountain conditions are temporarily unavailable.' : failedAlerts ? 'Road and power alerts are temporarily unavailable.' : failedWeather ? 'Weather is temporarily unavailable.' : '';
-  return { html: conditionsHtml(alerts.status === 'fulfilled' ? alerts.value : '', weather.status === 'fulfilled' ? weather.value : null, now,
+  return { html: conditionsHtml(alerts.status === 'fulfilled' ? alerts.value : '', weather.status === 'fulfilled' ? weather.value : null,
     notice ? `<div class="conditions-unavailable" role="status"><p>${notice}</p></div>` : ''), available: !failedAlerts && !failedWeather };
 }
 
@@ -69,12 +69,7 @@ export async function composeHomepageConditions(bucket: R2Bucket, origin: string
   const index = await boundary('storage', () => bucket.get('pages/index.html'));
   const base = index ? decodeIndex(await boundary('storage', () => index.arrayBuffer()), index.httpMetadata) : renderPage([], { origin });
   const snapshot = await conditionsSnapshot(bucket, context);
-  const rendered = replaceConditions(base, snapshot.html);
-  const previous = marker.exec(base)?.[0];
-  const proposed = marker.exec(rendered)![0];
-  // Ignore only our generated snapshot clock, never observation/expiry times.
-  const content = (block: string) => block.replace(/<p class="conditions-as-of">[\s\S]*?<\/p>/, '');
-  const body = previous && content(previous) === content(proposed) ? base : rendered;
+  const body = replaceConditions(base, snapshot.html);
   const metadata: Record<string, string> = { ...index?.customMetadata, ...(!index ? { conditions_only: 'true' } : {}) };
   if (index && !metadata.manifest && metadata.conditions_only !== 'true') {
     metadata[NEWS_ANCHOR] ??= index.uploaded.toISOString();

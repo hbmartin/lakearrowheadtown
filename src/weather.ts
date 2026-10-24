@@ -110,9 +110,9 @@ export function renderWeatherChart(hours: WeatherHour[]): string {
 export function renderWeather(weather: TownWeather): { summary: string; details: string } {
   const { observation: o, forecast: f } = weather;
   return {
-    summary: `<div class="weather-card"><h2>Today on the mountain</h2><p class="weather-station">${escapeHtml(weather.station.label)} · ${escapeHtml(f?.date_local ?? (o ? localDate(o.observed_at) : ''))}</p>
+    summary: `<div class="weather-card"><h2>Today on the mountain</h2><div class="weather-summary-body">
       <p class="weather-temperature">${temp(o?.temp_f ?? null)}</p>${f ? `<p class="weather-high-low">Forecast high ${temp(f.high_f)} · low ${temp(f.low_f)}</p>` : ''}
-      ${f?.outlook ? `<p class="weather-outlook">${escapeHtml(f.outlook)}</p>` : ''}<p class="weather-time">${o ? `Observed ${weatherTime(o.observed_at)}` : 'Station observation unavailable.'}</p>
+      ${f?.outlook ? `<p class="weather-outlook">${escapeHtml(f.outlook)}</p>` : ''}${o ? '' : '<p class="weather-time">Station observation unavailable.</p>'}</div>
       <button class="weather-toggle" type="button" aria-expanded="false" aria-controls="weather-details">Show weather details <span aria-hidden="true">↓</span></button></div>`,
     details: `<section id="weather-details" class="weather-details weather-card" aria-label="Mountain weather details"><h3>Mountain weather details</h3>
       <dl class="weather-metrics">${metric('Observed temperature', temp(o?.temp_f ?? null))}${metric('Wind', o?.wind_mph == null ? '—' : `${Math.round(o.wind_mph)} mph`)}${metric('Gusts', o?.gust_mph == null ? '—' : `${Math.round(o.gust_mph)} mph`)}
