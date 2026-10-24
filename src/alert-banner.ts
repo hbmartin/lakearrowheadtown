@@ -11,7 +11,7 @@ const sourceNames = { caltrans: 'Caltrans', nws: 'National Weather Service', sce
 function renderAlert(alert: AlertView): string {
   const location = [alert.routes?.join(', '), alert.area].filter(Boolean).join(' · ');
   const count = alert.power?.customer_count;
-  return `<details class="alert-row">
+  return `<div class="alert-item" data-alert-id="${escapeHtml(alert.alert_id)}"><details class="alert-row">
     <summary><span class="alert-summary"><span class="alert-location">${escapeHtml(location)}</span><span class="alert-headline">${escapeHtml(alert.headline)}</span></span></summary>
     <div class="alert-details">
       ${alert.detail ? `<div class="markdown">${markdown.render(alert.detail)}</div>` : ''}
@@ -29,7 +29,7 @@ function renderAlert(alert: AlertView): string {
       </dl>
       <p class="alert-source"><a href="${escapeHtml(alert.source_url)}" rel="noopener noreferrer">${sourceNames[alert.source]}</a></p>
     </div>
-  </details>`;
+  </details><button class="alert-dismiss" type="button" aria-label="${escapeHtml(`Dismiss alert: ${alert.headline}`)}" title="Hide this alert"><span aria-hidden="true">×</span></button></div>`;
 }
 
 export function renderAlertBanner(alerts: AlertView[]): string {
@@ -38,5 +38,5 @@ export function renderAlertBanner(alerts: AlertView[]): string {
       .sort((a, b) => Date.parse(b.observed_at) - Date.parse(a.observed_at) || a.alert_id.localeCompare(b.alert_id));
     return selected.length ? `<section class="alert-group" aria-labelledby="${category}-alerts"><h2 id="${category}-alerts">${category === 'traffic' ? 'Traffic' : 'Power'}</h2>${selected.map(renderAlert).join('\n')}</section>` : '';
   }).join('');
-  return groups ? `<aside class="alerts-banner" aria-label="Local alerts">${groups}</aside>` : '';
+  return groups ? `<aside class="alerts-banner" aria-label="Local alerts" hidden>${groups}</aside>` : '';
 }

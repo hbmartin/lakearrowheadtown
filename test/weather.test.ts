@@ -52,6 +52,25 @@ describe('Open Sun contract and chart', () => {
 });
 
 describe('static weather publication', () => {
+  it('starts alert-only conditions hidden while preserving weather and unavailable notices', async () => {
+    const now = new Date();
+    await submitAlert(bucket, validateAlertInput({ client_ref: 'hidden-alert', phase: 'open', category: 'traffic', kind: 'closure',
+      routes: ['SR-18'], headline: 'Road closure', source: 'caltrans', source_url: 'https://roads.dot.ca.gov/', observed_at: now.toISOString() }), 'a'.repeat(64), now);
+    const alerts = await conditionsSnapshot(bucket, undefined, now);
+    expect(alerts.html).toContain('<section class="homepage-conditions" aria-label="Mountain conditions snapshot" hidden>');
+    expect(alerts.html).toContain('<div class="conditions-row" hidden>');
+    expect(alerts.html).toContain('<aside class="alerts-banner" aria-label="Local alerts" hidden>');
+    await bucket.put(WEATHER_KEY, JSON.stringify(sample()));
+    const weather = await conditionsSnapshot(bucket, undefined, now);
+    expect(weather.html).toContain('<section class="homepage-conditions has-weather" aria-label="Mountain conditions snapshot">');
+    expect(weather.html).not.toContain(' has-alerts');
+    expect(weather.html).toContain('<div class="conditions-row">');
+    await bucket.put(WEATHER_KEY, '{broken');
+    const unavailable = await conditionsSnapshot(bucket, undefined, now);
+    expect(unavailable.html).toContain('<section class="homepage-conditions" aria-label="Mountain conditions snapshot">');
+    expect(unavailable.html).toContain('Weather is temporarily unavailable.');
+    expect(unavailable.html).toContain('<div class="conditions-row" hidden>');
+  });
   it('pulls conditionally, builds only on changes, and serves without upstream or conditions reads', async () => {
     const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify(sample()), { headers: { ETag: '"one"' } }));
     await publisher().pullWeatherV1(base);
