@@ -80,14 +80,24 @@ test('the full smoke and daily calendar reuse succeed twice over a built local W
     const news = await (await fetch(origin + '/api/posts', { headers })).json(); assert.equal(news.posts.length, 0);
     const calendar = await (await fetch(origin + '/api/events', { headers })).json(); assert.equal(calendar.events.length, 1);
   }
-  // Losing the first publishing response still leaves cleanup able to recover the reference.
-  let lost = false;
-  await assert.rejects(smokeChanges(origin, async (url, init) => {
-    const response = await fetch(url, init);
-    if (!lost && new URL(url).pathname === '/api/digests' && init?.method === 'POST') { lost = true; throw Error('lost acknowledgement'); }
-    return response;
-  }, headers, options));
-  assert.equal(lost, true); assert.equal((await (await fetch(origin + '/api/posts', { headers })).json()).posts.length, 0);
+  // Both a lost acknowledgement and an assertion after a real commit must clean up.
+  for (const failure of ['lost acknowledgement', 'invalid API version']) {
+    let injected = false;
+    await assert.rejects(smokeChanges(origin, async (url, init) => {
+      const response = await fetch(url, init);
+      if (!injected && new URL(url).pathname === '/api/digests' && init?.method === 'POST') {
+        injected = true;
+        if (failure === 'lost acknowledgement') throw Error(failure);
+        const changed = new Headers(response.headers); changed.set('X-API-Version', 'unexpected');
+        return new Response(response.body, { status: response.status, headers: changed });
+      }
+      return response;
+    }, headers, options));
+    assert.equal(injected, true); assert.equal((await (await fetch(origin + '/api/posts', { headers })).json()).posts.length, 0);
+  }
+  await assert.rejects(smoke([origin], { ...options, expectedConfirmations: true }), /Confirmation rollout mode differs/);
+  assert.equal((await (await fetch(origin + '/api/posts', { headers })).json()).posts.length, 0);
+  assert((await (await fetch(origin + '/api/alerts', { headers })).json()).alerts.every(alert => alert.state === 'retracted'));
 });
 test('conditional HTML verification retries only an intervening publication and fails broken stable validators', async () => {
   const { verifyHtmlRevalidation } = await import('../scripts/smoke-support.mjs');
