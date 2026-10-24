@@ -4,7 +4,7 @@ import { reset, runInDurableObject } from 'cloudflare:test';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import fixture from './fixtures/town-card.json';
 import worker from '../src/worker';
-import { validateWeather, renderWeatherChart, WEATHER_KEY, WEATHER_URL } from '../src/weather';
+import { validateWeather, renderWeather, renderWeatherChart, WEATHER_KEY, WEATHER_URL } from '../src/weather';
 import { composeHomepageConditions, conditionsSnapshot, replaceConditions } from '../src/homepage-conditions';
 import { submitAlert, validateAlertInput, ALERTS_KEY } from '../src/alerts';
 import { NEWS_ANCHOR } from '../src/index-metadata';
@@ -23,6 +23,31 @@ const digest: Digest = { title: 'News', source: 'test', items: [{ group: 'Commun
 beforeEach(async () => { vi.restoreAllMocks(); await reset(); vi.spyOn(console, 'info').mockImplementation(() => {}); vi.spyOn(console, 'error').mockImplementation(() => {}); });
 
 describe('Open Sun contract and chart', () => {
+  it('keeps the weather summary focused while retaining detailed forecast information', () => {
+    const weather = validateWeather(sample());
+    const { summary, details } = renderWeather(weather);
+    expect(summary).toContain('Today on the mountain');
+    expect(summary).toContain(`${Math.round(weather.observation!.temp_f!)}°F`);
+    expect(summary).toContain('Forecast high');
+    expect(summary).toContain(weather.forecast!.outlook);
+    expect(summary).not.toContain('weather-station');
+    expect(summary).not.toContain(weather.station.label);
+    expect(summary).not.toContain('<time');
+    expect(details).toContain('Observed temperature');
+    expect(details).toContain('Forecast issued');
+    expect(details).toContain(weather.forecast!.issued_at);
+    expect(details).toContain('weather-chart');
+  });
+  it('preserves unavailable observation and forecast messages', () => {
+    const weather = validateWeather(sample());
+    const forecastOnly = renderWeather({ ...weather, observation: null });
+    expect(forecastOnly.summary).toContain('Station observation unavailable.');
+    expect(forecastOnly.summary).toContain('<p class="weather-temperature">—</p>');
+    expect(forecastOnly.details).toContain('Forecast issued');
+    const observationOnly = renderWeather({ ...weather, forecast: null });
+    expect(observationOnly.details).toContain('Forecast unavailable.');
+    expect(observationOnly.summary).not.toContain('Station observation unavailable.');
+  });
   it('accepts the shared producer fixture and rejects incompatible identity, units, times, and bands', () => {
     expect(validateWeather(sample()).schema_version).toBe(1);
     const mutations = [
@@ -309,6 +334,30 @@ it('clears recovery markers without refreshing unchanged snapshot text after tim
     await runInDurableObject(publisher(), async (instance, state) => { await state.storage.put('conditions:pending', true); await (instance as any).finishConditions(base); expect(await state.storage.get('conditions:pending')).toBeUndefined(); });
     const healed = (await bucket.get('pages/index.html'))!; expect(withoutIndexFence(await healed.text())).toBe(withoutIndexFence(html)); expect(healed.customMetadata?.conditions_status).toBeUndefined();
   } finally { vi.useRealTimers(); }
+});
+
+it.each([false, true])('cleans an older saved snapshot once with weather=%s', async weather => {
+  const now = new Date();
+  await submitAlert(bucket, validateAlertInput({ client_ref: 'legacy-snapshot-alert', phase: 'open', category: 'traffic', kind: 'closure',
+    routes: ['SR-18'], headline: 'Saved closure', source: 'caltrans', source_url: 'https://roads.dot.ca.gov/', observed_at: now.toISOString() }), 'a'.repeat(64), now);
+  if (weather) await bucket.put(WEATHER_KEY, JSON.stringify(sample()));
+  await composeHomepageConditions(bucket, base);
+  const index = (await bucket.get('pages/index.html'))!;
+  const clean = await index.text();
+  const snapshot = (await conditionsSnapshot(bucket, undefined, now)).html;
+  const oldSnapshot = snapshot.replace('\n    ', '\n    <p class="conditions-as-of">Conditions snapshot: old timestamp</p>');
+  await bucket.put('pages/index.html', replaceConditions(clean, oldSnapshot), { customMetadata: index.customMetadata });
+  const before = (await bucket.head('pages/index.html'))!;
+  await composeHomepageConditions(bucket, base);
+  const after = (await bucket.get('pages/index.html'))!;
+  expect(after.version).not.toBe(before.version);
+  const html = await after.text();
+  expect(html).not.toContain('conditions-as-of');
+  expect(html).not.toContain('Conditions snapshot:');
+  expect(withoutIndexFence(html)).toBe(withoutIndexFence(clean));
+  expect(after.customMetadata).toEqual(index.customMetadata);
+  await composeHomepageConditions(bucket, base);
+  expect((await bucket.head('pages/index.html'))!.version).toBe(after.version);
 });
 
 it('logs the neutral conditions metadata code and retains pending intent without replacing the page', async () => {
