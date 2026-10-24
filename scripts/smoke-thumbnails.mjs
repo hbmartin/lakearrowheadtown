@@ -1,22 +1,39 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
-import { readFile, writeFile, mkdtemp } from 'node:fs/promises';
+import { readFile, writeFile, mkdtemp, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { imageSize } from 'image-size';
 import { createSmokeContext } from './smoke-support.mjs';
 import { maintenanceTarget } from './maintenance.mjs';
+import { reportFailure, ValidationError } from './validation-errors.mjs';
+
+export const THUMBNAIL_ARTIFACT_LIMIT = 1024 * 1024;
+export async function thumbnailBytes(response) {
+  const reader = response.body?.getReader();
+  if (!reader) throw new ValidationError('thumbnail_empty', 'Thumbnail response has no image body');
+  const parts = []; let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break;
+      size += value.byteLength;
+      if (size > THUMBNAIL_ARTIFACT_LIMIT) throw new ValidationError('thumbnail_oversized', 'Thumbnail artifact exceeds 1 MiB');
+      parts.push(value);
+    }
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  return Buffer.concat(parts, size);
+}
 
 // Writes fixtures only to the allowlisted preview environment, never production.
 export async function smokeThumbnails(args = process.argv.slice(2), options = {}) {
 const origin = maintenanceTarget('preview', args[0]);
 if (new URL(origin).hostname === 'localhost') throw new Error('Thumbnail acceptance requires the deployed preview Images binding and Workers Cache');
 const context = createSmokeContext(origin, { ...options, artifactName: 'thumbnails' });
-return context.run(async () => {
+const result = await context.run(async () => {
 const fetch = context.request; const auth = context.headers;
 const directory = options.artifactsDirectory ?? await mkdtemp(join(tmpdir(), 'lakearrowhead-thumbnails-'));
-await (await import('node:fs/promises')).mkdir(directory, { recursive: true });
+if (options.artifactsDirectory) await mkdir(directory, { recursive: true });
 const photo = await readFile(new URL('../test/fixtures/thumbnail-pattern.jpg', import.meta.url));
 assert.deepEqual(imageSize(photo), { width: 1920, height: 1280, type: 'jpg' });
 const fixtures = [
@@ -47,11 +64,12 @@ for (const fixture of fixtures) {
   assert.equal(modern.status, 200, `Expected optimized ${fixture.name}, got ${modern.status}`);
   assert.equal(modern.headers.get('content-type'), 'image/webp');
   assert(!modern.headers.get('vary')?.split(',').some(value => value.trim().toLowerCase() === 'accept'));
-  const bytes = Buffer.from(await modern.arrayBuffer());
-  await writeFile(join(directory, `${fixture.name}.webp`), bytes);
+  const bytes = await thumbnailBytes(modern);
   const encoded = imageSize(bytes);
+  assert.equal(encoded.type, 'webp', 'Thumbnail bytes must be WebP');
   const scale = Math.min(1, 480 / Math.max(upload.width, upload.height));
   assert.equal(encoded.width, Math.max(1, Math.floor(upload.width * scale)));
+  assert.equal(encoded.height, Math.max(1, Math.floor(upload.height * scale)));
   const legacy = await fetch(thumbnail(fixture, 480, fixture.extension), { headers: { Accept: 'image/webp;q=0,*/*;q=1' }, redirect: 'manual' });
   assert.equal(legacy.status, 200);
   assert.equal(legacy.headers.get('content-type'), fixture.type);
@@ -85,7 +103,8 @@ for (const fixture of fixtures) {
   } else {
     assert.equal(chunks(bytes).filter(chunk => chunk.type === 'ANMF').length, 2, 'WebP must preserve both animation frames');
   }
-  console.log(JSON.stringify({ fixture: fixture.name, source_bytes: fixture.bytes.length, thumbnail_bytes: bytes.length, reduction_percent: Number((100 * (1 - bytes.length / fixture.bytes.length)).toFixed(2)), dimensions: encoded, cache: 'HIT' }));
+  await writeFile(join(directory, `${fixture.name}.webp`), bytes);
+  (options.log ?? console.log)(JSON.stringify({ fixture: fixture.name, source_bytes: fixture.bytes.length, thumbnail_bytes: bytes.length, reduction_percent: Number((100 * (1 - bytes.length / fixture.bytes.length)).toFixed(2)), dimensions: encoded, cache: 'HIT' }));
 }
 const now = context.now().toISOString();
 const run = `thumbnail:${crypto.randomUUID()}`;
@@ -106,10 +125,11 @@ assert(homepage.includes('<picture>'));
 const v1 = await fetch(`${origin}/thumbnails/v1/${fixtures[0].url.split('/').at(-1)}/160`, { headers: { Accept: 'image/webp' }, redirect: 'manual' });
 assert.equal(v1.status, 200); assert.equal(v1.headers.get('content-type'), 'image/webp'); await v1.arrayBuffer();
 assert(homepage.includes('sizes="(max-width: 600px) 96px, 160px"'));
-console.log(JSON.stringify({ preview: origin, artifacts: directory, status: 'passed' }));
-return { origin, post_id: published.post.id };
+return { origin, post_id: published.post.id, artifacts: directory };
 });
+(options.log ?? console.log)(JSON.stringify({ preview: origin, artifacts: result.artifacts, status: 'passed' }));
+return result;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { await smokeThumbnails(undefined, { artifactsDirectory: '.artifacts/preview' }); } catch (error) { console.error(`Thumbnail acceptance failed (${error.name}); inspect .artifacts/preview/thumbnails.json.`); process.exitCode = 1; }
+  try { await smokeThumbnails(undefined, { artifactsDirectory: '.artifacts/preview' }); } catch (error) { reportFailure('Thumbnail acceptance failed; inspect .artifacts/preview/thumbnails.json', error); process.exitCode = 1; }
 }

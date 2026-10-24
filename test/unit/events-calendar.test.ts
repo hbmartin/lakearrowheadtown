@@ -19,8 +19,10 @@ it.each([
 });
 it('bounds combined validation issues and handles non-object inputs', () => {
   for (const value of [null, [], {}, { items: [null] }]) expect(() => validateEvents(value)).toThrow();
+  expect(() => validateEvents({ items: Array.from({ length: 60 }, () => ({ all_day: 'invalid', location: 1 })) }))
+    .toThrow(expect.objectContaining({ details: expect.any(Array), details_truncated: true }));
   try { validateEvents({ items: Array.from({ length: 60 }, () => ({ all_day: 'invalid', location: 1 })) }); }
-  catch (error: any) { expect(error.details).toHaveLength(50); expect(error.details_truncated).toBe(true); }
+  catch (error: any) { expect(error.details).toHaveLength(50); }
 });
 it('keeps exclusive ends and Pacific dates across both DST transitions', () => {
   expect(eventDates(timed({ all_day: true, starts_at: '2026-10-24', ends_at: '2026-10-27' }))).toEqual({ first: '2026-10-24', last: '2026-10-26' });

@@ -125,11 +125,12 @@ it.each(['preparation_ack', 'index_ack', 'activation', 'activation_ack', 'result
       }));
     }
     try {
-      const response = await request(input); expect(response.status).toBe(fault === 'result_read' ? 500 : 503);
+      const response = await request(input); expect(response.status).toBe(503);
       failed = await response.json<any>();
-      expect(failed).toMatchObject({ code: fault === 'result_read' ? 'storage_error' : 'repair_pending', retryable: true,
+      expect(failed).toMatchObject({ code: 'repair_pending', retryable: true,
         publication_status: fault === 'preparation_ack' ? 'not_committed' : fault === 'index_ack' ? 'unknown' : 'committed',
-        details: { repair_id: expect.any(String), job_id: expect.any(String) }, ...(fault === 'result_read' ? {} : { retry_at: expect.any(String) }) });
+        details: { repair_id: expect.any(String), job_id: expect.any(String) }, retry_at: expect.any(String) });
+      expect(response.headers.get('Retry-After')).toMatch(/^\d+$/);
     } finally { spies.forEach(spy => spy.mockRestore()); }
   });
   expect(injected).toBe(true);
@@ -585,13 +586,13 @@ it.each([false, true])('retains recovery diagnostics through retry exhaustion an
     const head = instance.env.SITE_BUCKET.head.bind(instance.env.SITE_BUCKET);
     const get = state.storage.get.bind(state.storage) as any;
     const fault = known
-      ? vi.spyOn(state.storage, 'get').mockImplementation((key: any) => { if (key === 'migration') throw new Error('Private receipt outage'); return get(key); })
+      ? vi.spyOn(state.storage, 'get').mockImplementation((key: any) => { if ((Array.isArray(key) ? key : [key]).includes('migration')) throw new Error('Private receipt outage'); return get(key); })
       : vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => { if (key === 'pages/index.html') throw new Error('Private receipt outage'); return head(key); });
     try { for (let attempt = 0; attempt <= 6; attempt++) { await state.storage.deleteAlarm(); await expect(instance.alarm()).rejects.toBeInstanceOf(OperationFailure); } }
     finally { fault.mockRestore(); }
   });
   await evictDurableObject(publisher());
-  expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'running', blocked: { reason: 'unscheduled' }, recovery: { code: 'storage_error', stage: known ? 'rebuild_migration_receipt' : 'rebuild_receipt_read', retryable: true, publication_status: known ? 'committed' : 'unknown' } });
+  expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'running', blocked: { reason: 'unscheduled' }, recovery: { code: 'storage_error', stage: known ? 'rebuild_finalization_read' : 'rebuild_receipt_read', retryable: true, publication_status: known ? 'committed' : 'unknown' } });
   expect(await publisher().resumeRebuild(queued.id)).toMatchObject({ status: 'queued' }); await runDurableObjectAlarm(publisher());
   expect(await publisher().jobStatus(queued.id)).toMatchObject({ status: 'completed' });
   expect((await bindings.SITE_BUCKET.head('pages/index.html'))!.version).toBe(version);
@@ -725,7 +726,7 @@ it.each(['unknown', 'committed'] as const)('preserves %s evidence across explici
     const head = instance.env.SITE_BUCKET.head.bind(instance.env.SITE_BUCKET);
     const get = state.storage.get.bind(state.storage) as any;
     const fault = certainty === 'committed'
-      ? vi.spyOn(state.storage, 'get').mockImplementation((key: any) => { if (key === 'migration') throw new Error('Recovery outage after resume'); return get(key); })
+      ? vi.spyOn(state.storage, 'get').mockImplementation((key: any) => { if ((Array.isArray(key) ? key : [key]).includes('migration')) throw new Error('Recovery outage after resume'); return get(key); })
       : vi.spyOn(instance.env.SITE_BUCKET, 'head').mockImplementation((key: any) => { if (key === 'pages/index.html') throw new Error('Recovery outage after resume'); return head(key); });
     try { await expect(instance.alarm()).rejects.toBeDefined(); } finally { fault.mockRestore(); }
     expect(await instance.jobStatus(queued.id)).toMatchObject({ recovery: { publication_status: certainty } });

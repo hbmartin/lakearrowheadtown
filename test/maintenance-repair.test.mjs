@@ -10,6 +10,14 @@ let clock = 0;
 const advance = async ms => { clock += ms; };
 const options = { secret, origin: 'http://localhost:8787', now: () => clock, sleep: advance };
 
+test('checkpoint guidance resumes the blocking repair or the rebuild according to its identity', async () => {
+  for (const repair of [undefined, 'repair-identity']) {
+    const job = { id, status: 'queued', blocked: { reason: 'rebuild_checkpoint_damaged', job_id: id, ...(repair ? { repair_id: repair } : {}) } };
+    await assert.rejects(waitForRebuild(job, 'preview', options), error => error.message.includes('finalization checkpoint')
+      && (repair ? error.message.includes('explicitly resume repair recovery') && error.message.includes(repair) : error.message.includes('explicitly resume it')));
+  }
+});
+
 test('snapshot uses authenticated GET and repair submits the reviewed JSON without altering its expected version', async () => {
   for (const operation of ['snapshot', 'repair']) {
     const result = await maintenance(operation, 'preview', undefined, { ...options, payload: operation === 'repair' ? payload : undefined,

@@ -332,7 +332,7 @@ export class DigestPublisher extends DurableObject<Env> {
     return this.serialize(async () => {
       const trace = new OperationTrace(context);
       try { return { ok: true, result: await this.repairCoordinator().control(action, input, trace) }; }
-      catch (error) { const failure = asHttpError(error); return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, details: failure.details, retryable: failure.retryable, stage: trace.failed_stage ?? 'repair_recovery', publication_status: failure.publication_status ?? 'not_attempted' } }; }
+      catch (error) { const failure = asHttpError(error); return { ok: false, failure: { status: failure.status, code: failure.code, error: failure.message, details: failure.details, retryable: failure.retryable, stage: trace.failed_stage ?? 'repair_recovery', publication_status: failure.publication_status ?? 'not_attempted', ...(failure.retry_at ? { retry_at: failure.retry_at } : {}) } }; }
     }, context);
   }
 
@@ -541,7 +541,10 @@ export class DigestPublisher extends DurableObject<Env> {
       const bootstrapContext: OperationContext = { request_id: crypto.randomUUID(), worker_version: this.env.CF_VERSION_METADATA?.id ?? 'local', environment: this.env.ENVIRONMENT ?? 'local', operation: 'rebuild' };
       return await this.serialize(async () => {
         const bootstrap = new OperationTrace(bootstrapContext);
-        try { if (await this.repairCoordinator().recover(bootstrap, true) === 'cancelled') return; }
+        try {
+          const recovery = await this.repairCoordinator().recover(bootstrap, true);
+          if (recovery === 'cancelled' || typeof recovery === 'object') return;
+        }
         catch (error) { if (repairErrorState(asHttpError(error).code)?.stopAlarm) return; throw error; }
         let ids: string[];
         let job: RebuildJob | null | undefined;
@@ -571,17 +574,18 @@ export class DigestPublisher extends DurableObject<Env> {
         // Receipt reads/finalization fail through platform redelivery, never the
         // pre-commit failure path. The marker survives later index replacements.
         try {
-          const keys = [checkpointKey(job.id), ...(job.generation_id ? [generationKey(job.id, job.generation_id)] : [])];
+          const keys = [checkpointKey(job.id), ...(job.generation_id ? [generationKey(job.id, job.generation_id)] : []), ...(inherited === 'committed' ? ['migration'] : [])];
           const evidence = await trace.run('rebuild_finalization_read', () => boundary('storage', () => this.ctx.storage.get(keys)));
           if (job.generation_id) await trace.run('rebuild_generation_read', () => readHandoff(evidence.get(generationKey(job!.id, job!.generation_id!)), job!));
           let finalization = await trace.run('rebuild_finalization_validation', () => readCheckpoint(evidence.get(checkpointKey(job!.id)), job!));
           if (inherited === 'committed' && finalization) {
             if (finalization.version === 2 && finalization.phase === 'prepared') throw checkpointDamaged('Committed recovery contradicts a prepared checkpoint. Restore the matching dispatch checkpoint before resuming.');
-            const migration = finalization.migration ?? await trace.run('rebuild_migration_receipt', () => boundary('storage', () => this.ctx.storage.get('migration')));
+            const persistedMigration = evidence.get('migration');
+            const migration = finalization.migration ?? persistedMigration;
             if (!completeMigration(migration)) throw checkpointDamaged('Committed migration bookkeeping is missing. Restore the matching finalization checkpoint before resuming.');
             trace.publication_status = 'committed';
             phase = 'finalizing';
-            await this.finalizeRebuild(job, ids, migration, undefined, trace); return;
+            await this.finalizeRebuild(job, ids, JSON.stringify(migration) === JSON.stringify(persistedMigration) ? undefined : migration, undefined, trace); return;
           }
           if (inherited !== 'committed' && (!finalization || finalization.version === 2 && finalization.phase === 'prepared')) inherited = 'not_committed';
           // A prepared checkpoint proves non-dispatch. Absence still needs a

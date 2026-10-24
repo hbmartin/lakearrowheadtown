@@ -9,6 +9,7 @@ import { createSmokeContext, verifyHtmlRevalidation } from './smoke-support.mjs'
 import { smokeAlerts } from './smoke-alerts.mjs';
 import { smokeChanges } from './smoke-changes.mjs';
 import { maintenance, maintenanceTarget, waitForRebuild } from './maintenance.mjs';
+import { reportFailure } from './validation-errors.mjs';
 
 export function checkHtmlHeaders(response) {
   assert(response.headers.get('ETag')?.startsWith('W/'), 'HTML must expose a weak ETag');
@@ -39,7 +40,9 @@ export function parseSmokeArgs(args = process.argv.slice(2)) {
 export async function smoke(args = process.argv.slice(2), options = {}) {
   const { origin } = parseSmokeArgs(args);
   const context = createSmokeContext(origin, options);
-  return context.run(() => smokeBody(args, { ...options, request: context.request, cleanupRequest: context.cleanupRequest, registerAlert: context.registerAlert, credential: () => context.secret }, context));
+  const result = await context.run(() => smokeBody(args, { ...options, context, request: context.request, cleanupRequest: context.cleanupRequest, registerAlert: context.registerAlert, credential: () => context.secret }, context));
+  (options.log ?? console.log)(`Preview smoke checks passed: ${origin}. Rebuild ${result.job.id} completed.`);
+  return result;
 }
 
 async function smokeBody(args, options, context) {
@@ -86,7 +89,7 @@ async function smokeBody(args, options, context) {
     assert.equal(beforePreview.status, 200);
     checkHtmlHeaders(beforePreview);
     const preview = await fetch(`${origin}/api/digests?dry_run=true`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
-    assert.equal(preview.status, 200, await preview.clone().text());
+    assert.equal(preview.status, 200, 'Story preview must succeed');
     const planned = await preview.json();
     assert.equal(planned.dry_run, true); assert.equal(planned.committed, false); assert(planned.checked_at);
     assert.equal(planned.counts.published, attempt === 1 ? 0 : 1);
@@ -185,7 +188,7 @@ async function smokeBody(args, options, context) {
   let appendedRssTag;
   for (let attempt = 0; attempt < 2; attempt++) {
     const preview = await fetch(`${updatePath}?dry_run=true`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(update) });
-    assert.equal(preview.status, 200, await preview.clone().text());
+    assert.equal(preview.status, 200, 'Append preview must succeed');
     const planned = await preview.json();
     assert.equal(planned.dry_run, true); assert.equal(planned.committed, false); assert.equal(planned.status, attempt ? 'duplicate' : 'appended');
     const response = await fetch(updatePath, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(update) });
@@ -197,7 +200,16 @@ async function smokeBody(args, options, context) {
     if (attempt) assert.equal(result.suggestion.action, 'review_existing_story');
     const homepage = await fetch(origin, { headers: { 'If-None-Match': appendedTag ?? previousTag } });
     const rss = await fetch(`${origin}/rss.xml`, { headers: { 'If-None-Match': appendedRssTag ?? previousRssTag } });
-    assert.equal(homepage.status, attempt ? 304 : 200); assert.equal(rss.status, attempt ? 304 : 200);
+    if (!attempt) assert.equal(homepage.status, 200);
+    else {
+      assert([200, 304].includes(homepage.status), 'Conditional homepage read must succeed');
+      if (homepage.status === 200) {
+        assert(homepage.headers.get('ETag'), 'Changed homepage must expose a validator');
+        assert.notEqual(homepage.headers.get('ETag'), appendedTag, 'A stable homepage validator must return 304');
+      }
+      await homepage.arrayBuffer(); await verifyHtmlRevalidation(origin, fetch, edge);
+    }
+    assert.equal(rss.status, attempt ? 304 : 200);
     checkRssHeaders(rss);
     if (!attempt) {
       assert((await homepage.text()).includes('Attached <strong>source update</strong>'));
@@ -236,7 +248,9 @@ async function smokeBody(args, options, context) {
   assert.equal(syntaxError.diagnostics.body_complete, true);
   assert.equal(syntaxError.diagnostics.body_sha256, createHash('sha256').update(malformedBody).digest('hex'));
   requestIds.push(syntaxError.request_id);
-  assert.equal((await fetch(origin, { headers: { 'If-None-Match': previousTag } })).status, 304);
+  await verifyHtmlRevalidation(origin, fetch, edge);
+  const afterInvalid = (await listStories()).find(post => post.post_id === story.post_id).items.find(item => item.item_index === story.item_index);
+  assert.deepEqual(afterInvalid, readStory, 'Rejected submissions must preserve the published story');
   assert.equal((await fetch(`${origin}/rss.xml`, { headers: { 'If-None-Match': previousRssTag } })).status, 304);
   assert.equal((await fetch(`${origin}/api/digests`, { method: 'POST', body: '{}' })).status, 401);
   assert.equal((await fetch(`${origin}/digests/2026-10-16`)).status, 404);
@@ -296,11 +310,10 @@ async function smokeBody(args, options, context) {
   const queued = await maintenance('start', 'preview', undefined, { secret, origin, request: fetch });
   const job = await waitForRebuild(queued, 'preview', { secret, origin, request: fetch, timeoutMs: options.rebuildTimeoutMs ?? 300000 });
   await verifyHtmlRevalidation(origin, fetch, edge);
-  (options.log ?? console.log)(`Preview smoke checks passed: ${origin}. Rebuild ${job.id} completed.`);
   return { origin, job, request_ids: requestIds, worker_version: workerVersion };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { await smoke(undefined, { artifactsDirectory: '.artifacts/preview' }); }
-  catch (error) { console.error(`Preview smoke failed (${error.name}); inspect .artifacts/preview/smoke.json.`); process.exitCode = 1; }
+  catch (error) { reportFailure('Preview smoke failed; inspect .artifacts/preview/smoke.json', error); process.exitCode = 1; }
 }

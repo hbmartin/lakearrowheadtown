@@ -1,4 +1,4 @@
-import { asHttpError, type HttpError } from './errors';
+import { asHttpError, HttpError } from './errors';
 import type { PublicationStatus, RebuildBlocker } from './types';
 
 const states: Record<string, { reason: RebuildBlocker['reason']; stopAlarm: boolean; message: string }> = {
@@ -13,9 +13,16 @@ export const repairErrorState = (code: string) => Object.hasOwn(states, code) ? 
 export interface RepairFailureContext { publication_status: PublicationStatus; repair_id?: string; job_id?: string }
 
 /** Enrich the envelope without discarding the original exception's prototype or diagnostics. */
-export function repairFailure(error: unknown, context: RepairFailureContext): HttpError {
-  const failure = asHttpError(error);
-  const { publication_status, ...ids } = context;
+export function repairFailure(error: unknown, context: RepairFailureContext, completion?: { retry_at?: string }): HttpError {
+  let failure = asHttpError(error);
+  if (completion && context.publication_status === 'committed' && failure.code === 'storage_error' && failure.retryable) {
+    failure = new HttpError(503, 'Repair committed; retry the identical request to recover its result.', {}, {
+      code: 'repair_pending', retryable: true, publication_status: 'committed',
+      retry_at: completion.retry_at && Date.parse(completion.retry_at) > Date.now() ? completion.retry_at : new Date(Date.now() + 1000).toISOString(),
+    });
+  }
+  const { publication_status } = context;
+  const ids = Object.fromEntries(Object.entries(context).filter(([key, value]) => key !== 'publication_status' && value !== undefined));
   const enriched = Object.create(Object.getPrototypeOf(failure), Object.getOwnPropertyDescriptors(failure)) as HttpError;
   return Object.defineProperties(enriched, {
     stack: { value: failure.stack, configurable: true },

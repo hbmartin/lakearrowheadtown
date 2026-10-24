@@ -19,8 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
-      group: local-tests-${{ github.ref }}
-      cancel-in-progress: true
+      group: local-tests-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -44,6 +44,7 @@ jobs:
           path: |
             .artifacts/
             coverage/
+            !coverage/tooling/tmp/**
           retention-days: 14
           include-hidden-files: true
       - name: Upload application coverage
@@ -102,11 +103,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           PREVIEW_API_SECRET: ${{ secrets.PREVIEW_API_SECRET }}
-        run: |
-          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID PREVIEW_API_SECRET; do
-            if [ -z "${!name}" ]; then echo "::error::Missing CI configuration: $name"; exit 1; fi
-          done
-          npm run test:preview
+        run: npm run test:preview
       - name: Upload preview diagnostics
         if: always()
         uses: actions/upload-artifact@v6

@@ -9,7 +9,8 @@ import { deploy } from './deploy.mjs';
 import { maintenanceTarget, waitForRebuild } from './maintenance.mjs';
 import { smoke } from './smoke-preview.mjs';
 import { smokeThumbnails } from './smoke-thumbnails.mjs';
-import { createSmokeContext } from './smoke-support.mjs';
+import { createSmokeContext, withCleanup } from './smoke-support.mjs';
+import { reportFailure, safeFailure, ValidationError } from './validation-errors.mjs';
 
 export function validateCandidate(candidate, expected) {
   assert.equal(candidate.state, 'OPEN', 'Candidate PR is no longer open');
@@ -25,46 +26,63 @@ export function versionForTag(versions, tag) {
 }
 export async function previewCI(options = {}) {
   const variables = options.variables ?? process.env;
-  if (variables.GITHUB_ACTIONS === 'true') for (const name of ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'PREVIEW_API_SECRET']) assert(variables[name], `Missing CI configuration: ${name}`);
-  const origin = maintenanceTarget('preview', options.origin);
-  const secret = validateCredential((options.credential ?? readPublishingCredential)('preview'));
-  const command = options.command ?? ((args) => execFileSync(args[0], args.slice(1), { encoding: 'utf8' }));
-  const sha = options.sha ?? variables.CANDIDATE_SHA ?? command(['git', 'rev-parse', 'HEAD']).trim();
-  assert.match(sha, /^[a-f0-9]{40}$/);
-  const pr = variables.CANDIDATE_PR;
-  if (pr) {
-    assert.match(pr, /^\d+$/);
-    const candidate = JSON.parse(await command(['gh', 'pr', 'view', pr, '--repo', 'hbmartin/lakearrowheadtown', '--json', 'state,isCrossRepository,headRefOid,baseRefOid']));
-    validateCandidate(candidate, { head: variables.CANDIDATE_HEAD_SHA, base: variables.CANDIDATE_BASE_SHA });
-  }
-  const tag = `ci-${sha.slice(0, 12)}-${variables.GITHUB_RUN_ID ?? crypto.randomUUID()}-${variables.GITHUB_RUN_ATTEMPT ?? '1'}`;
   const directory = options.artifactsDirectory ?? '.artifacts/preview';
-  await mkdir(directory, { recursive: true });
-  const result = { candidate_sha: sha, pr: pr ?? null, tag, status: 'failed' };
-  try {
-    const queued = await (options.deploy ?? deploy)('preview', { secret, origin, tag, message: `API validation ${sha}`, request: options.request });
-    const versions = JSON.parse(await command(['npx', 'wrangler', 'versions', 'list', '--env', 'preview', '--json']));
-    result.worker_version = versionForTag(versions, tag); result.rebuild_id = queued.id;
-    const config = options.config ?? unstable_readConfig({ config: 'wrangler.jsonc', env: 'preview' });
-    assert(['true', 'false'].includes(config.vars?.ALERT_CONFIRMATIONS_ENABLED), 'Preview confirmation mode must be explicit');
-    const common = { ...options, credential: () => secret, expectedVersion: result.worker_version,
-      expectedConfirmations: config.vars.ALERT_CONFIRMATIONS_ENABLED === 'true', candidateSha: sha, artifactsDirectory: directory };
-    const context = createSmokeContext(origin, { ...common, artifactName: 'rebuild' });
-    await context.run(() => (options.wait ?? waitForRebuild)(queued, 'preview', { secret, origin, request: context.request, timeoutMs: 300000 }));
-    await (options.smoke ?? smoke)([origin, '--verify-edge'], common);
-    await (options.thumbnails ?? smokeThumbnails)([origin], common);
-    // A final version check catches deployment drift after the last fixture write.
-    const finalContext = createSmokeContext(origin, { ...common, artifactName: 'final-version' });
-    await finalContext.run(async () => { const response = await finalContext.request(origin + '/api/posts?fields=index', { headers: finalContext.headers }); assert.equal(response.status, 200); });
-    if (pr) {
-      const current = JSON.parse(await command(['gh', 'pr', 'view', pr, '--repo', 'hbmartin/lakearrowheadtown', '--json', 'state,isCrossRepository,headRefOid,baseRefOid']));
-      validateCandidate(current, { head: variables.CANDIDATE_HEAD_SHA, base: variables.CANDIDATE_BASE_SHA });
-    }
-    result.status = 'passed'; return result;
-  } catch (error) { result.failure = error.name; throw error; }
-  finally { await writeFile(join(directory, 'result.json'), JSON.stringify(result, null, 2)); }
+  const result = { candidate_sha: null, pr: null, status: 'failed', stage: 'configuration' };
+  const secrets = Object.entries(variables).filter(([key]) => /TOKEN|SECRET|KEY/.test(key)).map(([, value]) => value);
+  return withCleanup(async () => {
+    try {
+      if (variables.GITHUB_ACTIONS === 'true') for (const name of ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'PREVIEW_API_SECRET']) assert(variables[name], `Missing CI configuration: ${name}`);
+      const origin = maintenanceTarget('preview', options.origin);
+      let secret;
+      try { secret = validateCredential((options.credential ?? readPublishingCredential)('preview')); }
+      catch (cause) { throw new ValidationError('credential_invalid', 'Publishing credential is invalid or unavailable', { cause }); }
+      secrets.push(secret);
+      const execute = options.command ?? (args => execFileSync(args[0], args.slice(1), { encoding: 'utf8' }));
+      const command = async args => {
+        try { return await execute(args); }
+        catch (cause) { throw new ValidationError('command_failed', `Command failed: ${args[0]} ${args[1]}`, { cause }); }
+      };
+      result.stage = 'candidate';
+      const sha = options.sha?.trim() || variables.CANDIDATE_SHA?.trim() || String(await command(['git', 'rev-parse', 'HEAD'])).trim();
+      assert.match(sha, /^[a-f0-9]{40}$/, 'Candidate SHA must be 40 lowercase hexadecimal characters');
+      result.candidate_sha = sha;
+      const pr = variables.CANDIDATE_PR;
+      const inspect = async () => {
+        assert.match(pr, /^\d+$/, 'Candidate PR must be numeric');
+        result.pr = pr;
+        const candidate = JSON.parse(await command(['gh', 'pr', 'view', pr, '--repo', 'hbmartin/lakearrowheadtown', '--json', 'state,isCrossRepository,headRefOid,baseRefOid']));
+        validateCandidate(candidate, { head: variables.CANDIDATE_HEAD_SHA, base: variables.CANDIDATE_BASE_SHA });
+      };
+      if (pr) await inspect();
+      const tag = `ci-${sha.slice(0, 12)}-${variables.GITHUB_RUN_ID ?? crypto.randomUUID()}-${variables.GITHUB_RUN_ATTEMPT ?? '1'}`;
+      result.tag = tag; result.stage = 'deployment';
+      const queued = await (options.deploy ?? deploy)('preview', { secret, origin, tag, message: `API validation ${sha}`, request: options.request });
+      const versions = JSON.parse(await command(['npx', 'wrangler', 'versions', 'list', '--env', 'preview', '--json']));
+      result.worker_version = versionForTag(versions, tag); result.rebuild_id = queued.id;
+      const config = options.config ?? unstable_readConfig({ config: 'wrangler.jsonc', env: 'preview' });
+      assert(['true', 'false'].includes(config.vars?.ALERT_CONFIRMATIONS_ENABLED), 'Preview confirmation mode must be explicit');
+      const common = { ...options, credential: () => secret, expectedVersion: result.worker_version,
+        expectedConfirmations: config.vars.ALERT_CONFIRMATIONS_ENABLED === 'true', candidateSha: sha, artifactsDirectory: directory };
+      const context = createSmokeContext(origin, { ...common, artifactName: 'rebuild' });
+      result.stage = 'rebuild';
+      await context.run(() => (options.wait ?? waitForRebuild)(queued, 'preview', { ...common, secret, origin, request: context.request, timeoutMs: 300000 }));
+      result.stage = 'smoke';
+      await (options.smoke ?? smoke)([origin, '--verify-edge'], common);
+      result.stage = 'thumbnails';
+      await (options.thumbnails ?? smokeThumbnails)([origin], common);
+      // A final version check catches deployment drift after the last fixture write.
+      const finalContext = createSmokeContext(origin, { ...common, artifactName: 'final-version' });
+      await finalContext.run(async () => { const response = await finalContext.request(origin + '/api/posts?fields=index', { headers: finalContext.headers }); assert.equal(response.status, 200); });
+      result.stage = 'final_candidate';
+      if (pr) await inspect();
+      result.status = 'passed'; return result;
+    } catch (error) { result.failure = safeFailure(error, secrets); throw error; }
+  }, async () => {
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, 'result.json'), JSON.stringify(result, null, 2));
+  });
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { console.log(JSON.stringify(await previewCI())); }
-  catch (error) { console.error(`Preview API validation failed (${error.name}); inspect .artifacts/preview diagnostics.`); process.exitCode = 1; }
+  catch (error) { reportFailure('Preview API validation failed; inspect .artifacts/preview', error); process.exitCode = 1; }
 }
