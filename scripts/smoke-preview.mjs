@@ -4,7 +4,8 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { SaxesParser } from 'saxes';
-import { readCredential, validateCredential } from './credentials.mjs';
+import { readPublishingCredential, validateCredential } from './credentials.mjs';
+import { createSmokeContext, verifyHtmlRevalidation } from './smoke-support.mjs';
 import { smokeAlerts } from './smoke-alerts.mjs';
 import { smokeChanges } from './smoke-changes.mjs';
 import { maintenance, maintenanceTarget, waitForRebuild } from './maintenance.mjs';
@@ -24,7 +25,7 @@ export function checkRssHeaders(response) {
 
 export async function readSmokeNews(fetch, origin, headers) {
   const response = await fetch(`${origin}/api/posts?fields=index`, { headers });
-  assert.equal(response.status, 200, await response.clone().text());
+  assert.equal(response.status, 200, 'Unexpected API response status');
   const result = await response.json(); assert.equal(result.ok, true); assert(Array.isArray(result.posts));
   return result;
 }
@@ -36,20 +37,26 @@ export function parseSmokeArgs(args = process.argv.slice(2)) {
 }
 
 export async function smoke(args = process.argv.slice(2), options = {}) {
+  const { origin } = parseSmokeArgs(args);
+  const context = createSmokeContext(origin, options);
+  return context.run(() => smokeBody(args, { ...options, request: context.request, cleanupRequest: context.cleanupRequest, registerAlert: context.registerAlert, credential: () => context.secret }, context));
+}
+
+async function smokeBody(args, options, context) {
   const { origin, edge } = parseSmokeArgs(args);
-  const fetch = (url, init = {}) => (options.request ?? globalThis.fetch)(url, { ...init, signal: AbortSignal.timeout(30000) });
-  const secret = validateCredential((options.credential ?? readCredential)('preview'));
+  const fetch = (url, init = {}) => (options.request ?? globalThis.fetch)(url, init);
+  const secret = validateCredential((options.credential ?? readPublishingCredential)('preview'));
   const headers = { Authorization: `Bearer ${secret}` };
   // Confirm support through a read before any dry_run request reaches an older writer.
   const capability = await fetch(`${origin}/api/posts?fields=index`, { headers });
-  assert.equal(capability.status, 200, await capability.clone().text());
+  assert.equal(capability.status, 200, 'Unexpected capability response status');
   assert.equal(capability.headers.get('X-API-Version'), '3');
   const supported = await capability.json(); assert.equal(supported.ok, true); assert.equal(supported.fields, 'index');
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
   const form = new FormData();
   form.append('file', new File([png], 'preview.png', { type: 'image/png' }));
   const imageResponse = await fetch(`${origin}/api/images`, { method: 'POST', headers, body: form });
-  assert.equal(imageResponse.status, 200, await imageResponse.clone().text());
+  assert.equal(imageResponse.status, 200, 'Unexpected image response status');
   const { url: imageUrl, width, height } = await imageResponse.json();
   assert.equal(width, 1); assert.equal(height, 1);
   assert.equal(new URL(imageUrl).origin, origin);
@@ -63,7 +70,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   const input = {
     date: '2099-01-01', title: run, source: 'deployment-smoke-test',
     client_ref: `smoke:${crypto.randomUUID()}`,
-    items: [{ group: 'Preview verification', group_url: 'https://lakearrowhead.town/', headline: run, body: `This is preview test content.\n\n**Markdown works.**\n\n![Uploaded image](${imageUrl})`, post_url: `https://lakearrowhead.town/?smoke=${encodeURIComponent(run)}`, category: 'announcement', posted_at: new Date().toISOString() }],
+    items: [{ group: 'Preview verification', group_url: 'https://lakearrowhead.town/', headline: run, body: `This is preview test content.\n\n**Markdown works.**\n\n![Uploaded image](${imageUrl})`, post_url: `https://lakearrowhead.town/?smoke=${encodeURIComponent(run)}`, category: 'announcement', posted_at: context.now().toISOString() }],
   };
   let previousTag;
   let previousRssTag;
@@ -88,8 +95,9 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     checkHtmlHeaders(unchanged);
     const afterNews = await readSmokeNews(fetch, origin, headers);
     assert.deepEqual(afterNews.posts, beforeNews.posts); assert.equal(afterNews.published_at, beforeNews.published_at);
+    context.registerDigest(input.client_ref);
     const response = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
-    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal(response.status, 200, 'Unexpected API response status');
     const result = await response.json();
     story ??= result.items[0];
     assert.equal(result.ok, true); assert.equal(result.url, '/');
@@ -160,7 +168,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     const posts = [];
     do {
       const response = await fetch(`${origin}/api/posts?days=7${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, { headers });
-      assert.equal(response.status, 200, await response.clone().text());
+      assert.equal(response.status, 200, 'Unexpected API response status');
       assert.equal(response.headers.get('Cache-Control'), 'no-store');
       const result = await response.json();
       assert.equal(result.ok, true);
@@ -171,7 +179,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     return posts;
   };
   assert((await listStories()).some(post => post.post_id === story.post_id && post.items.some(item => item.item_index === story.item_index)));
-  const update = { group: 'Preview follow-up', post_url: `${input.items[0].post_url}&attached=1`, body: `Attached **source update** for ${run}.`, posted_at: new Date().toISOString() };
+  const update = { group: 'Preview follow-up', post_url: `${input.items[0].post_url}&attached=1`, body: `Attached **source update** for ${run}.`, posted_at: context.now().toISOString() };
   const updatePath = `${origin}/api/posts/${story.post_id}/items/${story.item_index}/updates`;
   let appendedTag;
   let appendedRssTag;
@@ -181,7 +189,7 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
     const planned = await preview.json();
     assert.equal(planned.dry_run, true); assert.equal(planned.committed, false); assert.equal(planned.status, attempt ? 'duplicate' : 'appended');
     const response = await fetch(updatePath, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(update) });
-    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal(response.status, 200, 'Unexpected API response status');
     const result = await response.json();
     assert.equal(result.status, attempt ? 'duplicate' : 'appended');
     assert.equal(result.post_id, story.post_id); assert.equal(result.item_index, story.item_index); assert.equal(result.update_index, 0);
@@ -235,12 +243,13 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   assert.equal((await fetch(`${origin}/posts/`)).status, 404);
   // Retract a separate labeled batch so the main HTML/RSS/archive checks retain their fixtures.
   const cleanupInput = { ...input, client_ref: `${input.client_ref}:retract`, items: [{ ...input.items[0], headline: 'Self-retraction smoke fixture', post_url: `${input.items[0].post_url}&retract=1` }] };
+  context.registerDigest(cleanupInput.client_ref);
   const cleanupPublish = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(cleanupInput) });
   assert.equal(cleanupPublish.status, 200);
   const cleanupId = (await cleanupPublish.json()).post.id;
   for (let attempt = 0; attempt < 2; attempt++) {
     const response = await fetch(`${origin}/api/posts/${cleanupId}/retract`, { method: 'POST', headers });
-    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal(response.status, 200, 'Unexpected API response status');
     assert.equal((await response.json()).status, attempt ? 'already_retracted' : 'retracted');
   }
   const cleanupLookup = await fetch(`${origin}/api/digests?client_ref=${encodeURIComponent(cleanupInput.client_ref)}`, { headers });
@@ -282,15 +291,16 @@ export async function smoke(args = process.argv.slice(2), options = {}) {
   new SaxesParser({ xmlns: true }).write(feed).close();
   assert(feed.includes('<ttl>15</ttl>')); assert(feed.includes('<image>')); assert(feed.includes('<dc:creator>'));
   assert(feed.includes('<media:content '));
-  await smokeAlerts(origin, fetch, headers);
-  await smokeChanges(origin, fetch, headers);
+  await smokeAlerts(origin, fetch, headers, options);
+  await smokeChanges(origin, fetch, headers, options);
   const queued = await maintenance('start', 'preview', undefined, { secret, origin, request: fetch });
-  const job = await waitForRebuild(queued, 'preview', { secret, origin, request: fetch });
+  const job = await waitForRebuild(queued, 'preview', { secret, origin, request: fetch, timeoutMs: options.rebuildTimeoutMs ?? 300000 });
+  await verifyHtmlRevalidation(origin, fetch, edge);
   (options.log ?? console.log)(`Preview smoke checks passed: ${origin}. Rebuild ${job.id} completed.`);
   return { origin, job, request_ids: requestIds, worker_version: workerVersion };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { await smoke(); }
-  catch (error) { console.error(error.message); process.exitCode = 1; }
+  try { await smoke(undefined, { artifactsDirectory: '.artifacts/preview' }); }
+  catch (error) { console.error(`Preview smoke failed (${error.name}); inspect .artifacts/preview/smoke.json.`); process.exitCode = 1; }
 }

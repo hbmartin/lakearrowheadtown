@@ -10,7 +10,7 @@ export async function deploy(environment, options = {}) {
   if (new URL(origin).hostname === 'localhost') throw new Error('Deployment rebuilds must target the deployed Worker, not localhost; unset SITE_URL or select the remote environment URL');
   // Validate the credential's format before deployment; authentication follows it.
   const secret = validateCredential(options.secret ?? readPublishingCredential(environment));
-  const result = (options.run ?? spawnSync)('npx', ['wrangler', 'deploy', '--env', environment === 'preview' ? 'preview' : ''], { stdio: 'inherit' });
+  const result = (options.run ?? spawnSync)('npx', ['wrangler', 'deploy', '--env', environment === 'preview' ? 'preview' : '', ...(options.tag ? ['--tag', options.tag] : []), ...(options.message ? ['--message', options.message] : [])], { stdio: 'inherit' });
   if (result.error || result.status !== 0) throw new Error('Worker deployment failed; no rebuild was requested');
   const job = await maintenance('start', environment, undefined, { origin, secret, request: options.request });
   return job;
