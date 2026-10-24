@@ -72,7 +72,9 @@ export function prepareWrites(bucket: ContentBucket, trace: OperationTrace, fenc
         }));
         if (failed) throw failure;
         for (const write of writes.filter(write => write.key === 'pages/index.html')) {
-          await beforeIndexDispatch?.();
+          const phase = trace.phase;
+          trace.phase = 'commit';
+          try { await beforeIndexDispatch?.(); } finally { trace.phase = phase; }
           trace.publication_status = 'unknown';
           try { committedIndex = (await persist(write))!; }
           catch (error) { if (error instanceof PublicationConflict) trace.publication_status = 'not_committed'; throw error; }
