@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --env preview",
-    "test": "vitest run && npm run test:scripts",
-    "test:coverage": "vitest run --coverage && npm run test:scripts",
+    "test": "vitest run && npm run test:scripts && npm run test:api",
+    "test:coverage": "vitest run --coverage && npm run test:scripts:coverage && npm run test:api",
     "typecheck": "tsc --noEmit",
     "artwork": "node scripts/generate-artwork.mjs",
     "build": "wrangler deploy --env='' --dry-run --outdir dist",
@@ -19,7 +19,13 @@
     "rebuild": "node scripts/maintenance.mjs start",
     "rebuild:status": "node scripts/maintenance.mjs status",
     "rebuild:resume": "node scripts/maintenance.mjs resume",
-    "fonts": "node scripts/generate-fonts.mjs"
+    "fonts": "node scripts/generate-fonts.mjs",
+    "test:unit": "vitest run test/unit",
+    "test:api": "vitest run --config vitest.api.config.ts",
+    "test:scripts:coverage": "c8 --check-coverage node --test test/*.test.mjs",
+    "test:extended": "TEST_EXTENDED=1 vitest run && npm run test:scripts && npm run test:api",
+    "test:preview": "node scripts/preview-ci.mjs",
+    "build:preview": "wrangler deploy --env preview --dry-run --outdir dist/preview"
   },
   "dependencies": {
     "@resvg/resvg-wasm": "^2.6.2",
@@ -33,11 +39,32 @@
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^24.0.0",
     "@vitest/coverage-v8": "^4.1.11",
+    "c8": "^12.0.0",
     "esbuild": "0.28.2",
+    "fast-check": "^4.10.2",
     "saxes": "^6.0.0",
     "typescript": "^5.9.3",
     "vitest": "^4.1.0",
     "wawoff2": "^2.0.1",
     "wrangler": "^4.151.1"
+  },
+  "c8": {
+    "all": true,
+    "include": [
+      "scripts/**/*.mjs"
+    ],
+    "exclude": [],
+    "reporter": [
+      "text-summary",
+      "html",
+      "lcovonly",
+      "json",
+      "json-summary"
+    ],
+    "lines": 80,
+    "statements": 80,
+    "functions": 80,
+    "branches": 80,
+    "reports-dir": "coverage/tooling"
   }
 }

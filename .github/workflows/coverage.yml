@@ -1,42 +1,141 @@
-name: Coverage
+name: Tests
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-
-concurrency:
-  group: coverage-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  schedule:
+    - cron: '17 10 * * *'
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
-  coverage:
+  local:
+    name: Local validation
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
+    concurrency:
+      group: local-tests-${{ github.ref }}
+      cancel-in-progress: true
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:coverage
+      - run: npm run build
+      - run: npm run build:preview
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: local-test-reports
+          path: |
+            .artifacts/
+            coverage/
+          retention-days: 14
+      - name: Upload application coverage
+        if: env.CODECOV_TOKEN != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: codecov/codecov-action@v7
+        continue-on-error: true
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/worker/lcov.info
+          flags: worker
+          disable_search: true
+          fail_ci_if_error: false
+      - name: Upload tooling coverage
+        if: env.CODECOV_TOKEN != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: codecov/codecov-action@v7
+        continue-on-error: true
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/tooling/lcov.info
+          flags: tooling
+          disable_search: true
+          fail_ci_if_error: false
+
+  preview:
+    name: Preview API
+    needs: local
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: lakearrowheadtown-shared-preview
+      cancel-in-progress: false
+      queue: max
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_SHA: ${{ github.sha }}
+      CANDIDATE_PR: ${{ github.event.pull_request.number }}
+      CANDIDATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      CANDIDATE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - name: Require a trusted repository branch
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo 'Remote validation requires importing the reviewed change into a repository branch and opening a replacement PR.'
+          exit 1
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - name: Deploy and validate candidate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          PREVIEW_API_SECRET: ${{ secrets.PREVIEW_API_SECRET }}
+        run: |
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID PREVIEW_API_SECRET; do
+            if [ -z "${!name}" ]; then echo "::error::Missing CI configuration: $name"; exit 1; fi
+          done
+          npm run test:preview
+      - name: Upload preview diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: preview-api-reports
+          path: .artifacts/preview/
+          retention-days: 14
+
+  extended:
+    name: Extended validation
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version-file: .node-version
           cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Check types
-        run: npm run typecheck
-      - name: Run tests with coverage
-        run: npm run test:coverage
-      - name: Upload coverage reports to Codecov
-        if: env.CODECOV_TOKEN != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: codecov/codecov-action@v7
-        continue-on-error: true
+      - run: npm ci
+      - name: Select replayable property seed
+        run: node -e 'console.log("TEST_SEED=" + require("node:crypto").randomInt(2147483647))' >> "$GITHUB_ENV"
+      - run: npm run typecheck
+      - run: npm run test:extended
+        env:
+          TEST_LIVE_WEATHER: '1'
+      - name: Upload extended diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
-          disable_search: true
-          fail_ci_if_error: false
+          name: extended-test-reports
+          path: .artifacts/
+          retention-days: 14

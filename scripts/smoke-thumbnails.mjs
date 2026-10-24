@@ -5,16 +5,18 @@ import { readFile, writeFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { imageSize } from 'image-size';
-import { readPublishingCredential } from './credentials.mjs';
+import { createSmokeContext } from './smoke-support.mjs';
 import { maintenanceTarget } from './maintenance.mjs';
 
 // Writes fixtures only to the allowlisted preview environment, never production.
-export async function smokeThumbnails(args = process.argv.slice(2)) {
+export async function smokeThumbnails(args = process.argv.slice(2), options = {}) {
 const origin = maintenanceTarget('preview', args[0]);
 if (new URL(origin).hostname === 'localhost') throw new Error('Thumbnail acceptance requires the deployed preview Images binding and Workers Cache');
-const secret = readPublishingCredential('preview');
-const auth = { Authorization: `Bearer ${secret}` };
-const directory = await mkdtemp(join(tmpdir(), 'lakearrowhead-thumbnails-'));
+const context = createSmokeContext(origin, { ...options, artifactName: 'thumbnails' });
+return context.run(async () => {
+const fetch = context.request; const auth = context.headers;
+const directory = options.artifactsDirectory ?? await mkdtemp(join(tmpdir(), 'lakearrowhead-thumbnails-'));
+await (await import('node:fs/promises')).mkdir(directory, { recursive: true });
 const photo = await readFile(new URL('../test/fixtures/thumbnail-pattern.jpg', import.meta.url));
 assert.deepEqual(imageSize(photo), { width: 1920, height: 1280, type: 'jpg' });
 const fixtures = [
@@ -85,23 +87,28 @@ for (const fixture of fixtures) {
   }
   console.log(JSON.stringify({ fixture: fixture.name, source_bytes: fixture.bytes.length, thumbnail_bytes: bytes.length, reduction_percent: Number((100 * (1 - bytes.length / fixture.bytes.length)).toFixed(2)), dimensions: encoded, cache: 'HIT' }));
 }
-const now = new Date().toISOString();
+const now = context.now().toISOString();
+const run = `thumbnail:${crypto.randomUUID()}`;
+context.registerDigest(run);
 const digest = await fetch(`${origin}/api/digests`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify({
-  title: 'Responsive thumbnail acceptance', source: 'thumbnail-acceptance', items: fixtures.map(fixture => ({
-    headline: `Thumbnail verification: ${fixture.name}`, group: 'Preview verification', group_url: 'https://lakearrowhead.town/',
-    post_url: `https://lakearrowhead.town/?thumbnail-fixture=${fixture.name}`, posted_at: now, category: 'announcement',
+  title: run, source: 'thumbnail-acceptance', client_ref: run, items: fixtures.map(fixture => ({
+    headline: `Thumbnail verification ${run}: ${fixture.name}`, group: 'Preview verification', group_url: 'https://lakearrowhead.town/',
+    post_url: `${origin}/?thumbnail-fixture=${fixture.name}&run=${encodeURIComponent(run)}`, posted_at: now, category: 'announcement',
     body: `![${fixture.name} thumbnail verification](${fixture.url})\n\nPreview fixture for responsive sizing, image quality, transparency, and animation.`,
   })),
 }) });
 assert.equal(digest.status, 200);
+const published = await digest.json(); assert(published.post?.id); assert.equal(published.counts.published, fixtures.length);
 const homepage = await (await fetch(origin)).text();
+for (const fixture of fixtures) { assert(homepage.includes(`Thumbnail verification ${run}: ${fixture.name}`)); assert(homepage.includes(fixture.url.split('/').at(-1))); }
 assert(homepage.includes('/thumbnails/v2/'));
 assert(homepage.includes('<picture>'));
 const v1 = await fetch(`${origin}/thumbnails/v1/${fixtures[0].url.split('/').at(-1)}/160`, { headers: { Accept: 'image/webp' }, redirect: 'manual' });
 assert.equal(v1.status, 200); assert.equal(v1.headers.get('content-type'), 'image/webp'); await v1.arrayBuffer();
 assert(homepage.includes('sizes="(max-width: 600px) 96px, 160px"'));
 console.log(JSON.stringify({ preview: origin, artifacts: directory, status: 'passed' }));
-
+return { origin, post_id: published.post.id };
+});
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { await smokeThumbnails(); } catch (error) { console.error(error.message); process.exitCode = 1; }
