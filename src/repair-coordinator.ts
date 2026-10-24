@@ -1,3 +1,4 @@
+import { repairControlSchema } from './schemas/maintenance';
 import { asHttpError, boundary, HttpError } from './errors';
 import { emit, OperationTrace, safeError } from './diagnostics';
 import { fingerprint, record as object } from './primitives';
@@ -242,7 +243,9 @@ export class RepairCoordinator {
     }
   }
   async control(action: 'resume' | 'cancel', input: unknown, trace: OperationTrace): Promise<RepairResult> {
-    if (!object(input) || Object.keys(input).some(key => !['expected_recovery_token', 'expected_version'].includes(key)) || typeof input.expected_recovery_token !== 'string' || typeof input.expected_version !== 'string') throw new HttpError(400, 'Supply expected_recovery_token and expected_version.');
+    const parsed = repairControlSchema.safeParse(input);
+    if (!parsed.success) throw new HttpError(400, 'Supply expected_recovery_token and expected_version.');
+    const control = parsed.data;
     let saved: RepairRecord | undefined;
     let failureContext: RepairFailureContext = { publication_status: 'not_attempted' };
     let completing = false;
@@ -250,18 +253,20 @@ export class RepairCoordinator {
       const snapshot = await this.snapshot(trace);
       if (snapshot.recovery) failureContext = { publication_status: snapshot.recovery.publication_status,
         repair_id: snapshot.recovery.repair_id, job_id: snapshot.recovery.job_id };
-      if (!snapshot.recovery || snapshot.recovery.recovery_token !== input.expected_recovery_token || snapshot.publication.version !== input.expected_version) throw new HttpError(409, 'Recovery state changed. Inspect it again.', {}, { code: 'repair_recovery_changed' });
+      if (!snapshot.recovery || snapshot.recovery.recovery_token !== control.expected_recovery_token || snapshot.publication.version !== control.expected_version) throw new HttpError(409, 'Recovery state changed. Inspect it again.', {}, { code: 'repair_recovery_changed' });
       saved = (await this.active()).record;
       if (!saved) throw damaged();
       const record = saved;
       if (action === 'resume') {
+        const resumed = { ...record, attempts: 0, stalled: false, next_retry_at: new Date(Date.now() + 1000).toISOString() };
         await boundary('storage', () => this.storage.transaction(async storage => {
-          await storage.put(record.key, { ...record, attempts: 0, stalled: false, next_retry_at: new Date(Date.now() + 1000).toISOString() });
-          await storage.setAlarm(Date.now() + 1000);
+          await storage.put(record.key, resumed);
+          await storage.setAlarm(Date.parse(resumed.next_retry_at));
         }));
+        saved = resumed;
       } else {
         const head = await boundary('storage', () => this.bucket.head('pages/index.html'));
-        if (!head || head.version !== input.expected_version) throw publicationChanged(certainty(record));
+        if (!head || head.version !== control.expected_version) throw publicationChanged(certainty(record));
         if (head.customMetadata?.[REPAIR_MARKER] === record.id && matches(head, record.input)) await this.activate(record, head, trace.context);
         else if (record.phase === 'prepared' || head.etag !== record.etag) await this.cancel(record, certainty(record));
         else throw new HttpError(409, 'Cannot cancel an unresolved conditional write. Reconcile or resume this repair.', {}, { code: 'unsafe_repair_cancellation', publication_status: certainty(record) });

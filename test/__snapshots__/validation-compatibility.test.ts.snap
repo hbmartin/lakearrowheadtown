@@ -1,0 +1,864 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`alert: all field errors matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_field",
+      "message": "Expected a nonblank reference of at most 128 characters without control characters.",
+      "path": "client_ref",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected one of: caltrans, nws, sce.",
+      "path": "source",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected one of: traffic, power.",
+      "path": "category",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected one of: closure, chain-control, one-way, construction, storm, hazard, outage, planned-outage, psps.",
+      "path": "kind",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected an absolute HTTP(S) URL without credentials.",
+      "path": "source_url",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected an ISO timestamp with an explicit timezone.",
+      "path": "observed_at",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected a nonempty headline.",
+      "path": "headline",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected a string or null.",
+      "path": "detail",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected a timezone-qualified ISO timestamp or null.",
+      "path": "starts_at",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected unique supported state routes, or null.",
+      "path": "routes",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected one of: watch, warning, scheduled, in-effect.",
+      "path": "power.stage",
+    },
+    {
+      "code": "invalid_field",
+      "message": "Expected a nonnegative safe integer or null.",
+      "path": "power.customer_count",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Alert validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`alert: invalid effective opening matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_field",
+      "message": "Traffic alerts require routes or an affected area.",
+      "path": "routes",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Alert validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`alert: nonobject matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_type",
+      "message": "Expected an object.",
+      "path": "alert",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Alert validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`alert: opening matches API v3 1`] = `
+{
+  "ok": true,
+  "value": {
+    "area": "Town",
+    "category": "traffic",
+    "client_ref": "ref",
+    "headline": "Hazard",
+    "kind": "hazard",
+    "observed_at": "2026-10-24T12:00:00-07:00",
+    "phase": "open",
+    "source": "caltrans",
+    "source_url": "https://example.com",
+  },
+}
+`;
+
+exports[`alert: patch null and omission matches API v3 1`] = `
+{
+  "ok": true,
+  "value": {
+    "alert_id": "00000000-0000-0000-0000-000000000001",
+    "area": null,
+    "client_ref": "r",
+    "observed_at": "2026-10-24T12:00:00-07:00",
+    "phase": "update",
+    "power": {
+      "customer_count": null,
+    },
+    "source": "sce",
+    "source_url": "https://example.com/story",
+  },
+}
+`;
+
+exports[`confirmations: empty matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_count",
+      "message": "Expected an array of 1–100 confirmations.",
+      "path": "confirmations",
+    },
+  ],
+  "details_truncated": false,
+  "message": "confirmations must contain between 1 and 100 checks.",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`confirmations: envelope only matches API v3 1`] = `
+{
+  "ok": true,
+  "value": [
+    null,
+    {},
+    {
+      "unknown": true,
+    },
+  ],
+}
+`;
+
+exports[`digest: bounded issues matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].group",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].group_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].headline",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].body",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].post_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].category",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].posted_at",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].group",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].group_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].headline",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].body",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].post_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].category",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].posted_at",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[2].group",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[2].group_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[2].headline",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[2].body",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[2].post_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[2].category",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[2].posted_at",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[3].group",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[3].group_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[3].headline",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[3].body",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[3].post_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[3].category",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[3].posted_at",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[4].group",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[4].group_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[4].headline",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[4].body",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[4].post_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[4].category",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[4].posted_at",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[5].group",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[5].group_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[5].headline",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[5].body",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[5].post_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[5].category",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[5].posted_at",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[6].group",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[6].group_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[6].headline",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[6].body",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[6].post_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[6].category",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[6].posted_at",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[7].group",
+    },
+  ],
+  "details_truncated": true,
+  "message": "Digest validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`digest: empty matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "empty_items",
+      "message": "At least one story is required.",
+      "path": "items",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Digest validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`digest: nonarray matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "title",
+    },
+    {
+      "code": "empty_string",
+      "message": "Expected a nonempty string.",
+      "path": "source",
+    },
+    {
+      "code": "invalid_client_ref",
+      "message": "Expected a nonblank string of at most 128 characters without control characters.",
+      "path": "client_ref",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected an array.",
+      "path": "items",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Digest validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`digest: nonobject matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_type",
+      "message": "Expected an object.",
+      "path": "digest",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Digest validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`digest: ordered field errors matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "title",
+    },
+    {
+      "code": "empty_string",
+      "message": "Expected a nonempty string.",
+      "path": "source",
+    },
+    {
+      "code": "invalid_client_ref",
+      "message": "Expected a nonblank string of at most 128 characters without control characters.",
+      "path": "client_ref",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected an object.",
+      "path": "items[0]",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].group",
+    },
+    {
+      "code": "empty_string",
+      "message": "Expected a nonempty string.",
+      "path": "items[1].group_url",
+    },
+    {
+      "code": "empty_string",
+      "message": "Expected a nonempty string.",
+      "path": "items[1].headline",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].body",
+    },
+    {
+      "code": "invalid_url",
+      "message": "Expected an absolute HTTP(S) URL without credentials.",
+      "path": "items[1].post_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[1].category",
+    },
+    {
+      "code": "invalid_timestamp",
+      "message": "Expected an ISO timestamp with a real calendar date and explicit timezone.",
+      "path": "items[1].posted_at",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Digest validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`digest: strips server fields and preserves whitespace matches API v3 1`] = `
+{
+  "ok": true,
+  "value": {
+    "client_ref": " ref ",
+    "items": [
+      {
+        "body": "",
+        "category": "",
+        "group": "Group",
+        "group_url": "https://example.com",
+        "headline": "Title",
+        "post_url": "https://example.com/story",
+        "posted_at": "2026-10-24T12:00:00-07:00",
+      },
+    ],
+    "source": "Source",
+    "title": " title ",
+  },
+}
+`;
+
+exports[`event: all day matches API v3 1`] = `
+{
+  "ok": true,
+  "value": {
+    "items": [
+      {
+        "all_day": true,
+        "body": "",
+        "category": "",
+        "ends_at": "2026-10-25",
+        "group": "Group",
+        "group_url": "https://example.com",
+        "headline": "Title",
+        "post_url": "https://example.com/story",
+        "posted_at": "2026-10-24T12:00:00-07:00",
+        "starts_at": "2026-10-24",
+      },
+    ],
+    "source": "Source",
+    "title": "Digest",
+  },
+}
+`;
+
+exports[`event: base then event issues matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "title",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "source",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].group",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].group_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].headline",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].body",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].post_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].category",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].posted_at",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected an object.",
+      "path": "items[1]",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a boolean.",
+      "path": "items[0].all_day",
+    },
+    {
+      "code": "invalid_timestamp",
+      "message": "Expected an ISO timestamp with an explicit timezone for a timed event.",
+      "path": "items[0].starts_at",
+    },
+    {
+      "code": "invalid_timestamp",
+      "message": "Expected an ISO timestamp with an explicit timezone for a timed event.",
+      "path": "items[0].ends_at",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "items[0].location",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Event validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`event: range matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_range",
+      "message": "ends_at must be later than starts_at; all-day end dates are exclusive.",
+      "path": "items[0].ends_at",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Event validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`event: timed default matches API v3 1`] = `
+{
+  "ok": true,
+  "value": {
+    "items": [
+      {
+        "all_day": false,
+        "body": "",
+        "category": "",
+        "group": "Group",
+        "group_url": "https://example.com",
+        "headline": "Title",
+        "post_url": "https://example.com/story",
+        "posted_at": "2026-10-24T12:00:00-07:00",
+        "starts_at": "2026-10-24T12:00:00-07:00",
+      },
+    ],
+    "source": "Source",
+    "title": "Digest",
+  },
+}
+`;
+
+exports[`reference: control matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_client_ref",
+      "message": "Expected a nonblank string of at most 128 characters without control characters.",
+      "path": "client_ref",
+    },
+  ],
+  "details_truncated": false,
+  "message": "client_ref must be a nonblank string of at most 128 characters without control characters.",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`reference: too long matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_client_ref",
+      "message": "Expected a nonblank string of at most 128 characters without control characters.",
+      "path": "client_ref",
+    },
+  ],
+  "details_truncated": false,
+  "message": "client_ref must be a nonblank string of at most 128 characters without control characters.",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`reference: unicode matches API v3 1`] = `
+{
+  "ok": true,
+  "value": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+}
+`;
+
+exports[`repair: malformed matches API v3 1`] = `
+{
+  "code": "invalid_request",
+  "details": {},
+  "details_truncated": false,
+  "message": "Supply expected_version and existing manifest, rss, and archives pointers. archives must be a catalogue key or null.",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`stored: empty legacy matches API v3 1`] = `
+{
+  "ok": true,
+  "value": {
+    "items": [],
+    "source": "Source",
+    "title": "Digest",
+  },
+}
+`;
+
+exports[`update: defaults and strips matches API v3 1`] = `
+{
+  "ok": true,
+  "value": {
+    "body": "",
+    "group": "G",
+    "post_url": "https://example.com/story",
+    "posted_at": "2026-10-24T12:00:00-07:00",
+  },
+}
+`;
+
+exports[`update: nonobject matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "invalid_type",
+      "message": "Expected an object.",
+      "path": "update",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Update validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;
+
+exports[`update: ordered errors matches API v3 1`] = `
+{
+  "code": "validation_failed",
+  "details": [
+    {
+      "code": "empty_string",
+      "message": "Expected a nonempty string.",
+      "path": "group",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "group_url",
+    },
+    {
+      "code": "invalid_type",
+      "message": "Expected a string.",
+      "path": "body",
+    },
+    {
+      "code": "empty_string",
+      "message": "Expected a nonempty string.",
+      "path": "post_url",
+    },
+    {
+      "code": "empty_string",
+      "message": "Expected a nonempty string.",
+      "path": "posted_at",
+    },
+  ],
+  "details_truncated": false,
+  "message": "Update validation failed",
+  "ok": false,
+  "status": 400,
+}
+`;

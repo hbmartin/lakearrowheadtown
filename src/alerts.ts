@@ -1,22 +1,20 @@
-import { settledInOrder } from './batches';
 import { Buffer } from 'node:buffer';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { asHttpError, boundary, OperationFailure, DamagedManifest, DamagedSource, HttpError, isPublishReply, detailsWithStage, type ValidationIssue } from './errors';
+import { confirmationEntry, confirmationKey, expandHistory, isConfirmationNode, isHistoryRoot, type ConfirmationNode, type ConfirmationRun, type HistoryRoot } from './alert-history';
+import { settledInOrder } from './batches';
 import { emit, OperationTrace, safeError } from './diagnostics';
+import { asHttpError, boundary, DamagedManifest, DamagedSource, detailsWithStage, HttpError, isPublishReply, OperationFailure, type ValidationIssue } from './errors';
 import { localDate, recentDates } from './feed';
-import { canonicalJson as canonical, fingerprint, httpUrl, record, text } from './primitives';
-import { confirmationEntry, expandHistory, isHistoryRoot, confirmationKey, isConfirmationNode, type ConfirmationNode, type ConfirmationRun, type HistoryRoot } from './alert-history';
-import { isClientRef, isTimestamp, validateClientRef } from './validation';
 import { instant, timestampPayload } from './instants';
+import { canonicalJson as canonical, fingerprint, record } from './primitives';
+import { ALERT_ROUTES, alertSchema, confirmationEnvelopeSchema, confirmationSchema, powerKinds, sources, stages, trafficKinds } from './schemas/alerts';
+import { parseSchema } from './schemas/shared';
 import type { ContentBucket, OperationContext, PublicationWarning, PublishFailure } from './types';
+import { isClientRef, isTimestamp, validateClientRef } from './validation';
+export { ALERT_ROUTES } from './schemas/alerts';
 
 export const ALERTS_KEY = 'alerts/current.json';
 export const ALERT_DAY = 24 * 60 * 60 * 1000;
-export const ALERT_ROUTES = ['SR-18', 'SR-189', 'SR-330', 'SR-138', 'SR-173'] as const;
-const trafficKinds = ['closure', 'chain-control', 'one-way', 'construction', 'storm', 'hazard'] as const;
-const powerKinds = ['outage', 'planned-outage', 'psps'] as const;
-const sources = ['caltrans', 'nws', 'sce'] as const;
-const stages = ['watch', 'warning', 'scheduled', 'in-effect'] as const;
 const states = ['open', 'resolved', 'expired-unconfirmed', 'retracted'] as const;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const revisionKey = /^alerts\/revisions\/[a-f0-9]{64}\.json$/;
@@ -73,66 +71,7 @@ function invalidFields(issues: ValidationIssue[]): never {
 }
 
 export function validateAlertInput(value: unknown): AlertInput {
-  if (!record(value)) invalidFields([{ path: 'alert', code: 'invalid_type', message: 'Expected an object.' }]);
-  const issues: ValidationIssue[] = [];
-  const invalid = (path: string, message: string) => issues.push({ path, code: 'invalid_field', message });
-  const output: Record<string, unknown> = {};
-  if (!isClientRef(value.client_ref)) invalid('client_ref', 'Expected a nonblank reference of at most 128 characters without control characters.');
-  output.client_ref = value.client_ref;
-  if (!member(value.phase, ['open', 'update', 'resolved'])) invalid('phase', 'Expected open, update, or resolved.');
-  output.phase = value.phase;
-  if (value.phase !== 'open' || value.alert_id !== undefined) {
-    if (typeof value.alert_id !== 'string' || !uuid.test(value.alert_id) || value.phase === 'open') invalid('alert_id', 'Updates and resolutions require an alert UUID; openings must omit it.');
-    output.alert_id = value.alert_id;
-  }
-  for (const [key, values] of [['source', sources], ['category', ['traffic', 'power']], ['kind', [...trafficKinds, ...powerKinds]]] as const) {
-    if (value[key] !== undefined || key === 'source' || value.phase === 'open') {
-      if (!member(value[key], values)) invalid(key, `Expected one of: ${values.join(', ')}.`);
-      output[key] = value[key];
-    }
-  }
-  if (!httpUrl(value.source_url)) invalid('source_url', 'Expected an absolute HTTP(S) URL without credentials.');
-  output.source_url = value.source_url;
-  if (!isTimestamp(value.observed_at)) invalid('observed_at', 'Expected an ISO timestamp with an explicit timezone.');
-  output.observed_at = value.observed_at;
-  if (value.headline !== undefined || value.phase === 'open') {
-    if (!text(value.headline)) invalid('headline', 'Expected a nonempty headline.');
-    output.headline = value.headline;
-  }
-  for (const key of ['detail', 'area', 'source_event_id', 'starts_at', 'expected_end'] as const) {
-    if (value[key] === undefined) continue;
-    const field = value[key];
-    if (field !== null && (key === 'starts_at' || key === 'expected_end' ? !isTimestamp(field) : typeof field !== 'string' || key !== 'detail' && !field.trim())) {
-      invalid(key, key === 'starts_at' || key === 'expected_end' ? 'Expected a timezone-qualified ISO timestamp or null.' : 'Expected a string or null.');
-    }
-    output[key] = field;
-  }
-  if (value.routes !== undefined) {
-    if (value.routes !== null && (!Array.isArray(value.routes) || !value.routes.length || value.routes.some(route => !member(route, ALERT_ROUTES)) || new Set(value.routes).size !== value.routes.length)) invalid('routes', 'Expected unique supported state routes, or null.');
-    output.routes = value.routes;
-  }
-  if (value.chain_level !== undefined) {
-    if (value.chain_level !== null && !member(value.chain_level, ['R1', 'R2', 'R3'])) invalid('chain_level', 'Expected R1, R2, R3, or null.');
-    output.chain_level = value.chain_level;
-  }
-  if (value.power !== undefined) {
-    if (value.power === null) output.power = null;
-    else if (!record(value.power)) invalid('power', 'Expected a power object or null.');
-    else {
-      const power: Record<string, unknown> = {};
-      if (value.power.stage !== undefined) {
-        if (!member(value.power.stage, stages)) invalid('power.stage', `Expected one of: ${stages.join(', ')}.`);
-        power.stage = value.power.stage;
-      }
-      if (value.power.customer_count !== undefined) {
-        if (value.power.customer_count !== null && (!Number.isSafeInteger(value.power.customer_count) || Number(value.power.customer_count) < 0)) invalid('power.customer_count', 'Expected a nonnegative safe integer or null.');
-        power.customer_count = value.power.customer_count;
-      }
-      output.power = power;
-    }
-  }
-  if (issues.length) invalidFields(issues);
-  const input = output as unknown as AlertInput;
+  const input = parseSchema(alertSchema, value, 'Alert validation failed', 'alert');
   if (input.phase === 'open') validateEffective(applyFields({} as AlertFields, input));
   return input;
 }
@@ -356,19 +295,13 @@ async function commitRecord(bucket: ContentBucket, manifest: AlertManifest, valu
 }
 
 export function validateConfirmationBatch(value: unknown): unknown[] {
-  if (!record(value) || !Array.isArray(value.confirmations) || value.confirmations.length < 1 || value.confirmations.length > 100) {
-    throw new HttpError(400, 'confirmations must contain between 1 and 100 checks.', {}, { code: 'validation_failed',
-      details: [{ path: 'confirmations', code: 'invalid_count', message: 'Expected an array of 1–100 confirmations.' }] });
-  }
-  return value.confirmations;
+  const result = confirmationEnvelopeSchema.safeParse(value);
+  if (!result.success) throw new HttpError(400, 'confirmations must contain between 1 and 100 checks.', {}, { code: 'validation_failed',
+    details: [{ path: 'confirmations', code: 'invalid_count', message: 'Expected an array of 1–100 confirmations.' }] });
+  return result.data.confirmations;
 }
 function validateConfirmation(value: unknown): ConfirmationInput {
-  if (!record(value)) invalidFields([{ path: 'confirmation', code: 'invalid_type', message: 'Expected a confirmation object.' }]);
-  const allowed = ['client_ref', 'alert_id', 'source', 'source_url', 'observed_at'];
-  const extras = Object.keys(value).filter(key => !allowed.includes(key));
-  if (extras.length) invalidFields(extras.map(path => ({ path, code: 'unsupported_field', message: 'Confirmations cannot change alert content or lifecycle.' })));
-  const input = validateAlertInput({ ...value, phase: 'update' });
-  return { client_ref: input.client_ref, alert_id: input.alert_id!, source: input.source, source_url: input.source_url, observed_at: input.observed_at };
+  return parseSchema(confirmationSchema, value, 'Alert validation failed', 'confirmation');
 }
 async function rootForConfirmation(bucket: ContentBucket, ref: AlertReference): Promise<HistoryRoot> {
   const raw = await readAlertJson(bucket, ref.key, ref.alert_id);

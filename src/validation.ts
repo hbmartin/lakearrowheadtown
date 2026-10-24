@@ -1,109 +1,25 @@
-import type { Digest, DigestItem, StoredItem, StoryUpdate } from './types';
-import { boundary, declaredBodyBytes, HttpError, type ValidationIssue } from './errors';
-import { httpUrl as isHttpUrl } from './primitives';
+import { boundary, declaredBodyBytes, HttpError } from './errors';
+import { clientRefSchema, digestSchema, digestSubmissionSchema, updateSchema } from './schemas/content';
+import { isTimestamp } from './schemas/primitives';
+import { parseSchema } from './schemas/shared';
+import type { Digest, StoredItem, StoryUpdate } from './types';
 export { HttpError } from './errors';
-
-export function isDate(value: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || value.startsWith('0000')) return false;
-  const parsed = new Date(`${value}T00:00:00Z`);
-  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
-}
-
-export function isTimestamp(value: unknown): value is string {
-  if (typeof value !== 'string') return false;
-  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))$/.exec(value);
-  return !!match && isDate(match[1]) && Number(match[2]) <= 23 && Number(match[3]) <= 59 && Number(match[4]) <= 59
-    && Number(match[6] ?? 0) <= 23 && Number(match[7] ?? 0) <= 59 && Number.isFinite(Date.parse(value));
-}
-
-export function isClientRef(value: unknown): value is string {
-  return typeof value === 'string' && !!value.trim() && [...value].length <= 128 && !/[\u0000-\u001f\u007f]/.test(value);
-}
+export { isClientRef, isDate, isTimestamp } from './schemas/primitives';
 
 export function validateClientRef(value: unknown): string {
-  if (!isClientRef(value)) throw new HttpError(400, 'client_ref must be a nonblank string of at most 128 characters without control characters.', {}, {
+  const result = clientRefSchema.safeParse(value);
+  if (!result.success) throw new HttpError(400, 'client_ref must be a nonblank string of at most 128 characters without control characters.', {}, {
     code: 'validation_failed', details: [{ path: 'client_ref', code: 'invalid_client_ref', message: 'Expected a nonblank string of at most 128 characters without control characters.' }],
   });
-  return value;
-}
-
-function fields(message: string) {
-  const issues: ValidationIssue[] = [];
-  let issueCount = 0;
-  function invalid(path: string, code: string, message: string): void {
-    issueCount++;
-    if (issues.length < 50) issues.push({ path, code, message });
-  }
-  function record(input: unknown, path: string): Record<string, unknown> | undefined {
-    if (!input || typeof input !== 'object' || Array.isArray(input)) {
-      invalid(path, 'invalid_type', 'Expected an object.');
-      return undefined;
-    }
-    return input as Record<string, unknown>;
-  }
-  function string(input: unknown, path: string, empty = false): string {
-    if (typeof input !== 'string') { invalid(path, 'invalid_type', 'Expected a string.'); return ''; }
-    if (!empty && !input.trim()) invalid(path, 'empty_string', 'Expected a nonempty string.');
-    return input;
-  }
-  function httpUrl(input: unknown, path: string): string {
-    const text = string(input, path);
-    if (typeof input !== 'string' || !text.trim()) return text;
-    if (!isHttpUrl(text)) invalid(path, 'invalid_url', 'Expected an absolute HTTP(S) URL without credentials.');
-    return text;
-  }
-  function timestamp(input: unknown, path: string): string {
-    const text = string(input, path);
-    if (typeof input !== 'string' || !text.trim()) return text;
-    if (!isTimestamp(text)) {
-      invalid(path, 'invalid_timestamp', 'Expected an ISO timestamp with a real calendar date and explicit timezone.');
-    }
-    return text;
-  }
-  const reject = (): never => { throw new HttpError(400, message, {}, { code: 'validation_failed', details: issues, details_truncated: issueCount > issues.length }); };
-  return { invalid, record, string, httpUrl, timestamp, reject, check() { if (issueCount) reject(); } };
+  return result.data;
 }
 
 export function validateDigest(value: unknown, options: { requireItems?: boolean } = {}): Digest {
-  const v = fields('Digest validation failed');
-  const { invalid, record, string, httpUrl, timestamp } = v;
-  const input = record(value, 'digest');
-  if (!input) return v.reject();
-  const title = string(input.title, 'title');
-  const source = string(input.source, 'source');
-  if (input.client_ref !== undefined && !isClientRef(input.client_ref)) invalid('client_ref', 'invalid_client_ref', 'Expected a nonblank string of at most 128 characters without control characters.');
-  let items: DigestItem[] = [];
-  if (!Array.isArray(input.items)) invalid('items', 'invalid_type', 'Expected an array.');
-  else {
-    if (options.requireItems && input.items.length === 0) invalid('items', 'empty_items', 'At least one story is required.');
-    items = input.items.flatMap((value, i): DigestItem[] => {
-      const item = record(value, `items[${i}]`);
-      if (!item) return [];
-      const field = (name: string) => `items[${i}].${name}`;
-      return [{
-        group: string(item.group, field('group')), group_url: httpUrl(item.group_url, field('group_url')),
-        headline: string(item.headline, field('headline')), body: string(item.body, field('body'), true),
-        post_url: httpUrl(item.post_url, field('post_url')), category: string(item.category, field('category'), true),
-        posted_at: timestamp(item.posted_at, field('posted_at')),
-      }];
-    });
-  }
-  v.check();
-  // Client-supplied date/receipt/identity fields never control server publication.
-  return { title, source, items, ...(input.client_ref === undefined ? {} : { client_ref: input.client_ref as string }) };
+  return parseSchema(options.requireItems ? digestSubmissionSchema : digestSchema, value, 'Digest validation failed', 'digest');
 }
 
 export function validateUpdate(value: unknown): StoryUpdate {
-  const v = fields('Update validation failed');
-  const input = v.record(value, 'update');
-  if (!input) return v.reject();
-  const group = v.string(input.group, 'group');
-  const group_url = input.group_url === undefined ? undefined : v.httpUrl(input.group_url, 'group_url');
-  const body = v.string(input.body === undefined ? '' : input.body, 'body', true);
-  const post_url = v.httpUrl(input.post_url, 'post_url');
-  const posted_at = v.timestamp(input.posted_at, 'posted_at');
-  v.check();
-  return { group, ...(group_url === undefined ? {} : { group_url }), body, post_url, posted_at };
+  return parseSchema(updateSchema, value, 'Update validation failed', 'update');
 }
 
 // Incoming digest validation deliberately ignores updates; only stored sources may carry them.

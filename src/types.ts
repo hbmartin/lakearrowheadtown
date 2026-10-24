@@ -1,5 +1,4 @@
 import type { ValidationIssue } from './errors';
-import type { DigestPublisher } from './publisher';
 
 export interface DigestItem {
   group: string;
@@ -205,16 +204,15 @@ export interface RebuildJob {
   failed_stage?: string;
 }
 
-export interface Env {
-  IMAGES?: ImagesBinding;
-  API_SECRET?: string;
-  SITE_ORIGIN: string;
-  SITE_BUCKET: R2Bucket;
-  PUBLISHER: DurableObjectNamespace<DigestPublisher>;
-  CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
-  ENVIRONMENT?: string;
-  ALERT_CONFIRMATIONS_ENABLED?: string;
-}
+// Runtime bindings come from Wrangler; optional values retain fail-closed behavior
+// and allow tests to inject missing configuration without duplicating binding types.
+type OptionalBindings = 'IMAGES' | 'ENVIRONMENT' | 'ALERT_CONFIRMATIONS_ENABLED';
+export type Env = Omit<CloudflareBindings, OptionalBindings | 'API_SECRET' | 'CF_VERSION_METADATA'>
+  & Partial<Pick<CloudflareBindings, OptionalBindings>> & {
+    API_SECRET?: string;
+    CF_VERSION_METADATA?: Pick<CloudflareBindings['CF_VERSION_METADATA'], 'id'>
+      & Partial<Omit<CloudflareBindings['CF_VERSION_METADATA'], 'id'>>;
+  };
 
 // A narrow storage interface also allows failure injection in publishing tests.
 export interface ContentBucket {

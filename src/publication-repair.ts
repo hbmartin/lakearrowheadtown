@@ -1,10 +1,11 @@
-import { boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply } from './errors';
-import { loadPublication, validArchiveKey, validRssKey } from './committed';
 import { loadCatalog } from './archives';
-import { loadHistoryIndex } from './history-index';
-import { loadPost, rebuildReference } from './publishing';
 import { settledInOrder } from './batches';
+import { loadPublication } from './committed';
+import { boundary, DamagedManifest, DamagedSource, HttpError, isPublishReply } from './errors';
+import { loadHistoryIndex } from './history-index';
 import { record } from './primitives';
+import { loadPost, rebuildReference } from './publishing';
+import { repairSchema } from './schemas/maintenance';
 import type { ContentBucket, PublishFailure, RebuildJob } from './types';
 
 export interface RepairPointers { manifest: string; rss: string; archives: string | null }
@@ -22,11 +23,7 @@ export function publicationHead(index: R2Object): PublicationHead {
 export const indexNotFound = () => new HttpError(404, 'No stored index exists to repair.', {}, { code: 'index_not_found' });
 
 export function validateRepair(input: unknown): RepairInput {
-  if (!record(input) || Object.keys(input).some(key => !['expected_version', 'manifest', 'rss', 'archives'].includes(key))
-    || typeof input.expected_version !== 'string' || !input.expected_version || input.expected_version.length > 256
-    || typeof input.manifest !== 'string' || !/^publications\/[a-f0-9-]{36}\.json$/.test(input.manifest)
-    || !validRssKey(input.rss)
-    || input.archives !== null && !validArchiveKey(input.archives)) {
+  if (!repairSchema.safeParse(input).success) {
     throw new HttpError(400, 'Supply expected_version and existing manifest, rss, and archives pointers. archives must be a catalogue key or null.');
   }
   return input as unknown as RepairInput;
